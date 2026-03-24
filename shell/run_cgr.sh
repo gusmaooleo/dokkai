@@ -1,3 +1,5 @@
+#!/bin/bash
+
 set -e
 
 PROJECT_PATH="$1"
