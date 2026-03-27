@@ -8,6 +8,7 @@ dependencies = [
     "code-graph-rag[treesitter-full]>=0.0.148",
     "fastapi[standard]>=0.135.2",
     "numpy>=2.4.3",
+    "weaviate-client>=4.10.0",
 ]
 
 

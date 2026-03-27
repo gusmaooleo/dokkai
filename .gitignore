@@ -51,3 +51,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Ingested graph outputs (auto-generated, can be large)
+ingested/*.json
