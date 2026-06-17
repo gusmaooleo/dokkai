@@ -21,10 +21,22 @@ import os
 import weaviate
 from weaviate.classes.config import Configure, Property, DataType
 from weaviate.classes.query import Filter
+from weaviate.util import generate_uuid5
 
 from services.chunker import CodeChunk
 
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "CodeEntity")
+
+
+def uuid_for_entity(project_name: str, qualified_name: str) -> str:
+    """
+    Deterministic object id for a code entity.
+
+    The SAME formula is used at insert time (so it doubles as the upsert /
+    dedup key) and by the retriever to follow graph edges by id. Stable across
+    re-ingestions because it is derived only from the entity's identity.
+    """
+    return generate_uuid5(f"{project_name}:{qualified_name}")
 
 def _get_vectorizer_config():
     provider = os.getenv("VECTORIZER_PROVIDER", "local").lower()
@@ -143,7 +155,10 @@ def upsert_chunks(
                 "defined_methods": chunk.defined_methods,
                 "ingestion_id":    ingestion_id,
             }
-            batch.add_object(properties=properties)
+            batch.add_object(
+                properties=properties,
+                uuid=uuid_for_entity(chunk.project_name, chunk.qualified_name),
+            )
             inserted += 1
 
     return inserted
