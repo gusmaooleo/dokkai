@@ -12,9 +12,23 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 import weaviate
-from weaviate.classes.query import MetadataQuery, HybridFusion
+from weaviate.classes.query import MetadataQuery, HybridFusion, Filter
+
+from services.weaviate_client import uuid_for_entity
 
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "CodeEntity")
+
+# --- graph expansion config ------------------------------------------------
+# Chunk fields that hold qualified_names and can be followed as graph edges.
+# The weight reflects how much signal each edge type carries about related
+# context. ``defined_methods`` is intentionally excluded: it stores plain
+# names (not qualified_names), so it cannot be joined by id.
+_FORWARD_EDGES = {"calls": 0.60, "inherits": 0.65, "implements": 0.60, "overrides": 0.50}
+_BACKWARD_EDGES = {"called_by": 0.45}
+
+_HOP_DECAY = 0.5      # each extra hop multiplies the inherited score by this
+_MAX_FANOUT = 8       # max neighbors followed per edge field, per node
+_HUB_THRESHOLD = 25   # skip an edge whose neighbor list exceeds this (hub node)
 
 
 @dataclass
@@ -39,6 +53,8 @@ class RetrievedChunk:
     overrides: list[str] = field(default_factory=list)
     defined_methods: list[str] = field(default_factory=list)
     score: float | None = None
+    hop: int = 0          # 0 = seed (matched query), 1 = direct neighbor, ...
+    via: str = ""         # provenance, e.g. "calls ← registerRoutes"
 
 
 class Retriever:
@@ -100,32 +116,81 @@ class Retriever:
             return_metadata=MetadataQuery(score=True),
         )
 
-        chunks: list[RetrievedChunk] = []
-        for obj in response.objects:
-            props = obj.properties
-            chunk = RetrievedChunk(
-                entity_type=str(props.get("entity_type", "")),
-                name=str(props.get("name", "")),
-                qualified_name=str(props.get("qualified_name", "")),
-                file_path=str(props.get("file_path", "")),
-                absolute_path=str(props.get("absolute_path", "")),
-                start_line=int(cast(int, props["start_line"])) if props.get("start_line") is not None else None,
-                end_line=int(cast(int, props["end_line"])) if props.get("end_line") is not None else None,
-                project_name=str(props.get("project_name", "")),
-                module_name=str(props.get("module_name", "")),
-                parent_class=str(props.get("parent_class", "")),
-                chunk_text=str(props.get("chunk_text", "")),
-                calls=list(props.get("calls", [])),  # type: ignore[arg-type]
-                called_by=list(props.get("called_by", [])),  # type: ignore[arg-type]
-                inherits=list(props.get("inherits", [])),  # type: ignore[arg-type]
-                implements=list(props.get("implements", [])),  # type: ignore[arg-type]
-                overrides=list(props.get("overrides", [])),  # type: ignore[arg-type]
-                defined_methods=list(props.get("defined_methods", [])),  # type: ignore[arg-type]
-                score=obj.metadata.score if obj.metadata else None,
-            )
-            chunks.append(chunk)
+        return [self._to_chunk(obj) for obj in response.objects]
 
-        return chunks
+    def search_graph(
+        self,
+        query: str,
+        *,
+        project_name: str,
+        top_k_seeds: int = 6,
+        max_hops: int = 2,
+        max_nodes: int = 30,
+        direction: str = "both",
+        alpha: float = 0.7,
+    ) -> list[RetrievedChunk]:
+        """
+        Hybrid-search for seed chunks, then expand along the dependency graph.
+
+        Seeds are ranked by hybrid score; neighbors inherit a fraction of their
+        parent's score (decayed per hop, weighted by edge type), so a helper
+        called directly by the top match outranks a weak, loosely-matched seed.
+
+        Parameters
+        ----------
+        direction:
+            ``"forward"`` follows dependencies (calls/inherits/...), good for
+            "how does X work"; ``"backward"`` follows callers, good for impact
+            / "what uses X"; ``"both"`` (default) combines them.
+        """
+        edges: dict[str, float] = {}
+        if direction in ("forward", "both"):
+            edges |= _FORWARD_EDGES
+        if direction in ("backward", "both"):
+            edges |= _BACKWARD_EDGES
+
+        # 1) seeds via hybrid search
+        seeds = self.search(query, project_name=project_name, top_k=top_k_seeds, alpha=alpha)
+        selected: dict[str, RetrievedChunk] = {}
+        for seed in seeds:
+            seed.hop, seed.via = 0, "seed (matched query)"
+            selected[seed.qualified_name] = seed
+
+        # 2) breadth-first expansion over the graph edges
+        frontier = list(seeds)
+        for hop in range(1, max_hops + 1):
+            # qname -> (parent, inherited_score, edge_field)
+            wanted: dict[str, tuple[RetrievedChunk, float, str]] = {}
+            for parent in frontier:
+                for field_name, weight in edges.items():
+                    neighbors = getattr(parent, field_name, []) or []
+                    if len(neighbors) > _HUB_THRESHOLD:
+                        continue  # hub node — expanding it would flood the context
+                    for qn in neighbors[:_MAX_FANOUT]:
+                        if qn in selected or qn.startswith("<unknown"):
+                            continue
+                        score = (parent.score or 0.0) * weight * (_HOP_DECAY ** (hop - 1))
+                        best = wanted.get(qn)
+                        if best is None or score > best[1]:
+                            wanted[qn] = (parent, score, field_name)
+            if not wanted:
+                break
+
+            fetched = self._fetch_by_qnames(list(wanted), project_name)
+            frontier = []
+            for qn, chunk in fetched.items():
+                parent, score, field_name = wanted[qn]
+                chunk.hop = hop
+                chunk.via = f"{field_name} ← {parent.name}"
+                chunk.score = score
+                selected[qn] = chunk
+                frontier.append(chunk)
+            if len(selected) >= max_nodes:
+                break
+
+        # 3) rank by score: seeds float to the top, then strongest neighbors
+        ranked = sorted(selected.values(), key=lambda c: -(c.score or 0.0))
+        return ranked[:max_nodes]
 
     def build_context(
         self,
@@ -191,9 +256,73 @@ class Retriever:
 
         return "\n\n".join(sections)
 
+    def build_graph_context(
+        self,
+        chunks: list[RetrievedChunk],
+        *,
+        max_chars: int = 16_000,
+    ) -> str:
+        """
+        Format graph-expanded chunks for an LLM prompt, in ranked order, each
+        prefixed with its provenance (seed vs. how the neighbor was reached) so
+        the model understands the structure of the connected context.
+        """
+        if not chunks:
+            return "(No relevant code found in the codebase.)"
+
+        sections: list[str] = []
+        total = 0
+        for i, chunk in enumerate(chunks, 1):
+            tag = "SEED · matched query" if chunk.hop == 0 else f"hop {chunk.hop} · {chunk.via}"
+            section = f"--- Source {i} [{tag}] ---\n{chunk.chunk_text}"
+            if sections and total + len(section) > max_chars:
+                break
+            sections.append(section)
+            total += len(section)
+
+        return "\n\n".join(sections)
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _to_chunk(obj: Any) -> RetrievedChunk:
+        """Map a raw Weaviate object to a RetrievedChunk."""
+        props = obj.properties
+        return RetrievedChunk(
+            entity_type=str(props.get("entity_type", "")),
+            name=str(props.get("name", "")),
+            qualified_name=str(props.get("qualified_name", "")),
+            file_path=str(props.get("file_path", "")),
+            absolute_path=str(props.get("absolute_path", "")),
+            start_line=int(cast(int, props["start_line"])) if props.get("start_line") is not None else None,
+            end_line=int(cast(int, props["end_line"])) if props.get("end_line") is not None else None,
+            project_name=str(props.get("project_name", "")),
+            module_name=str(props.get("module_name", "")),
+            parent_class=str(props.get("parent_class", "")),
+            chunk_text=str(props.get("chunk_text", "")),
+            calls=list(props.get("calls", [])),  # type: ignore[arg-type]
+            called_by=list(props.get("called_by", [])),  # type: ignore[arg-type]
+            inherits=list(props.get("inherits", [])),  # type: ignore[arg-type]
+            implements=list(props.get("implements", [])),  # type: ignore[arg-type]
+            overrides=list(props.get("overrides", [])),  # type: ignore[arg-type]
+            defined_methods=list(props.get("defined_methods", [])),  # type: ignore[arg-type]
+            score=obj.metadata.score if obj.metadata else None,
+        )
+
+    def _fetch_by_qnames(
+        self, qnames: list[str], project_name: str
+    ) -> dict[str, RetrievedChunk]:
+        """Batch-fetch chunks by deterministic UUID — exact, single round-trip."""
+        if not qnames:
+            return {}
+        ids = [uuid_for_entity(project_name, q) for q in qnames]
+        resp = self.collection.query.fetch_objects(
+            filters=Filter.by_id().contains_any(ids),
+            limit=len(ids),
+        )
+        return {c.qualified_name: c for c in (self._to_chunk(o) for o in resp.objects)}
 
     @staticmethod
     def _build_filters(
@@ -201,8 +330,6 @@ class Retriever:
         entity_type: str | None,
     ) -> Any | None:
         """Build a Weaviate filter combining project_name and entity_type."""
-        from weaviate.classes.query import Filter
-
         conditions: list[Any] = []
 
         if project_name:
