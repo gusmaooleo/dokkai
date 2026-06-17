@@ -24,7 +24,7 @@ from weaviate.classes.query import Filter
 
 from services.chunker import CodeChunk
 
-COLLECTION_NAME = "CodeEntity"
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "CodeEntity")
 
 def _get_vectorizer_config():
     provider = os.getenv("VECTORIZER_PROVIDER", "local").lower()

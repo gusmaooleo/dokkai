@@ -542,17 +542,25 @@ name = "dokkai"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "anthropic" },
     { name = "code-graph-rag", extra = ["treesitter-full"] },
     { name = "fastapi", extra = ["standard"] },
+    { name = "httpx" },
     { name = "numpy" },
+    { name = "openai" },
+    { name = "python-dotenv" },
     { name = "weaviate-client" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "anthropic", specifier = ">=0.28.0" },
     { name = "code-graph-rag", extras = ["treesitter-full"], specifier = ">=0.0.148" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.135.2" },
+    { name = "httpx", specifier = ">=0.27.0" },
     { name = "numpy", specifier = ">=2.4.3" },
+    { name = "openai", specifier = ">=1.30.0" },
+    { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "weaviate-client", specifier = ">=4.10.0" },
 ]
 

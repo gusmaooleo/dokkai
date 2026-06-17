@@ -8,7 +8,11 @@ dependencies = [
     "code-graph-rag[treesitter-full]>=0.0.148",
     "fastapi[standard]>=0.135.2",
     "numpy>=2.4.3",
+    "python-dotenv>=1.2.2",
     "weaviate-client>=4.10.0",
+    "openai>=1.30.0",
+    "anthropic>=0.28.0",
+    "httpx>=0.27.0",
 ]
 
 
