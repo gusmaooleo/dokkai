@@ -13,7 +13,7 @@ async def runPipeline(data: IngestRequest):
     output_json = ingest_result["output_json"]
 
     try:
-        vectorize_result = await process_and_store(output_json)
+        vectorize_result = await process_and_store(output_json, source_root=data.repo_path)
     except Exception as e:
         raise HTTPException(
             status_code=500,

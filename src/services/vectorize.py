@@ -18,7 +18,10 @@ from services.chunker import chunk_graph
 from services.weaviate_client import get_client, ensure_collection, upsert_chunks
 
 
-async def process_and_store(output_json_path: str) -> dict:
+async def process_and_store(
+    output_json_path: str,
+    source_root: str | None = None,
+) -> dict:
     """
     Main entry-point: chunk the graph JSON and push to Weaviate.
 
@@ -26,6 +29,9 @@ async def process_and_store(output_json_path: str) -> dict:
     ----------
     output_json_path:
         Absolute or relative path to the code-graph-rag output JSON.
+    source_root:
+        Repository root used to read the actual source code into each chunk.
+        Falls back to the absolute paths recorded in the graph when omitted.
 
     Returns
     -------
@@ -34,7 +40,7 @@ async def process_and_store(output_json_path: str) -> dict:
     path = Path(output_json_path)
     ingestion_id = path.stem
 
-    chunks = chunk_graph(path)
+    chunks = chunk_graph(path, source_root=source_root)
     client = get_client()
     
     try:

@@ -20,6 +20,10 @@ from typing import Any
 # ---------------------------------------------------------------------------
 CODE_ENTITY_LABELS = {"Class", "Function", "Method", "Interface", "Enum", "Type"}
 
+# Hard cap on the source snippet embedded per chunk, so a huge class body
+# cannot dominate the vector or blow up the context budget downstream.
+_MAX_SOURCE_CHARS = 6_000
+
 _CALLS = "CALLS"
 _DEFINES = "DEFINES"
 _DEFINES_METHOD = "DEFINES_METHOD"
@@ -53,43 +57,66 @@ class CodeChunk:
     implements: list[str] = field(default_factory=list)
     overrides: list[str] = field(default_factory=list)
     defined_methods: list[str] = field(default_factory=list)
+    source_code: str = ""
     chunk_text: str = ""
 
     def build_text(self) -> str:
-        lines: list[str] = []
-        lines.append(f"[{self.entity_type}] {self.qualified_name}")
-        lines.append(f"Name: {self.name}")
+        """
+        Build the text that gets embedded. A compact metadata header (signature,
+        location, graph relations) followed by the *actual source code* — the
+        source is what carries the real semantic signal for retrieval.
+        """
+        header: list[str] = [f"[{self.entity_type}] {self.qualified_name}"]
         if self.file_path:
             loc = f"File: {self.file_path}"
             if self.start_line is not None and self.end_line is not None:
                 loc += f" (lines {self.start_line}-{self.end_line})"
-            lines.append(loc)
-        if self.module_name:
-            lines.append(f"Module: {self.module_name}")
+            header.append(loc)
         if self.parent_class:
-            lines.append(f"Class: {self.parent_class}")
+            header.append(f"Class: {self.parent_class}")
         if self.decorators:
-            lines.append(f"Decorators: {', '.join(self.decorators)}")
-        lines.append(f"Exported: {'yes' if self.is_exported else 'no'}")
+            header.append(f"Decorators: {', '.join(self.decorators)}")
+
+        rels: list[str] = []
         if self.defined_methods:
-            lines.append(f"Methods: {', '.join(self.defined_methods)}")
+            rels.append(f"Methods: {', '.join(self.defined_methods)}")
         if self.inherits:
-            lines.append(f"Inherits: {', '.join(self.inherits)}")
-        if self.imports:
-            lines.append(f"Imports: {', '.join(self.imports)}")
+            rels.append(f"Inherits: {', '.join(self.inherits)}")
         if self.implements:
-            lines.append(f"Implements: {', '.join(self.implements)}")
+            rels.append(f"Implements: {', '.join(self.implements)}")
         if self.overrides:
-            lines.append(f"Overrides: {', '.join(self.overrides)}")
+            rels.append(f"Overrides: {', '.join(self.overrides)}")
         if self.calls:
-            lines.append(f"Calls: {', '.join(self.calls)}")
+            rels.append(f"Calls: {', '.join(self.calls)}")
         if self.called_by:
-            lines.append(f"Called by: {', '.join(self.called_by)}")
-        self.chunk_text = "\n".join(lines)
+            rels.append(f"Called by: {', '.join(self.called_by)}")
+        if rels:
+            header.append(" | ".join(rels))
+
+        parts = ["\n".join(header)]
+        if self.source_code:
+            parts.append(f"```\n{self.source_code}\n```")
+        self.chunk_text = "\n\n".join(parts)
         return self.chunk_text
 
 
-def chunk_graph(json_path: str | Path) -> list[CodeChunk]:
+def chunk_graph(
+    json_path: str | Path,
+    source_root: str | Path | None = None,
+) -> list[CodeChunk]:
+    """
+    Turn a code-graph-rag JSON into rich chunks.
+
+    Parameters
+    ----------
+    json_path:
+        Path to the code-graph-rag output JSON.
+    source_root:
+        Repository root used to read the actual source code for each entity.
+        When given, files are read from ``source_root / <relative path>``;
+        otherwise the absolute path recorded in the graph is used. Files are
+        read once and cached.
+    """
     with open(json_path, "r", encoding="utf-8") as fh:
         data: dict[str, Any] = json.load(fh)
 
@@ -97,6 +124,32 @@ def chunk_graph(json_path: str | Path) -> list[CodeChunk]:
     relationships: list[dict] = data.get("relationships", [])
 
     node_by_id: dict[int, dict] = {n["node_id"]: n for n in nodes}
+
+    # --- source code reading (cached per file) ----------------------------
+    file_cache: dict[str, list[str] | None] = {}
+
+    def _source_file(props: dict) -> str:
+        rel_path = props.get("path")
+        if source_root and rel_path:
+            return str(Path(source_root) / rel_path)
+        return props.get("absolute_path", "") or ""
+
+    def _read_source(file_key: str, start: int | None, end: int | None) -> str:
+        if not file_key or start is None or end is None:
+            return ""
+        if file_key not in file_cache:
+            try:
+                with open(file_key, "r", encoding="utf-8", errors="replace") as sfh:
+                    file_cache[file_key] = sfh.read().splitlines()
+            except OSError:
+                file_cache[file_key] = None
+        lines_ = file_cache[file_key]
+        if not lines_:
+            return ""
+        snippet = "\n".join(lines_[max(start - 1, 0):end])
+        if len(snippet) > _MAX_SOURCE_CHARS:
+            snippet = snippet[:_MAX_SOURCE_CHARS] + "\n… [truncated]"
+        return snippet
 
     project_name = ""
     for n in nodes:
@@ -162,6 +215,10 @@ def chunk_graph(json_path: str | Path) -> list[CodeChunk]:
 
         called_by = [_qname(fid) for rt, fid in incoming.get(nid, []) if rt == _CALLS]
 
+        source_code = _read_source(
+            _source_file(props), props.get("start_line"), props.get("end_line")
+        )
+
         chunk = CodeChunk(
             node_id=nid,
             entity_type=entity_type,
@@ -183,6 +240,7 @@ def chunk_graph(json_path: str | Path) -> list[CodeChunk]:
             overrides=overrides,
             imports=imports,
             defined_methods=defined_methods,
+            source_code=source_code,
         )
         chunk.build_text()
         chunks.append(chunk)
