@@ -1,5 +1,6 @@
 import subprocess
 import os
+import tempfile
 from datetime import datetime, timezone
 
 
@@ -24,11 +25,18 @@ async def ingestByLocalRepository(repo_path: str) -> dict:
 
     script_path = os.path.join(base_dir, "shell", "run_cgr.sh")
 
-    result = subprocess.run(
-        [script_path, repo_path, output_json],
-        capture_output=True,
-        text=True,
-    )
+    # Run code-graph-rag from an isolated working directory. Its config is a
+    # strict pydantic-settings model (env_file=".env", extra forbidden); if it
+    # ran from the project root it would read — and reject — this project's own
+    # .env (COLLECTION_NAME, WEAVIATE_*, EMBED_MODEL, ...). Inherited env vars
+    # are fine: the settings source ignores ones that aren't its fields.
+    with tempfile.TemporaryDirectory() as cgr_cwd:
+        result = subprocess.run(
+            [script_path, repo_path, output_json],
+            capture_output=True,
+            text=True,
+            cwd=cgr_cwd,
+        )
 
     if result.returncode != 0:
         raise RuntimeError(result.stderr or result.stdout)
