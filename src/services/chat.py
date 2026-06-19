@@ -77,6 +77,9 @@ async def chat_with_codebase(
     audience: str = "developer",
     conversation_id: str | None = None,
     top_k: int = 8,
+    max_hops: int = 2,
+    max_nodes: int = 30,
+    direction: str = "both",
 ) -> AsyncIterator[dict]:
     """
     RAG chat pipeline — yields SSE-ready dicts.
@@ -99,16 +102,19 @@ async def chat_with_codebase(
     else:
         conversation_id = str(uuid.uuid4())
 
-    # ---- Step 1: Retrieve relevant code ----
+    # ---- Step 1: Retrieve relevant code (graph-expanded) ----
     client = get_client()
     try:
         retriever = Retriever(client)
-        chunks = retriever.search(
+        chunks = retriever.search_graph(
             query=message,
             project_name=project_name,
-            top_k=top_k,
+            top_k_seeds=top_k,
+            max_hops=max_hops,
+            max_nodes=max_nodes,
+            direction=direction,
         )
-        context = retriever.build_context(chunks)
+        context = retriever.build_graph_context(chunks)
     finally:
         client.close()
 
@@ -123,6 +129,8 @@ async def chat_with_codebase(
             "end_line": c.end_line,
             "chunk_text": c.chunk_text,
             "score": c.score,
+            "hop": c.hop,
+            "via": c.via,
         }
         for c in chunks
     ]
