@@ -228,6 +228,18 @@ class AnthropicProvider(LLMProvider):
 # Ollama (local)
 # -----------------------------------------------------------------------
 
+def _parse_keep_alive(value: str) -> int | str:
+    """
+    Ollama accepts keep_alive as an int (seconds; -1 = stay loaded forever) or
+    a duration string like "30m". A numeric string such as "-1" must be sent as
+    an int — sending it as a string makes Ollama reject the request with 400.
+    """
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
 class OllamaProvider(LLMProvider):
     provider_name = "ollama"
 
@@ -236,6 +248,16 @@ class OllamaProvider(LLMProvider):
             base_url
             or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
         )
+        # Ollama defaults num_ctx to 2048, which silently truncates the RAG
+        # context. Size it for the graph context + system prompt + answer.
+        self._num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
+        # The first request cold-loads the model into memory, which can take far
+        # longer than a normal token read. Short connect, generous read — so a
+        # cold load doesn't surface as an opaque ReadTimeout.
+        self._timeout = httpx.Timeout(float(os.getenv("OLLAMA_TIMEOUT", "600")), connect=10.0)
+        # Keep the model resident in memory between requests. "-1" = stay loaded
+        # indefinitely; a duration like "30m" lets Ollama unload it when idle.
+        self._keep_alive = _parse_keep_alive(os.getenv("OLLAMA_KEEP_ALIVE", "-1"))
 
     async def chat(
         self,
@@ -245,16 +267,18 @@ class OllamaProvider(LLMProvider):
         temperature: float = 0.3,
         max_tokens: int = 4096,
     ) -> str:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(
                 f"{self._base_url}/api/chat",
                 json={
                     "model": model,
                     "messages": [m.to_dict() for m in messages],
                     "stream": False,
+                    "keep_alive": self._keep_alive,
                     "options": {
                         "temperature": temperature,
                         "num_predict": max_tokens,
+                        "num_ctx": self._num_ctx,
                     },
                 },
             )
@@ -272,7 +296,7 @@ class OllamaProvider(LLMProvider):
     ) -> AsyncIterator[str]:
         import json as _json
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
             async with client.stream(
                 "POST",
                 f"{self._base_url}/api/chat",
@@ -280,9 +304,11 @@ class OllamaProvider(LLMProvider):
                     "model": model,
                     "messages": [m.to_dict() for m in messages],
                     "stream": True,
+                    "keep_alive": self._keep_alive,
                     "options": {
                         "temperature": temperature,
                         "num_predict": max_tokens,
+                        "num_ctx": self._num_ctx,
                     },
                 },
             ) as response:
@@ -297,6 +323,24 @@ class OllamaProvider(LLMProvider):
                             yield content
                     except _json.JSONDecodeError:
                         continue
+
+    async def warmup(self, model: str) -> None:
+        """
+        Preload the model into memory (respecting keep_alive) so the first real
+        request isn't a cold start. Best-effort: a 1-token no-op generation.
+        """
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            resp = await client.post(
+                f"{self._base_url}/api/chat",
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": "ok"}],
+                    "stream": False,
+                    "keep_alive": self._keep_alive,
+                    "options": {"num_predict": 1},
+                },
+            )
+            resp.raise_for_status()
 
     async def list_models(self) -> list[str]:
         async with httpx.AsyncClient(timeout=10.0) as client:

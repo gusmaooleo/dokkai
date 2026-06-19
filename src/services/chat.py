@@ -174,7 +174,8 @@ async def chat_with_codebase(
             full_answer += token
             yield {"type": "token", "data": token}
     except Exception as e:
-        yield {"type": "error", "data": f"LLM error: {e}"}
+        detail = str(e) or repr(e)
+        yield {"type": "error", "data": f"LLM error ({type(e).__name__}): {detail}"}
         return
 
     # Save assistant response
