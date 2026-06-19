@@ -54,3 +54,6 @@ wheels/
 
 # Ingested graph outputs (auto-generated, can be large)
 ingested/*.json
+
+# Runtime data (chat history, etc.)
+data/
