@@ -10,7 +10,10 @@ Environment variables
 WEAVIATE_HOST          - default ``localhost``
 WEAVIATE_HTTP_PORT     - default ``8080``
 WEAVIATE_GRPC_PORT     - default ``50051``
-VECTORIZER_PROVIDER    - ``local`` (default) | ``openai`` | ``cohere``
+VECTORIZER_PROVIDER    - ``ollama`` (default) | ``openai`` | ``cohere`` | ``local``
+OLLAMA_EMBED_ENDPOINT  - Ollama URL as seen by the Weaviate server
+                         (default ``http://host.docker.internal:11434``)
+EMBED_MODEL            - Ollama embedding model (default ``nomic-embed-text``)
 OPENAI_API_KEY         - required when VECTORIZER_PROVIDER=openai
 COHERE_API_KEY         - required when VECTORIZER_PROVIDER=cohere
 """
@@ -39,9 +42,18 @@ def uuid_for_entity(project_name: str, qualified_name: str) -> str:
     return generate_uuid5(f"{project_name}:{qualified_name}")
 
 def _get_vectorizer_config():
-    provider = os.getenv("VECTORIZER_PROVIDER", "local").lower()
+    provider = os.getenv("VECTORIZER_PROVIDER", "ollama").lower()
 
-    if provider == "openai":
+    if provider == "ollama":
+        # Embeddings via local Ollama. ``api_endpoint`` is resolved from the
+        # Weaviate *server's* perspective, so under Docker it must reach the
+        # host (host.docker.internal), not localhost.
+        return Configure.Vectorizer.text2vec_ollama(
+            api_endpoint=os.getenv("OLLAMA_EMBED_ENDPOINT", "http://host.docker.internal:11434"),
+            model=os.getenv("EMBED_MODEL", "nomic-embed-text"),
+            vectorize_collection_name=False,
+        )
+    elif provider == "openai":
         return Configure.Vectorizer.text2vec_openai(
             model="text-embedding-3-small",
         )
@@ -61,7 +73,7 @@ def get_client() -> weaviate.WeaviateClient:
     grpc_port = int(os.getenv("WEAVIATE_GRPC_PORT", "50051"))
 
     headers: dict[str, str] = {}
-    provider = os.getenv("VECTORIZER_PROVIDER", "local").lower()
+    provider = os.getenv("VECTORIZER_PROVIDER", "ollama").lower()
     if provider == "openai":
         api_key = os.getenv("OPENAI_API_KEY", "")
         if api_key:
