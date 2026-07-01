@@ -30,6 +30,40 @@ _HOP_DECAY = 0.5      # each extra hop multiplies the inherited score by this
 _MAX_FANOUT = 8       # max neighbors followed per edge field, per node
 _HUB_THRESHOLD = 25   # skip an edge whose neighbor list exceeds this (hub node)
 
+# --- test de-prioritization ------------------------------------------------
+# For "how does X work?" queries, test files tend to out-rank the real
+# implementation: their descriptions read like specs, so they match the query
+# semantically. We softly down-weight test chunks (multiply their score) so the
+# implementation surfaces first — without dropping tests entirely, since a test
+# can still be the most relevant context. Set RETRIEVAL_TEST_PENALTY=1.0 to
+# disable.
+_TEST_PENALTY = float(os.getenv("RETRIEVAL_TEST_PENALTY", "0.35"))
+_SEARCH_OVERFETCH = 3  # fetch Nx candidates before penalizing, so demoted
+                       # tests don't crowd implementation out of the window
+_TEST_DIR_SEGMENTS = {"test", "tests", "__tests__", "spec", "specs", "e2e"}
+_TEST_FILE_MARKERS = (".test.", ".spec.", ".e2e.")
+
+
+def _is_test_path(file_path: str) -> bool:
+    """
+    Heuristically decide whether a file path belongs to a test.
+
+    Uses path *segments* for directories and filename *boundaries* for the
+    basename, so a path like ``latest_version.py`` is not misclassified as a
+    test just because it contains the substring "test".
+    """
+    if not file_path:
+        return False
+    p = file_path.replace("\\", "/").lower()
+    segments = p.split("/")
+    if any(seg in _TEST_DIR_SEGMENTS for seg in segments):
+        return True
+    base = segments[-1]
+    if any(marker in base for marker in _TEST_FILE_MARKERS):
+        return True
+    stem = base.rsplit(".", 1)[0]
+    return stem.startswith("test_") or stem.endswith(("_test", "_spec"))
+
 
 @dataclass
 class RetrievedChunk:
@@ -107,16 +141,25 @@ class Retriever:
         """
         filters = self._build_filters(project_name, entity_type)
 
+        # Over-fetch so down-weighted test chunks don't crowd real
+        # implementation out of the candidate window before we re-rank.
+        fetch_limit = top_k * _SEARCH_OVERFETCH if _TEST_PENALTY < 1.0 else top_k
         response = self.collection.query.hybrid(
             query=query,
-            limit=top_k,
+            limit=fetch_limit,
             alpha=alpha,
             fusion_type=HybridFusion.RELATIVE_SCORE,
             filters=filters,
             return_metadata=MetadataQuery(score=True),
         )
 
-        return [self._to_chunk(obj) for obj in response.objects]
+        chunks = [self._to_chunk(obj) for obj in response.objects]
+        if _TEST_PENALTY < 1.0:
+            for c in chunks:
+                if c.score is not None and _is_test_path(c.file_path):
+                    c.score *= _TEST_PENALTY
+            chunks.sort(key=lambda c: -(c.score or 0.0))
+        return chunks[:top_k]
 
     def search_graph(
         self,
