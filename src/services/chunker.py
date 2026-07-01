@@ -11,6 +11,7 @@ chunked themselves.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,9 @@ CODE_ENTITY_LABELS = {"Class", "Function", "Method", "Interface", "Enum", "Type"
 # cannot dominate the vector or blow up the context budget downstream.
 _MAX_SOURCE_CHARS = 6_000
 
+# Hard cap on the extracted docstring / leading comment surfaced per chunk.
+_MAX_DOC_CHARS = 600
+
 _CALLS = "CALLS"
 _DEFINES = "DEFINES"
 _DEFINES_METHOD = "DEFINES_METHOD"
@@ -33,6 +37,131 @@ _OVERRIDES = "OVERRIDES"
 _IMPORTS = "IMPORTS"
 _CONTAINS_FILE = "CONTAINS_FILE"
 _CONTAINS_MODULE = "CONTAINS_MODULE"
+
+
+# ---------------------------------------------------------------------------
+# Zero-cost text enrichment (Tier 1): identifier tokenization + doc extraction
+# ---------------------------------------------------------------------------
+# Natural-language queries ("how does the alarm flow work?") embed far from raw
+# code identifiers. Splitting `sendDetectionNotification` into "send detection
+# notification" and surfacing any hand-written docstring/JSDoc gives the
+# embedder real NL tokens to match against — with no extra LLM calls.
+
+_CAMEL_BOUNDARY_1 = re.compile(r"([A-Z]+)([A-Z][a-z])")   # HTTPServer  -> HTTP Server
+_CAMEL_BOUNDARY_2 = re.compile(r"([a-z\d])([A-Z])")        # sendAlarm   -> send Alarm
+_ID_LEAF_SPLIT = re.compile(r"[.:#/\\]")
+_COMMENT_MARKER = re.compile(r"^(//+|#+|\*+|/\*+)\s?")
+_PY_DOCSTRING = re.compile(r':\s*\n\s*("""|\'\'\')(?P<body>.*?)\1', re.DOTALL)
+
+
+def _split_identifier(identifier: str) -> list[str]:
+    """Decompose a (possibly qualified) identifier into lowercase words."""
+    leaf = _ID_LEAF_SPLIT.split(identifier)[-1].split("(")[0]
+    leaf = leaf.replace("_", " ").replace("-", " ")
+    leaf = _CAMEL_BOUNDARY_1.sub(r"\1 \2", leaf)
+    leaf = _CAMEL_BOUNDARY_2.sub(r"\1 \2", leaf)
+    return [w.lower() for w in leaf.split() if w]
+
+
+def _keyword_terms(chunk: "CodeChunk", *, max_terms: int = 24) -> str:
+    """
+    Build a comma-separated list of natural-language phrases from the entity's
+    own name, its parent class, its methods, and (multi-word) callees — so the
+    behaviour described by those identifiers becomes searchable in plain words.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def add(identifier: str, *, require_phrase: bool = False) -> None:
+        words = _split_identifier(identifier)
+        if not words or (require_phrase and len(words) < 2):
+            return
+        phrase = " ".join(words)
+        if phrase not in seen:
+            seen.add(phrase)
+            out.append(phrase)
+
+    add(chunk.name)
+    if chunk.parent_class:
+        add(chunk.parent_class)
+    for method in chunk.defined_methods:
+        add(method)
+    for callee in chunk.calls:
+        if len(out) >= max_terms:
+            break
+        add(callee, require_phrase=True)  # callees only add NL signal when they decompose
+    return ", ".join(out[:max_terms])
+
+
+def _is_comment_line(line: str) -> bool:
+    return bool(line) and (line.startswith(("//", "#", "*", "/*")) or line.endswith("*/"))
+
+
+def _leading_comment(
+    file_lines: list[str] | None, start_line: int | None, max_scan: int = 40
+) -> str:
+    """Collect the contiguous comment block directly above a declaration."""
+    if not file_lines or not start_line:
+        return ""
+    # line directly above the declaration (0-indexed), clamped in case the
+    # recorded start_line exceeds the file on disk (stale path / changed file)
+    i = min(start_line - 2, len(file_lines) - 1)
+    # bridge over decorators / blank lines sitting between the doc and the decl
+    while i >= 0 and (not file_lines[i].strip() or file_lines[i].strip().startswith("@")):
+        i -= 1
+    block: list[str] = []
+    scanned = 0
+    while i >= 0 and scanned < max_scan:
+        stripped = file_lines[i].strip()
+        if _is_comment_line(stripped):
+            block.append(stripped)
+            i -= 1
+            scanned += 1
+        else:
+            break
+    block.reverse()
+    return "\n".join(block)
+
+
+def _clean_comment(text: str) -> str:
+    """Strip comment fences/markers, leaving plain prose on a single line."""
+    text = text.replace("/**", "").replace("/*", "").replace("*/", "")
+    out: list[str] = []
+    for line in text.splitlines():
+        line = _COMMENT_MARKER.sub("", line.strip()).strip()
+        if line:
+            out.append(line)
+    return " ".join(out).strip()
+
+
+def _python_docstring(source_code: str) -> str:
+    """Extract a leading triple-quoted docstring from a Python entity's body."""
+    match = _PY_DOCSTRING.search(source_code)
+    return match.group("body").strip() if match else ""
+
+
+def _extract_doc(
+    file_lines: list[str] | None,
+    start_line: int | None,
+    source_code: str,
+    file_key: str,
+) -> str:
+    """
+    Best-effort natural-language description of an entity, pulled from source:
+    a leading comment/JSDoc block (any language) and a Python docstring.
+    """
+    parts: list[str] = []
+    lead = _clean_comment(_leading_comment(file_lines, start_line))
+    if lead:
+        parts.append(lead)
+    if file_key.endswith(".py"):
+        docstring = _python_docstring(source_code)
+        if docstring:
+            parts.append(" ".join(docstring.split()))
+    doc = " ".join(parts).strip()
+    if len(doc) > _MAX_DOC_CHARS:
+        doc = doc[:_MAX_DOC_CHARS].rstrip() + " …"
+    return doc
 
 
 @dataclass
@@ -58,6 +187,7 @@ class CodeChunk:
     overrides: list[str] = field(default_factory=list)
     defined_methods: list[str] = field(default_factory=list)
     source_code: str = ""
+    doc: str = ""
     chunk_text: str = ""
 
     def build_text(self) -> str:
@@ -93,7 +223,13 @@ class CodeChunk:
         if rels:
             header.append(" | ".join(rels))
 
+        terms = _keyword_terms(self)
+        if terms:
+            header.append(f"Terms: {terms}")
+
         parts = ["\n".join(header)]
+        if self.doc:
+            parts.append(f"Doc: {self.doc}")
         if self.source_code:
             parts.append(f"```\n{self.source_code}\n```")
         self.chunk_text = "\n\n".join(parts)
@@ -215,9 +351,10 @@ def chunk_graph(
 
         called_by = [_qname(fid) for rt, fid in incoming.get(nid, []) if rt == _CALLS]
 
-        source_code = _read_source(
-            _source_file(props), props.get("start_line"), props.get("end_line")
-        )
+        file_key = _source_file(props)
+        start_line = props.get("start_line")
+        source_code = _read_source(file_key, start_line, props.get("end_line"))
+        doc = _extract_doc(file_cache.get(file_key), start_line, source_code, file_key)
 
         chunk = CodeChunk(
             node_id=nid,
@@ -241,6 +378,7 @@ def chunk_graph(
             imports=imports,
             defined_methods=defined_methods,
             source_code=source_code,
+            doc=doc,
         )
         chunk.build_text()
         chunks.append(chunk)
