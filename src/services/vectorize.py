@@ -14,16 +14,28 @@ JSON.  It will:
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from pathlib import Path
 
-from services.chunker import chunk_graph
+from services.chunker import CodeChunk, chunk_graph
 from services.describe import describe_chunks
-from services.weaviate_client import get_client, ensure_collection, upsert_chunks
+from services.weaviate_client import (
+    COLLECTION_NAME,
+    ensure_collection,
+    fetch_project_chunk_index,
+    get_client,
+    update_chunk_description,
+    upsert_chunks,
+    uuid_for_entity,
+)
 
 
-# progress(stage, done, total) — stage ∈ {"chunk","describe","upsert","done"}
+# progress(stage, done, total) — stage ∈ {"chunk","describe","upsert","update","done"}
 ProgressFn = Callable[[str, int, int], None]
+
+# Timestamp suffix used by ingestByLocalRepository: "-<YYYYMMDDTHHMMSS>".
+_TIMESTAMP_SUFFIX_RE = re.compile(r"^-\d{8}T\d{6}$")
 
 
 async def process_and_store(
@@ -102,3 +114,154 @@ async def process_and_store(
         "ingestion_id": ingestion_id,
         "descriptions": desc_stats,
     }
+
+
+def _ingested_dir() -> Path:
+    return Path(__file__).resolve().parent.parent.parent / "ingested"
+
+
+def find_latest_graph_json(project_name: str) -> Path | None:
+    """
+    Find the newest graph JSON for *project_name* in ``ingested/``.
+
+    Matches only ``<project_name>.json`` or
+    ``<project_name>-<YYYYMMDDTHHMMSS>.json`` — anchored so a project name
+    that prefixes another (e.g. ``foo`` vs ``foo-bar``) never matches the
+    wrong file. Newest mtime wins when several candidates exist.
+    """
+    ingested_dir = _ingested_dir()
+    if not ingested_dir.is_dir():
+        return None
+
+    candidates: list[Path] = []
+    for path in ingested_dir.glob("*.json"):
+        stem = path.stem
+        if stem == project_name:
+            candidates.append(path)
+        elif stem.startswith(project_name) and _TIMESTAMP_SUFFIX_RE.match(stem[len(project_name):]):
+            candidates.append(path)
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def no_graph_json_message(project_name: str) -> str:
+    """English message for a missing graph JSON — shared by the refresh
+    pre-flight (409) and the fail-loud check inside the refresh job itself."""
+    return (
+        f"no graph JSON found for project '{project_name}' in ingested/ — "
+        "re-run POST /instances/pipeline to regenerate it"
+    )
+
+
+async def refresh_descriptions(
+    project_name: str,
+    *,
+    force: bool = False,
+    progress: ProgressFn | None = None,
+) -> dict:
+    """
+    Re-run ONLY the describe pass over a project's already-ingested chunks.
+
+    Re-chunks the latest graph JSON in ``ingested/`` and, for every rebuilt
+    chunk whose ``chunk_text`` is byte-identical to what's stored in
+    Weaviate (the anti-drift guard), re-describes it and writes back the
+    ``description`` property when it changed. Chunks whose rebuilt text
+    differs from the stored one (source edited since ingestion) are counted
+    as ``stale_source`` and never described; rebuilt chunks with no stored
+    counterpart are counted as ``not_indexed`` and skipped.
+
+    Never re-chunks the graph relationships/upsert path and never touches
+    embeddings of unchanged ``chunk_text`` — only ``description`` (and the
+    ``summary`` vector it feeds) can change. A transient generation failure
+    (``describe_chunks`` swallows per-entity errors, leaving
+    ``chunk.description`` empty) never overwrites a non-empty stored
+    description with an empty one — such chunks are counted as
+    ``preserved`` instead of ``updated``.
+    """
+
+    def report(stage: str, done: int, total: int) -> None:
+        if progress:
+            progress(stage, done, total)
+
+    graph_path = find_latest_graph_json(project_name)
+    if graph_path is None:
+        raise RuntimeError(no_graph_json_message(project_name))
+
+    report("chunk", 0, 1)
+    chunks = chunk_graph(graph_path)
+    report("chunk", len(chunks), len(chunks))
+
+    if chunks and chunks[0].project_name != project_name:
+        raise RuntimeError(
+            f"graph JSON '{graph_path.name}' resolves to project "
+            f"'{chunks[0].project_name}', expected '{project_name}'"
+        )
+
+    client = get_client()
+    try:
+        index = fetch_project_chunk_index(client, project_name)
+
+        eligible: list[tuple[str, CodeChunk, dict]] = []
+        stale_source = 0
+        not_indexed = 0
+        for chunk in chunks:
+            uuid = uuid_for_entity(chunk.project_name, chunk.qualified_name)
+            stored = index.get(uuid)
+            if stored is None:
+                not_indexed += 1
+                continue
+            if stored.get("chunk_text") != chunk.chunk_text:
+                stale_source += 1
+                continue
+            eligible.append((uuid, chunk, stored))
+
+        report("describe", 0, len(eligible))
+        desc_stats = await describe_chunks(
+            [chunk for _, chunk, _ in eligible],
+            force=force,
+            progress=lambda done, total: report("describe", done, total),
+        )
+
+        collection = client.collections.get(COLLECTION_NAME)
+        total_eligible = len(eligible)
+        report("update", 0, total_eligible)
+        updated = 0
+        unchanged = 0
+        preserved = 0
+        for i, (uuid, chunk, stored) in enumerate(eligible, start=1):
+            new_description = chunk.description or chunk.doc
+            stored_description = stored.get("description")
+            if not new_description and stored_description:
+                # An eligible chunk's doc is byte-identical to ingestion time
+                # (chunk_text matched), so an empty new_description here can
+                # only mean a transient generation failure — never overwrite
+                # a good stored description with an empty one.
+                preserved += 1
+            elif new_description != stored_description:
+                update_chunk_description(collection, uuid, new_description)
+                updated += 1
+            else:
+                unchanged += 1
+            report("update", i, total_eligible)
+    finally:
+        client.close()
+
+    stats = {
+        "project_name": project_name,
+        "chunks_indexed": len(index),
+        "eligible": total_eligible,
+        "stale_source": stale_source,
+        "not_indexed": not_indexed,
+        "updated": updated,
+        "unchanged": unchanged,
+        "preserved": preserved,
+        "descriptions": desc_stats,
+    }
+    if stale_source > 0:
+        stats["note"] = (
+            f"{stale_source} entities changed on disk since ingestion — "
+            "re-ingest to refresh them"
+        )
+    return stats
