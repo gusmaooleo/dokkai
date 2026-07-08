@@ -31,6 +31,7 @@ async def process_and_store(
     source_root: str | None = None,
     *,
     recreate: bool = False,
+    describe: bool = True,
     progress: ProgressFn | None = None,
 ) -> dict:
     """
@@ -46,6 +47,11 @@ async def process_and_store(
     recreate:
         Drop and rebuild the collection before inserting. Needed once when the
         schema changes (e.g. adopting named vectors). Wipes ALL projects.
+    describe:
+        Whether to run the Tier-2 description pass. Defaults to ``True``; the
+        no-describe mode is an explicit opt-in for internal callers (the
+        CLI/API UX for it lands with feature 04) — it never falls back
+        silently on a missing/unavailable descriptor model.
     progress:
         Optional callback ``(stage, done, total)`` for job status reporting.
 
@@ -65,12 +71,18 @@ async def process_and_store(
     chunks = chunk_graph(path, source_root=source_root)
     report("chunking", len(chunks), len(chunks))
 
-    # Tier 2 — micro-descriptions (skipped gracefully if DESC_MODEL is unset).
+    # Tier 2 — micro-descriptions. Raises DescriptorError (via describe_chunks)
+    # when no descriptor model is configured or it's unavailable — describe=False
+    # is the only way to skip this pass.
     report("describing", 0, len(chunks))
-    desc_stats = await describe_chunks(
-        chunks,
-        progress=lambda done, total: report("describing", done, total),
-    )
+    if describe:
+        desc_stats = await describe_chunks(
+            chunks,
+            progress=lambda done, total: report("describing", done, total),
+        )
+    else:
+        desc_stats = {"enabled": False, "reason": "descriptions disabled for this ingestion"}
+        report("describing", len(chunks), len(chunks))
 
     client = get_client()
     try:

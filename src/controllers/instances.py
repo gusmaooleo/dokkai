@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from models.dtos.receive import IngestRequest
+from services.describe import DescriptorError, ensure_descriptor_available
 from services.jobs import get_job_store, submit_pipeline
 
 router = APIRouter(prefix="/instances")
@@ -11,7 +12,16 @@ async def runPipeline(data: IngestRequest):
     Enqueue the ingestion pipeline (graph → chunk → describe → embed) as a
     background job and return its id immediately. Poll ``/instances/jobs/{id}``
     for progress and the final result.
+
+    Descriptions are always on via this endpoint (the no-describe mode is an
+    internal-only opt-in until feature 04's CLI/API UX), so the descriptor
+    model is checked *before* creating the job: a missing/unavailable
+    descriptor fails the request immediately with no job created.
     """
+    try:
+        await ensure_descriptor_available()
+    except DescriptorError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     job = submit_pipeline(data.repo_path, recreate=data.recreate)
     return {"job_id": job.id, "status": job.status}
 

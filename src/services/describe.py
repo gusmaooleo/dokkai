@@ -15,8 +15,10 @@ Cost control (a description is one LLM call — the pipeline's dominant cost):
 
 If no model is configured (``DESC_MODEL`` unset) or the configured provider
 is unavailable (missing API key, unreachable, or model not found),
-description generation is skipped gracefully — ingestion still succeeds,
-entities simply get no ``summary`` vector.
+description generation **fails loudly** — see :class:`DescriptorError` and
+:func:`ensure_descriptor_available`. Ingesting without descriptions is an
+explicit opt-in (``process_and_store(..., describe=False)``), not a silent
+fallback.
 """
 
 from __future__ import annotations
@@ -200,6 +202,50 @@ async def _generate_one(provider: LLMProvider, model: str, chunk: CodeChunk) -> 
     return response.strip()
 
 
+class DescriptorError(RuntimeError):
+    """Raised when no descriptor model is configured or it is unavailable."""
+
+
+_NO_MODEL_MESSAGE = (
+    "no descriptor model specified — set DESC_MODEL (e.g. qwen2.5-coder:3b) "
+    "or configure a remote provider via DESC_PROVIDER"
+)
+
+
+async def _require_provider(provider_name: str, base_url: str, model: str) -> LLMProvider:
+    """Resolve + probe the descriptor provider, raising DescriptorError on failure."""
+    provider, reason = _resolve_provider(provider_name, base_url)
+    if provider is None:
+        raise DescriptorError(f"descriptor provider '{provider_name}' unavailable: {reason}")
+
+    available, reason = await _provider_available(provider, provider_name, model)
+    if not available:
+        if provider_name == "ollama":
+            raise DescriptorError(
+                f"descriptor model '{model}' is not available in Ollama at "
+                f"{base_url} — pull it with 'ollama pull {model}'"
+            )
+        raise DescriptorError(f"descriptor model '{model}' unavailable: {reason}")
+    return provider
+
+
+async def ensure_descriptor_available() -> tuple[str, str]:
+    """
+    Resolve and probe the configured descriptor provider/model, raising
+    :class:`DescriptorError` with a clear English message when description
+    generation cannot proceed. Returns ``(provider_name, model)`` on success.
+    """
+    model = os.getenv("DESC_MODEL", "").strip()
+    if not model:
+        raise DescriptorError(_NO_MODEL_MESSAGE)
+
+    provider_name = os.getenv("DESC_PROVIDER", "ollama").lower().strip()
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+
+    await _require_provider(provider_name, base_url, model)
+    return provider_name, model
+
+
 # ---------------------------------------------------------------------------
 # Public entry-point
 # ---------------------------------------------------------------------------
@@ -216,6 +262,11 @@ async def describe_chunks(
     """
     Populate ``chunk.description`` in place for describable entities.
 
+    Raises :class:`DescriptorError` when no descriptor model is configured, or
+    when the configured provider/model is unavailable and there is at least
+    one entity left to describe (a fully-cached or fully-templated pass with
+    an unavailable provider still succeeds offline).
+
     Returns a stats dict (enabled / describable / cached / generated / failed /
     skipped / templated) suitable for surfacing in a job status.
     """
@@ -231,12 +282,9 @@ async def describe_chunks(
         else:
             remaining.append(chunk)
 
-    model = model if model is not None else os.getenv("DESC_MODEL", "")
-    skipped_total = len(remaining)
+    model = model if model is not None else os.getenv("DESC_MODEL", "").strip()
     if not model:
-        return {"enabled": False, "reason": "DESC_MODEL not set",
-                "describable": 0, "cached": 0, "generated": 0, "failed": 0,
-                "skipped": skipped_total, "templated": templated}
+        raise DescriptorError(_NO_MODEL_MESSAGE)
 
     provider_name = os.getenv("DESC_PROVIDER", "ollama").lower().strip()
     base_url = base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -260,21 +308,9 @@ async def describe_chunks(
 
     generated = failed = 0
     if to_generate:
-        provider, reason = _resolve_provider(provider_name, base_url)
-        if provider is None:
-            return {"enabled": True, "reason": f"provider '{provider_name}' unavailable: {reason}",
-                    "model": model, "describable": len(targets),
-                    "cached": cached, "generated": 0, "failed": 0,
-                    "pending": len(to_generate), "skipped": skipped,
-                    "templated": templated}
-
-        available, reason = await _provider_available(provider, provider_name, model)
-        if not available:
-            return {"enabled": True, "reason": reason,
-                    "model": model, "describable": len(targets),
-                    "cached": cached, "generated": 0, "failed": 0,
-                    "pending": len(to_generate), "skipped": skipped,
-                    "templated": templated}
+        # Probe availability only when there's actually something to generate —
+        # a fully-cached (or fully-templated) re-run must still work offline.
+        provider = await _require_provider(provider_name, base_url, model)
 
         sem = asyncio.Semaphore(concurrency)
         done = 0
