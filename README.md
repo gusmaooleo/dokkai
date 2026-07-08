@@ -81,6 +81,16 @@ Every describable entity (not a test, has source, not a one‑liner) gets a one�
   - **LLM‑generated** — everything else goes through the configured descriptor model with a **trimmed prompt**: entity type + qualified name, the extracted doc/leading comment (capped), and a capped source excerpt (cut at a line boundary) — instead of the full source. Measured ~21% faster per entity than the original full‑source prompt (0.61 s → 0.48 s/entity, qwen2.5-coder:3b, warm model, 20‑entity sample), with comparable quality.
 - **Cached by source hash** — unchanged source reuses its cached description on re‑ingestion, so incremental ingests only pay the LLM for what changed.
 - **Pluggable descriptor provider** — the descriptor is routed through the same LLM provider abstraction used for chat: `DESC_PROVIDER=ollama` (default, local) `| openai | anthropic`, selected via environment variables only (no `/config` endpoint for it).
+
+### Refreshing descriptions
+
+`POST /instances/{project}/describe` re-runs **only** the describe pass over a project that's already ingested — no `cgr`, no re-embedding of unchanged code. Useful when you switch descriptor models (`DESC_MODEL`/`DESC_PROVIDER`) or want to fill in gaps without paying for a full re-ingest.
+
+- The cache is still honored by default — unchanged entities are cache hits and cost nothing. Pass `{"force": true}` in the body to bypass the cache and regenerate every eligible description.
+- **Anti-drift guard**: the endpoint re-chunks the latest graph JSON in `ingested/` and only describes chunks whose source is byte-identical to what's stored in Weaviate. Entities whose source changed on disk since ingestion are counted as `stale_source` and skipped (with a note to re-ingest) — refresh never describes text that isn't what's actually indexed.
+- A transient generation failure never overwrites a good stored description with an empty one — such entities are counted as `preserved`.
+- Only the `description` property (and the `summary` vector it feeds) is updated; the `code` vector is untouched.
+- Runs as a background job like the pipeline: returns `{job_id, status}`, poll `GET /instances/jobs/{job_id}`.
 - **Fail‑loud policy** — `POST /instances/pipeline` always ingests with descriptions on. The descriptor is checked *before* the job is created: if it's missing or unavailable, the request fails immediately with **HTTP 400** and **no job is created** (nothing is ingested):
   - No model configured: `no descriptor model specified — set DESC_MODEL (e.g. qwen2.5-coder:3b) or configure a remote provider via DESC_PROVIDER`
   - Model not pulled: `descriptor model '<m>' is not available in Ollama at <base_url> — pull it with 'ollama pull <m>'`
@@ -205,7 +215,7 @@ curl -X POST localhost:8000/instances/pipeline \
   -d '{"repo_path":"/absolute/path/to/your/repo"}'
 ```
 
-This runs the full pipeline: graph extraction → chunking (with source) → embedding → storage. The `project_name` is taken from the repo's top‑level folder name.
+This runs the full pipeline: graph extraction (`cgr`) → chunking (with source) → descriptions → embedding/storage — the job reports these as stages `cgr → chunk → describe → upsert → done`. The `project_name` is taken from the repo's top‑level folder name.
 
 ### 6. Chat with the codebase
 
@@ -273,15 +283,20 @@ All configuration is via environment variables (loaded from `.env` at startup).
 | Method | Endpoint | Description |
 | --- | --- | --- |
 | `POST` | `/instances/pipeline` | Run the full ingestion pipeline for a `repo_path` |
+| `POST` | `/instances/{project}/describe` | Refresh descriptions for an already-ingested project (background job; optional `{"force": true}`) — see [Refreshing descriptions](#refreshing-descriptions) |
+| `GET` | `/instances/jobs` | List ingestion/refresh jobs |
+| `GET` | `/instances/jobs/{id}` | Get a job's status, `stage`/`stage_progress` and result |
 | `POST` | `/chat` | Chat over the codebase (SSE: `sources` → `token` → `done`) |
 | `GET` | `/chat/conversations` | List conversations |
 | `GET` | `/chat/conversations/{id}` | Get a conversation's history |
 | `DELETE` | `/chat/conversations/{id}` | Delete a conversation |
-| `POST` | `/config/llm` | Set the active LLM provider/model |
+| `POST` | `/config/llm` | Set the active LLM provider/model (rejects an invalid/retired remote model) |
 | `GET` | `/config/llm` | Get the current LLM config |
-| `GET` | `/config/llm/models` | List available models for the provider |
-| `GET` | `/config/llm/health` | Check provider connectivity |
+| `GET` | `/config/llm/models` | List available models for the provider (live catalog, static fallback on failure) |
+| `GET` | `/config/llm/health` | Check connectivity — probes the configured model |
 | `GET` | `/` | Health check |
+
+Jobs report `stage` through the unified vocabulary `cgr → chunk → describe → upsert → done` (refresh jobs use `chunk → describe → update → done`), plus a `stage_progress` object `{"stage", "done", "total"}` mirroring the current stage's `done`/`total` counters, and a `kind` (`"pipeline"` | `"refresh"`).
 
 ---
 
@@ -341,6 +356,7 @@ These are known and tracked in the [Roadmap](#roadmap):
 | 08 | PDF ingestion — local NotebookLM | planned |
 | 09 | Code review & bug‑hunt routines | planned |
 | 10 | Documentation site (en/pt/zh/es) | planned |
+| 11 | Post‑01 polish (live provider model catalogs, stage‑level job progress, describe refresh endpoint) | ✅ done (pending merge) |
 
 ### Retrieval quality
 
