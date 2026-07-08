@@ -51,7 +51,6 @@ _CAMEL_BOUNDARY_1 = re.compile(r"([A-Z]+)([A-Z][a-z])")   # HTTPServer  -> HTTP 
 _CAMEL_BOUNDARY_2 = re.compile(r"([a-z\d])([A-Z])")        # sendAlarm   -> send Alarm
 _ID_LEAF_SPLIT = re.compile(r"[.:#/\\]")
 _COMMENT_MARKER = re.compile(r"^(//+|#+|\*+|/\*+)\s?")
-_PY_DOCSTRING = re.compile(r':\s*\n\s*("""|\'\'\')(?P<body>.*?)\1', re.DOTALL)
 
 
 def _split_identifier(identifier: str) -> list[str]:
