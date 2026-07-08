@@ -36,6 +36,8 @@ tags:
     description: Ask questions about an ingested codebase (streaming) and manage history.
   - name: Config
     description: Configure and inspect the active LLM provider.
+  - name: Graph
+    description: Read-only queries over an ingested project's dependency graph.
 
 paths:
   /:
@@ -126,6 +128,14 @@ paths:
                   summary: DESC_MODEL not pulled in Ollama
                   value:
                     detail: "descriptor model 'qwen2.5-coder:3b' is not available in Ollama at http://localhost:11434 — pull it with 'ollama pull qwen2.5-coder:3b'"
+        "409":
+          description: A pipeline or refresh job is already queued/running for this project (derived from `repo_path`'s folder name).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "another job is running for project 'your-repo'"
         "422":
           $ref: "#/components/responses/ValidationError"
 
@@ -237,15 +247,67 @@ paths:
               example:
                 detail: "project 'your-repo' has no chunks — ingest it first with POST /instances/pipeline"
         "409":
-          description: No graph JSON found for this project in `ingested/`.
+          description: Either no graph JSON was found for this project in `ingested/`, or a pipeline/refresh job is already queued/running for it.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
-              example:
-                detail: "no graph JSON found for project 'your-repo' in ingested/ — re-run POST /instances/pipeline to regenerate it"
+              examples:
+                no_graph_json:
+                  summary: Graph JSON missing from ingested/
+                  value:
+                    detail: "no graph JSON found for project 'your-repo' in ingested/ — re-run POST /instances/pipeline to regenerate it"
+                job_conflict:
+                  summary: Another job already running for this project
+                  value:
+                    detail: "another job is running for project 'your-repo'"
         "422":
           $ref: "#/components/responses/ValidationError"
+
+  /instances/jobs/{job_id}/events:
+    get:
+      tags: [Instances]
+      summary: Stream a job's progress (SSE)
+      description: |
+        Streams a single job's progress as **Server-Sent Events**, mirroring
+        `POST /chat`'s framing (`text/event-stream`, `event: <type>\ndata:
+        <json>\n\n` lines, no-cache headers).
+
+        Emits the current job state immediately on connect, then again
+        whenever `updated_at` changes (polled internally every ~0.5s). Event
+        type is `job` for in-progress updates and `done` for the terminal
+        state (`status = succeeded` or `failed`) — after which the stream
+        closes. The `data` payload is the same `Job` object returned by
+        `GET /instances/jobs/{job_id}`.
+
+        An unknown `job_id` returns a plain `404` (not a stream).
+      operationId: streamJobEvents
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: |
+            An SSE stream. Each event is `event: <type>\ndata: <json>\n\n`.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              examples:
+                stream:
+                  summary: Example event sequence
+                  value: |
+                    event: job
+                    data: {"id":"b0dc2159-...","status":"running","stage":"describe","done":120,"total":1739,"kind":"pipeline", "...": "..."}
+
+                    event: done
+                    data: {"id":"b0dc2159-...","status":"succeeded","stage":"done","kind":"pipeline", "...": "..."}
+        "404":
+          $ref: "#/components/responses/NotFound"
 
   /instances/jobs/{job_id}:
     get:
@@ -268,6 +330,197 @@ paths:
                 $ref: "#/components/schemas/Job"
         "404":
           $ref: "#/components/responses/NotFound"
+
+  # ---------------------------------------------------------------------------
+  # Graph
+  # ---------------------------------------------------------------------------
+  /graph:
+    get:
+      tags: [Graph]
+      summary: List projects with an ingested graph
+      description: |
+        Lists every project with a graph JSON in `ingested/`. Read directly
+        off the filesystem — restart-proof, no separate registry. Returns
+        `[]` when nothing has been ingested yet.
+      operationId: listGraphs
+      responses:
+        "200":
+          description: Projects with an ingested graph.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ProjectGraphDTO"
+
+  /graph/{project}:
+    get:
+      tags: [Graph]
+      summary: Get a project's full graph
+      description: |
+        Returns the ingested graph for `project`, normalized to
+        `{id, kind, name, qualified_name, path, absolute_path, start_line,
+        end_line}` nodes and `{source, target, type}` edges.
+
+        By default only code-entity nodes (Class, Function, Method,
+        Interface, Enum, Type) are returned, plus edges between them. Pass
+        `include=structural` to get every node instead (folders, files,
+        modules, packages, the project, external packages) and every edge.
+        Edges are always restricted to pairs where both endpoints are in the
+        returned node set — no dangling endpoints.
+      operationId: getGraph
+      parameters:
+        - name: project
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: include
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [structural]
+          description: Set to `structural` to include every node/edge instead of only code entities.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 5000
+          description: Maximum number of nodes to return (no upper bound).
+      responses:
+        "200":
+          description: The project's graph.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GraphResponse"
+        "404":
+          description: No graph has been ingested for this project.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "no graph found for project 'your-repo' — run POST /instances/pipeline to ingest it"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /graph/{project}/neighborhood:
+    get:
+      tags: [Graph]
+      summary: Get an entity's neighborhood
+      description: |
+        BFS from `entity`'s node over `CALLS`, `INHERITS`, `IMPLEMENTS`,
+        `OVERRIDES`, `DEFINES` and `DEFINES_METHOD` edges only — never
+        `IMPORTS` or containment/external-dependency edges.
+
+        `direction` picks which adjacency to follow while expanding (`out` =
+        outgoing edges only, `in` = incoming only, `both` = either); `depth`
+        bounds the number of hops; `limit` caps the total returned node
+        count (root included, closest hop first). Returned nodes carry a
+        `hop` field (0 = the center entity); the center is also returned
+        separately as `center`.
+      operationId: getNeighborhood
+      parameters:
+        - name: project
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: entity
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Qualified name of the entity to center the neighborhood on.
+          example: src.alarms.AlarmValidationUseCase
+        - name: depth
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+          description: Number of hops to expand from the entity.
+        - name: direction
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [in, out, both]
+            default: both
+          description: Which edge direction to follow while expanding.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 200
+          description: Maximum number of nodes to return, root included, closest-first.
+      responses:
+        "200":
+          description: The entity's neighborhood.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NeighborhoodResponse"
+        "404":
+          description: No graph for this project, or the entity was not found in it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                no_graph:
+                  summary: Project never ingested
+                  value:
+                    detail: "no graph found for project 'your-repo' — run POST /instances/pipeline to ingest it"
+                entity_not_found:
+                  summary: Qualified name not in this project's graph
+                  value:
+                    detail: "entity 'src.alarms.AlarmValidationUseCase' not found in project 'your-repo' graph"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /graph/{project}/files:
+    get:
+      tags: [Graph]
+      summary: Get the file-level dependency view
+      description: |
+        Aggregates every relationship in the graph into file-to-file edges:
+        each edge endpoint is mapped to the file it belongs to (code
+        entities, modules and files map via their path; folders, packages,
+        the project, and external packages are not files and drop the
+        relationship). Edges between the same pair of files are aggregated
+        into one edge with a total `weight` and a per relationship-type
+        `types` breakdown. Self-loops and external dependencies are
+        excluded — only internal file-to-file dependencies remain.
+      operationId: getFileView
+      parameters:
+        - name: project
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The project's file-level dependency view.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileViewResponse"
+        "404":
+          description: No graph has been ingested for this project.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "no graph found for project 'your-repo' — run POST /instances/pipeline to ingest it"
 
   # ---------------------------------------------------------------------------
   # Chat
@@ -611,7 +864,9 @@ components:
       properties:
         project_name: { type: string }
         chunks_created: { type: integer, description: Distinct objects upserted. }
-        ingestion_id: { type: string }
+        ingestion_id:
+          type: string
+          description: "Unique per run: `<project>-<UTC timestamp>`, e.g. `your-repo-20260708T120000`."
         descriptions:
           $ref: "#/components/schemas/DescriptionStats"
 
@@ -662,7 +917,16 @@ components:
                 ingest:
                   type: object
                   properties:
-                    output_json: { type: string }
+                    output_json:
+                      type: string
+                      description: >-
+                        Canonical graph JSON path for the project,
+                        `ingested/<project>.json` — cgr's timestamped output
+                        is atomically promoted (renamed) to this path on
+                        success, and older timestamped leftovers for the same
+                        project are removed. This is the same file the Graph
+                        API (`GET /graph/...`) reads from.
+                      example: ingested/your-repo.json
                 vectorize:
                   $ref: "#/components/schemas/VectorizeResult"
             - $ref: "#/components/schemas/RefreshResult"
@@ -810,3 +1074,134 @@ components:
           type: string
           enum: [healthy, unhealthy]
         message: { type: string }
+
+    ProjectGraphDTO:
+      type: object
+      description: One entry of `GET /graph`'s listing.
+      properties:
+        project: { type: string }
+        file: { type: string, description: Graph JSON filename in `ingested/`. }
+        nodes: { type: integer, description: Total node count in the graph. }
+        edges: { type: integer, description: Total relationship count in the graph. }
+        generated_at: { type: string, description: Export timestamp from the graph JSON, or the file's mtime as a fallback. }
+
+    GraphNodeDTO:
+      type: object
+      description: A normalized graph node.
+      properties:
+        id: { type: integer }
+        kind: { type: string, example: Class }
+        name: { type: string, nullable: true }
+        qualified_name: { type: string, nullable: true }
+        path: { type: string, nullable: true }
+        absolute_path: { type: string, nullable: true }
+        start_line: { type: integer, nullable: true }
+        end_line: { type: integer, nullable: true }
+
+    GraphEdgeDTO:
+      type: object
+      description: A normalized graph edge.
+      properties:
+        source: { type: integer }
+        target: { type: integer }
+        type: { type: string, example: CALLS }
+
+    GraphStatsDTO:
+      type: object
+      properties:
+        total_nodes: { type: integer, description: Count of nodes in the selected set (code-entity or structural) before limit. }
+        total_edges: { type: integer, description: Count of edges among the selected nodes before limit. }
+        returned_nodes: { type: integer }
+        returned_edges: { type: integer }
+        truncated: { type: boolean, description: True when returned_nodes < total_nodes (limit cut the response). }
+
+    GraphResponse:
+      type: object
+      properties:
+        project: { type: string }
+        generated_at: { type: string, nullable: true }
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/GraphNodeDTO"
+        edges:
+          type: array
+          items:
+            $ref: "#/components/schemas/GraphEdgeDTO"
+        stats:
+          $ref: "#/components/schemas/GraphStatsDTO"
+
+    NeighborhoodNodeDTO:
+      allOf:
+        - $ref: "#/components/schemas/GraphNodeDTO"
+        - type: object
+          properties:
+            hop: { type: integer, description: "0 = the center entity, 1 = direct neighbor, ..." }
+
+    NeighborhoodStatsDTO:
+      type: object
+      properties:
+        depth: { type: integer }
+        direction: { type: string, enum: [in, out, both] }
+        limit: { type: integer }
+        returned_nodes: { type: integer }
+        returned_edges: { type: integer }
+        truncated: { type: boolean }
+
+    NeighborhoodResponse:
+      type: object
+      properties:
+        project: { type: string }
+        entity: { type: string }
+        center:
+          $ref: "#/components/schemas/GraphNodeDTO"
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/NeighborhoodNodeDTO"
+        edges:
+          type: array
+          items:
+            $ref: "#/components/schemas/GraphEdgeDTO"
+        stats:
+          $ref: "#/components/schemas/NeighborhoodStatsDTO"
+
+    FileDTO:
+      type: object
+      properties:
+        path: { type: string, description: Repo-relative path. }
+        name: { type: string }
+        absolute_path: { type: string, nullable: true }
+
+    FileEdgeDTO:
+      type: object
+      properties:
+        source: { type: string, description: Source file path. }
+        target: { type: string, description: Target file path. }
+        weight: { type: integer, description: Total aggregated relationship count between the two files. }
+        types:
+          type: object
+          additionalProperties:
+            type: integer
+          description: 'Per relationship-type breakdown, e.g. `{"CALLS": 3, "IMPORTS": 1}`.'
+
+    FileViewStatsDTO:
+      type: object
+      properties:
+        files: { type: integer }
+        edges: { type: integer }
+
+    FileViewResponse:
+      type: object
+      properties:
+        project: { type: string }
+        files:
+          type: array
+          items:
+            $ref: "#/components/schemas/FileDTO"
+        edges:
+          type: array
+          items:
+            $ref: "#/components/schemas/FileEdgeDTO"
+        stats:
+          $ref: "#/components/schemas/FileViewStatsDTO"

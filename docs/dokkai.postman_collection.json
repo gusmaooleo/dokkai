@@ -2,7 +2,7 @@
   "info": {
     "name": "Dokkai API",
     "_postman_id": "d0kka1-0000-4000-8000-000000000001",
-    "description": "HTTP API for Dokkai — a graph-aware vector database over a codebase.\n\nUsage order:\n1. Config → Set LLM provider (or set OLLAMA_CHAT_MODEL on the server).\n2. Instances → Start pipeline (captures {{jobId}} automatically).\n3. Instances → Get job (poll until status = succeeded).\n4. Chat → Chat (SSE): note Postman shows the raw event stream.\n\nCollection variables let you avoid editing every request: set {{baseUrl}}, {{repoPath}}, {{projectName}} once.",
+    "description": "HTTP API for Dokkai — a graph-aware vector database over a codebase.\n\nUsage order:\n1. Config → Set LLM provider (or set OLLAMA_CHAT_MODEL on the server).\n2. Instances → Start pipeline (captures {{jobId}} automatically).\n3. Instances → Get job (poll until status = succeeded), or Job events (SSE) to stream progress.\n4. Chat → Chat (SSE): note Postman shows the raw event stream.\n5. Graph → List graphs / Get project graph / Get entity neighborhood / Get file dependency view, once a project is ingested.\n\nNote: only one pipeline/refresh job may run per project at a time — a second one returns 409 (see the '409 - job already running' saved examples).\n\nCollection variables let you avoid editing every request: set {{baseUrl}}, {{repoPath}}, {{projectName}} once.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -10,7 +10,8 @@
     { "key": "repoPath", "value": "/absolute/path/to/your/repo", "type": "string" },
     { "key": "projectName", "value": "your-repo", "type": "string" },
     { "key": "jobId", "value": "", "type": "string" },
-    { "key": "conversationId", "value": "", "type": "string" }
+    { "key": "conversationId", "value": "", "type": "string" },
+    { "key": "entityQualifiedName", "value": "src.alarms.AlarmValidationUseCase", "type": "string" }
   ],
   "item": [
     {
@@ -63,7 +64,7 @@
               "host": ["{{baseUrl}}"],
               "path": ["instances", "pipeline"]
             },
-            "description": "Enqueue the ingestion pipeline. Returns { job_id, status } immediately and runs in the background.\n\nSet recreate:true only once, to migrate the schema (it drops the whole collection). The test script saves job_id into {{jobId}}.\n\nFail-loud descriptor policy: the configured DESC_MODEL/DESC_PROVIDER is checked before the job is created. Missing or unavailable descriptor -> 400, no job created (see the '400 - no descriptor model' saved example)."
+            "description": "Enqueue the ingestion pipeline. Returns { job_id, status } immediately and runs in the background.\n\nSet recreate:true only once, to migrate the schema (it drops the whole collection). The test script saves job_id into {{jobId}}.\n\nFail-loud descriptor policy: the configured DESC_MODEL/DESC_PROVIDER is checked before the job is created. Missing or unavailable descriptor -> 400, no job created (see the '400 - no descriptor model' saved example).\n\nPer-project job lock: a second pipeline/refresh job for a project that already has one queued/running -> 409, no job created (see the '409 - job already running' saved example)."
           },
           "response": [
             {
@@ -87,6 +88,28 @@
               "header": [{ "key": "Content-Type", "value": "application/json" }],
               "cookie": [],
               "body": "{\n  \"detail\": \"no descriptor model specified — set DESC_MODEL (e.g. qwen2.5-coder:3b) or configure a remote provider via DESC_PROVIDER\"\n}"
+            },
+            {
+              "name": "409 - job already running",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"repo_path\": \"{{repoPath}}\",\n  \"recreate\": false\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/instances/pipeline",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["instances", "pipeline"]
+                }
+              },
+              "status": "Conflict",
+              "code": 409,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"another job is running for project 'your-repo'\"\n}"
             }
           ]
         },
@@ -133,6 +156,20 @@
               "path": ["instances", "jobs", "{{jobId}}"]
             },
             "description": "Poll a job's progress. Watch stage (cgr -> chunk -> describe -> upsert -> done for pipeline jobs, chunk -> describe -> update -> done for refresh jobs), stage_progress {stage,done,total}, and result.vectorize.descriptions (pipeline) or result.descriptions (refresh)."
+          },
+          "response": []
+        },
+        {
+          "name": "Job events (SSE)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "text/event-stream" }],
+            "url": {
+              "raw": "{{baseUrl}}/instances/jobs/{{jobId}}/events",
+              "host": ["{{baseUrl}}"],
+              "path": ["instances", "jobs", "{{jobId}}", "events"]
+            },
+            "description": "Streams the job's progress as Server-Sent Events, mirroring Chat (SSE)'s framing. Emits the current state on connect, then again whenever updated_at changes (~0.5s poll). event: job for in-progress updates, event: done for the terminal state (status = succeeded|failed), after which the stream closes. Each event's data is the same Job object as GET /instances/jobs/{id}. Unknown job_id -> plain 404 (not a stream).\n\nNote: Postman buffers the stream and shows it after completion; use curl -N for live events."
           },
           "response": []
         },
@@ -208,6 +245,25 @@
               "header": [{ "key": "Content-Type", "value": "application/json" }],
               "cookie": [],
               "body": "{\n  \"detail\": \"no graph JSON found for project 'your-repo' in ingested/ — re-run POST /instances/pipeline to regenerate it\"\n}"
+            },
+            {
+              "name": "409 - job already running",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": { "mode": "raw", "raw": "{}" },
+                "url": {
+                  "raw": "{{baseUrl}}/instances/{{projectName}}/describe",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["instances", "{{projectName}}", "describe"]
+                }
+              },
+              "status": "Conflict",
+              "code": 409,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"another job is running for project 'your-repo'\"\n}"
             }
           ]
         },
@@ -333,6 +389,92 @@
               "path": ["chat", "conversations", "{{conversationId}}"]
             },
             "description": "Delete a conversation and its history."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Graph",
+      "item": [
+        {
+          "name": "List graphs",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/graph",
+              "host": ["{{baseUrl}}"],
+              "path": ["graph"]
+            },
+            "description": "List every project with an ingested graph in ingested/. Returns [] when nothing has been ingested yet. Restart-proof -- read straight off the filesystem."
+          },
+          "response": []
+        },
+        {
+          "name": "Get project graph (code entities)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/graph/{{projectName}}?limit=5000",
+              "host": ["{{baseUrl}}"],
+              "path": ["graph", "{{projectName}}"],
+              "query": [{ "key": "limit", "value": "5000" }]
+            },
+            "description": "Normalized graph for the project: code-entity nodes (Class/Function/Method/Interface/Enum/Type) and edges among them only. 404 if the project was never ingested."
+          },
+          "response": []
+        },
+        {
+          "name": "Get project graph (structural)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/graph/{{projectName}}?include=structural&limit=5000",
+              "host": ["{{baseUrl}}"],
+              "path": ["graph", "{{projectName}}"],
+              "query": [
+                { "key": "include", "value": "structural" },
+                { "key": "limit", "value": "5000" }
+              ]
+            },
+            "description": "Every node (code entities, folders, files, modules, packages, the project, external packages) and every edge, up to limit."
+          },
+          "response": []
+        },
+        {
+          "name": "Get entity neighborhood",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/graph/{{projectName}}/neighborhood?entity={{entityQualifiedName}}&depth=1&direction=both&limit=200",
+              "host": ["{{baseUrl}}"],
+              "path": ["graph", "{{projectName}}", "neighborhood"],
+              "query": [
+                { "key": "entity", "value": "{{entityQualifiedName}}" },
+                { "key": "depth", "value": "1" },
+                { "key": "direction", "value": "both" },
+                { "key": "limit", "value": "200" }
+              ]
+            },
+            "description": "BFS over CALLS/INHERITS/IMPLEMENTS/OVERRIDES/DEFINES/DEFINES_METHOD edges only (never IMPORTS or containment/external edges). Nodes carry hop (0 = center); the center is also returned separately. 404 if the project has no graph, or if entity isn't in it."
+          },
+          "response": []
+        },
+        {
+          "name": "Get file dependency view",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/graph/{{projectName}}/files",
+              "host": ["{{baseUrl}}"],
+              "path": ["graph", "{{projectName}}", "files"]
+            },
+            "description": "Directed file-to-file dependency aggregation, internal files only (external packages/modules excluded, self-loops skipped). Each edge has a total weight and a per relationship-type types breakdown."
           },
           "response": []
         }
