@@ -210,11 +210,11 @@ def build_describe_prompt(chunk: CodeChunk, mode: str = "full") -> str:
     """
     Build the per-entity user prompt sent to the descriptor LLM.
 
-    ``mode="full"`` reproduces today's prompt (entity type + qualified name +
-    the complete source) bit-for-bit. ``mode="trimmed"`` is an experimental,
-    token-cheaper variant (decision 1c) that adds the extracted doc/comment
-    (capped) and caps the source excerpt, cutting at a line boundary — it is
-    measured via ``scripts/measure_descriptions.py`` but not yet shipped.
+    ``mode="full"`` is the original prompt (entity type + qualified name +
+    the complete source). ``mode="trimmed"`` — the shipped default since the
+    1c measurement gate — adds the extracted doc/comment (capped) and caps
+    the source excerpt, cutting at a line boundary. Both modes are measurable
+    via ``scripts/measure_descriptions.py``.
     """
     if mode == "full":
         return f"{chunk.entity_type} {chunk.qualified_name}\n\n{chunk.source_code}"
@@ -230,7 +230,7 @@ def build_describe_prompt(chunk: CodeChunk, mode: str = "full") -> str:
 async def _generate_one(provider: LLMProvider, model: str, chunk: CodeChunk) -> str:
     messages = [
         LLMMessage("system", DESC_SYSTEM_PROMPT),
-        LLMMessage("user", build_describe_prompt(chunk, "full")),
+        LLMMessage("user", build_describe_prompt(chunk, "trimmed")),
     ]
     response = await provider.chat(
         messages, model=model, temperature=_GEN_TEMPERATURE, max_tokens=_GEN_MAX_TOKENS
