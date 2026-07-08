@@ -187,8 +187,16 @@ async def _provider_available(
         if not matched:
             return False, f"model '{model}' unavailable"
         return True, ""
-    healthy, message = await provider.health_check()
-    return healthy, message
+    # Remote providers: probe with the actual configured model (a 1-token
+    # call) instead of provider.health_check(), whose hard-coded model can
+    # lag behind the vendor's catalog and 404 even when DESC_MODEL is valid.
+    try:
+        await provider.chat(
+            [LLMMessage("user", "hi")], model=model, temperature=0.0, max_tokens=1
+        )
+    except Exception as e:
+        return False, str(e)
+    return True, ""
 
 
 _TRIMMED_DOC_CAP = 600
