@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from controllers import instances, chat, config
+from controllers import instances, chat, config, graph
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -52,6 +52,7 @@ app.add_middleware(
 app.include_router(instances.router)
 app.include_router(chat.router)
 app.include_router(config.router)
+app.include_router(graph.router)
 
 @app.get("/")
 async def root():

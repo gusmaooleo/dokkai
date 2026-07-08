@@ -282,10 +282,15 @@ All configuration is via environment variables (loaded from `.env` at startup).
 
 | Method | Endpoint | Description |
 | --- | --- | --- |
-| `POST` | `/instances/pipeline` | Run the full ingestion pipeline for a `repo_path` |
-| `POST` | `/instances/{project}/describe` | Refresh descriptions for an already-ingested project (background job; optional `{"force": true}`) — see [Refreshing descriptions](#refreshing-descriptions) |
+| `POST` | `/instances/pipeline` | Run the full ingestion pipeline for a `repo_path` (409 if a job is already running for that project) |
+| `POST` | `/instances/{project}/describe` | Refresh descriptions for an already-ingested project (background job; optional `{"force": true}`; 409 if a job is already running for that project) — see [Refreshing descriptions](#refreshing-descriptions) |
 | `GET` | `/instances/jobs` | List ingestion/refresh jobs |
 | `GET` | `/instances/jobs/{id}` | Get a job's status, `stage`/`stage_progress` and result |
+| `GET` | `/instances/jobs/{id}/events` | Stream a job's progress as Server‑Sent Events (`event: job` on each update, `event: done` when it finishes) |
+| `GET` | `/graph` | List projects with an ingested graph |
+| `GET` | `/graph/{project}` | Full project graph (code entities by default, `?include=structural` for everything), `?limit=N` |
+| `GET` | `/graph/{project}/neighborhood` | BFS neighborhood of an entity — `?entity=<qualified_name>&depth=&direction=&limit=` |
+| `GET` | `/graph/{project}/files` | File‑to‑file dependency view (internal files only) |
 | `POST` | `/chat` | Chat over the codebase (SSE: `sources` → `token` → `done`) |
 | `GET` | `/chat/conversations` | List conversations |
 | `GET` | `/chat/conversations/{id}` | Get a conversation's history |
@@ -298,6 +303,20 @@ All configuration is via environment variables (loaded from `.env` at startup).
 
 Jobs report `stage` through the unified vocabulary `cgr → chunk → describe → upsert → done` (refresh jobs use `chunk → describe → update → done`), plus a `stage_progress` object `{"stage", "done", "total"}` mirroring the current stage's `done`/`total` counters, and a `kind` (`"pipeline"` | `"refresh"`).
 
+**Per‑project job lock** — only one pipeline/refresh job may run at a time for a given project; submitting a second one (either endpoint) returns HTTP 409 `another job is running for project '<project>'` and creates no job.
+
+**Job progress over SSE** — instead of polling `GET /instances/jobs/{id}`, `GET /instances/jobs/{id}/events` streams the same job payload over Server‑Sent Events (same framing as `/chat`): it emits `event: job` on every `updated_at` change and a terminal `event: done` with the final payload, then closes the stream. An unknown job id is a plain 404, not a stream.
+
+### Graph API
+
+All four `/graph...` endpoints are read‑only and served straight from the ingested graph JSON in `ingested/` — no separate database, restart‑proof, lazily loaded and cached in memory per project.
+
+- **`GET /graph`** — list every project with an ingested graph: `[{project, file, nodes, edges, generated_at}]`.
+- **`GET /graph/{project}?include=structural&limit=N`** — the project's graph, normalized to `{id, kind, name, qualified_name, path, absolute_path, start_line, end_line}` nodes and `{source, target, type}` edges, plus a `stats` block (`total_nodes`/`total_edges`/`returned_nodes`/`returned_edges`/`truncated`). By default only code‑entity nodes (Class/Function/Method/Interface/Enum/Type) and edges among them are returned; `include=structural` returns everything (folders, files, modules, packages, the project, external packages). `limit` defaults to 5000 with no upper bound. Edges never dangle — both endpoints are always in the returned node set.
+- **`GET /graph/{project}/neighborhood?entity=<qualified_name>&depth=1&direction=both&limit=200`** — BFS from a single entity over `CALLS`/`INHERITS`/`IMPLEMENTS`/`OVERRIDES`/`DEFINES`/`DEFINES_METHOD` edges only (never `IMPORTS` or containment/external edges). Nodes carry a `hop` (0 = the entity itself); the center node is also returned separately as `center`. `direction` picks which adjacency to follow (`in` | `out` | `both`); `depth` bounds hops; `limit` caps the total node count, closest‑first.
+- **`GET /graph/{project}/files`** — file‑to‑file dependency view: `{files:[{path,name,absolute_path}], edges:[{source,target,weight,types:{TYPE:count}}], stats:{files,edges}}`. Internal files only (external packages/modules are dropped) and self‑loops are skipped.
+- Unknown project → 404 `no graph found for project '<project>' — run POST /instances/pipeline to ingest it`. Unknown entity on the neighborhood endpoint → 404 `entity '<qualified_name>' not found in project '<project>' graph`.
+
 ---
 
 ## Project structure
@@ -306,14 +325,16 @@ Jobs report `stage` through the unified vocabulary `cgr → chunk → describe �
 dokkai/
 ├── src/
 │   ├── main.py                  # FastAPI app + startup (auto-config/warm LLM)
-│   ├── controllers/             # instances, chat, config routes
+│   ├── controllers/             # instances, graph, chat, config routes
 │   ├── services/
-│   │   ├── ingest.py            # runs code-graph-rag (cgr)
+│   │   ├── ingest.py            # runs code-graph-rag (cgr), promotes canonical JSON
 │   │   ├── chunker.py           # graph JSON → rich code chunks (with source)
 │   │   ├── vectorize.py         # chunk + store orchestrator
 │   │   ├── weaviate_client.py   # collection schema, upsert, deterministic UUIDs
+│   │   ├── graph_store.py       # loads/caches ingested graph JSON; graph query endpoints
 │   │   ├── retriever.py         # hybrid search + graph expansion
 │   │   ├── chat.py              # RAG chat pipeline (retrieve → prompt → stream)
+│   │   ├── jobs.py              # background job store (per-project lock, SSE events)
 │   │   ├── llm_provider.py      # Ollama / OpenAI / Anthropic abstraction
 │   │   ├── llm_config.py        # provider config store + validation
 │   │   └── chat_store.py        # conversation history (in-memory)
@@ -322,7 +343,9 @@ dokkai/
 ├── frontend/                    # Next.js app (WIP)
 ├── docker-compose.yml           # Weaviate (text2vec-ollama)
 ├── dev.sh                       # dev server launcher
-└── ingested/                    # generated graph JSON outputs
+└── ingested/                    # canonical graph JSON per project — <project>.json,
+                                  # promoted from cgr's timestamped output after each
+                                  # successful pipeline run; served by the Graph API
 ```
 
 ---
@@ -347,7 +370,7 @@ These are known and tracked in the [Roadmap](#roadmap):
 | # | Feature | Status |
 | --- | --- | --- |
 | 01 | Describe v2 (lighter descriptions, template descriptions, provider selection, fail‑loud policy) + absolute file paths | ✅ done |
-| 02 | Graph query API | planned |
+| 02 | Graph query API | ✅ done (pending merge) |
 | 03 | MCP server (core) | planned |
 | 04 | npm CLI (`dokkai`) + SRCS mode | planned |
 | 05 | Postgres conversation history | planned |
