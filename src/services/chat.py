@@ -9,6 +9,7 @@ Chat / RAG service — orchestrates retrieval + LLM generation.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import AsyncIterator
 
@@ -103,20 +104,26 @@ async def chat_with_codebase(
         conversation_id = str(uuid.uuid4())
 
     # ---- Step 1: Retrieve relevant code (graph-expanded) ----
-    client = get_client()
-    try:
-        retriever = Retriever(client)
-        chunks = retriever.search_graph(
-            query=message,
-            project_name=project_name,
-            top_k_seeds=top_k,
-            max_hops=max_hops,
-            max_nodes=max_nodes,
-            direction=direction,
-        )
-        context = retriever.build_graph_context(chunks)
-    finally:
-        client.close()
+    # The Weaviate client is synchronous (blocking gRPC), so run the whole
+    # retrieval off the event loop — otherwise it freezes every other request
+    # (concurrent chats, job-status polls) for the full retrieval window.
+    def _retrieve() -> tuple[list[RetrievedChunk], str]:
+        client = get_client()
+        try:
+            retriever = Retriever(client)
+            chunks = retriever.search_graph(
+                query=message,
+                project_name=project_name,
+                top_k_seeds=top_k,
+                max_hops=max_hops,
+                max_nodes=max_nodes,
+                direction=direction,
+            )
+            return chunks, retriever.build_graph_context(chunks)
+        finally:
+            client.close()
+
+    chunks, context = await asyncio.to_thread(_retrieve)
 
     # Yield sources to the client
     source_dicts = [
@@ -128,6 +135,7 @@ async def chat_with_codebase(
             "start_line": c.start_line,
             "end_line": c.end_line,
             "chunk_text": c.chunk_text,
+            "description": c.description,
             "score": c.score,
             "hop": c.hop,
             "via": c.via,

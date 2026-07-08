@@ -14,7 +14,7 @@ from typing import Any, cast
 import weaviate
 from weaviate.classes.query import MetadataQuery, HybridFusion, Filter
 
-from services.weaviate_client import uuid_for_entity
+from services.weaviate_client import uuid_for_entity, VECTOR_CODE, VECTOR_SUMMARY
 
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "CodeEntity")
 
@@ -86,6 +86,7 @@ class RetrievedChunk:
     implements: list[str] = field(default_factory=list)
     overrides: list[str] = field(default_factory=list)
     defined_methods: list[str] = field(default_factory=list)
+    description: str = ""  # Tier 2: LLM micro-description (summary-vector source)
     score: float | None = None
     hop: int = 0          # 0 = seed (matched query), 1 = direct neighbor, ...
     via: str = ""         # provenance, e.g. "calls ← registerRoutes"
@@ -117,6 +118,7 @@ class Retriever:
         entity_type: str | None = None,
         top_k: int = 10,
         alpha: float = 0.7,
+        target_vector: str = VECTOR_SUMMARY,
     ) -> list[RetrievedChunk]:
         """
         Run a hybrid search (vector + keyword) against the collection.
@@ -134,6 +136,9 @@ class Retriever:
         alpha : float
             Balance between vector (1.0) and keyword (0.0) search. Default
             0.7 leans towards semantic similarity.
+        target_vector : str
+            Which named vector to search — ``summary`` (natural-language intent,
+            default) or ``code`` (literal source). The collection has both.
 
         Returns
         -------
@@ -150,6 +155,7 @@ class Retriever:
             alpha=alpha,
             fusion_type=HybridFusion.RELATIVE_SCORE,
             filters=filters,
+            target_vector=target_vector,
             return_metadata=MetadataQuery(score=True),
         )
 
@@ -192,8 +198,18 @@ class Retriever:
         if direction in ("backward", "both"):
             edges |= _BACKWARD_EDGES
 
-        # 1) seeds via hybrid search
-        seeds = self.search(query, project_name=project_name, top_k=top_k_seeds, alpha=alpha)
+        # 1) seeds via hybrid search on BOTH named vectors, merged: the summary
+        #    vector catches conceptual matches, the code vector catches literal
+        #    ones (and undescribed entities that have no summary vector).
+        summary_seeds = self.search(
+            query, project_name=project_name, top_k=top_k_seeds, alpha=alpha,
+            target_vector=VECTOR_SUMMARY,
+        )
+        code_seeds = self.search(
+            query, project_name=project_name, top_k=top_k_seeds, alpha=alpha,
+            target_vector=VECTOR_CODE,
+        )
+        seeds = self._merge_seeds(summary_seeds, code_seeds, top_k_seeds)
         selected: dict[str, RetrievedChunk] = {}
         for seed in seeds:
             seed.hop, seed.via = 0, "seed (matched query)"
@@ -225,6 +241,10 @@ class Retriever:
                 parent, score, field_name = wanted[qn]
                 chunk.hop = hop
                 chunk.via = f"{field_name} ← {parent.name}"
+                # De-prioritize tests reached via expansion too, not just seeds,
+                # so they don't re-enter the context through the graph.
+                if _TEST_PENALTY < 1.0 and _is_test_path(chunk.file_path):
+                    score *= _TEST_PENALTY
                 chunk.score = score
                 selected[qn] = chunk
                 frontier.append(chunk)
@@ -317,7 +337,8 @@ class Retriever:
         total = 0
         for i, chunk in enumerate(chunks, 1):
             tag = "SEED · matched query" if chunk.hop == 0 else f"hop {chunk.hop} · {chunk.via}"
-            section = f"--- Source {i} [{tag}] ---\n{chunk.chunk_text}"
+            summary = f"Summary: {chunk.description}\n" if chunk.description else ""
+            section = f"--- Source {i} [{tag}] ---\n{summary}{chunk.chunk_text}"
             if sections and total + len(section) > max_chars:
                 break
             sections.append(section)
@@ -351,8 +372,23 @@ class Retriever:
             implements=list(props.get("implements", [])),  # type: ignore[arg-type]
             overrides=list(props.get("overrides", [])),  # type: ignore[arg-type]
             defined_methods=list(props.get("defined_methods", [])),  # type: ignore[arg-type]
+            description=str(props.get("description", "")),
             score=obj.metadata.score if obj.metadata else None,
         )
+
+    @staticmethod
+    def _merge_seeds(
+        summary_seeds: list[RetrievedChunk],
+        code_seeds: list[RetrievedChunk],
+        limit: int,
+    ) -> list[RetrievedChunk]:
+        """Union two seed lists by qualified_name, keeping the higher score."""
+        best: dict[str, RetrievedChunk] = {}
+        for chunk in (*summary_seeds, *code_seeds):
+            existing = best.get(chunk.qualified_name)
+            if existing is None or (chunk.score or 0.0) > (existing.score or 0.0):
+                best[chunk.qualified_name] = chunk
+        return sorted(best.values(), key=lambda c: -(c.score or 0.0))[:limit]
 
     def _fetch_by_qnames(
         self, qnames: list[str], project_name: str
