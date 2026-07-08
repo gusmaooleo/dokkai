@@ -63,10 +63,10 @@ paths:
       tags: [Instances]
       summary: Start an ingestion pipeline
       description: |
-        Enqueue the full pipeline (graph extraction → chunking → descriptions →
-        embedding) as a **background job** and return immediately with a
-        `job_id`. Poll `GET /instances/jobs/{job_id}` for progress and the final
-        result.
+        Enqueue the full pipeline (`cgr → chunk → describe → upsert`) as a
+        **background job** and return immediately with a `job_id`. Poll
+        `GET /instances/jobs/{job_id}` for progress (`stage`, `stage_progress`)
+        and the final result.
 
         `recreate` drops and rebuilds the **entire** collection (all projects)
         before inserting — needed only once after a schema change. Day-to-day
@@ -144,6 +144,108 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Job"
+
+  /instances/{project}/describe:
+    post:
+      tags: [Instances]
+      summary: Refresh descriptions for an ingested project
+      description: |
+        Re-run **only** the describe pass over a project's already-ingested
+        chunks — no graph re-extraction (`cgr`), no re-embedding of unchanged
+        `chunk_text` — as a **background job**. Poll
+        `GET /instances/jobs/{job_id}` for progress and the final result.
+
+        Useful when switching descriptor models (`DESC_MODEL`/`DESC_PROVIDER`)
+        or filling gaps without paying for a full re-ingest.
+
+        Re-chunks the latest graph JSON in `ingested/` and only describes
+        chunks whose rebuilt `chunk_text` is byte-identical to what's stored
+        in Weaviate (anti-drift guard). Entities whose source changed on disk
+        since ingestion are counted `stale_source` and skipped — refresh
+        never describes text that isn't what's actually indexed; re-ingest to
+        pick those up. A transient generation failure never overwrites a good
+        stored description with an empty one (`preserved`). Only the
+        `description` property is updated — the `summary` named vector it
+        feeds is re-embedded, the `code` vector is untouched.
+
+        `force` (default `false`) bypasses the description cache, regenerating
+        every eligible entity even if its source hasn't changed. Cache is
+        still honored (no LLM call for unchanged entities) when omitted.
+
+        Pre-flight, in order — each fails the request immediately with no job
+        created: the project must already have chunks in Weaviate (`404`),
+        its latest graph JSON must still be present in `ingested/` (`409`),
+        and the descriptor model must be available (`400`, same messages as
+        `POST /instances/pipeline`).
+      operationId: refreshDescriptions
+      parameters:
+        - name: project
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The `project_name` of an already-ingested repo.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DescribeRefreshRequest"
+            examples:
+              default:
+                summary: Cached refresh (default)
+                value: {}
+              force:
+                summary: Force-regenerate every eligible description
+                value:
+                  force: true
+      responses:
+        "200":
+          description: Job accepted and queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    example: queued
+        "400":
+          description: No descriptor model configured, or the configured descriptor is unavailable. No job was created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                no_model:
+                  summary: DESC_MODEL unset and no remote provider configured
+                  value:
+                    detail: "no descriptor model specified — set DESC_MODEL (e.g. qwen2.5-coder:3b) or configure a remote provider via DESC_PROVIDER"
+                model_unavailable:
+                  summary: DESC_MODEL not pulled in Ollama
+                  value:
+                    detail: "descriptor model 'qwen2.5-coder:3b' is not available in Ollama at http://localhost:11434 — pull it with 'ollama pull qwen2.5-coder:3b'"
+        "404":
+          description: The project has no chunks in Weaviate — it was never ingested.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "project 'your-repo' has no chunks — ingest it first with POST /instances/pipeline"
+        "409":
+          description: No graph JSON found for this project in `ingested/`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "no graph JSON found for project 'your-repo' in ingested/ — re-run POST /instances/pipeline to regenerate it"
+        "422":
+          $ref: "#/components/responses/ValidationError"
 
   /instances/jobs/{job_id}:
     get:
@@ -305,6 +407,9 @@ paths:
         Configure and validate the active chat model. `is_local: true` targets a
         local Ollama instance; `is_local: false` requires
         `provider_data.key` and validates connectivity with the remote provider.
+        Validation probes the exact `provider_data.model` given (see
+        `GET /config/llm/health`) — an invalid or retired remote model is
+        rejected with `400` and nothing is saved.
       operationId: setLlmConfig
       requestBody:
         required: true
@@ -357,7 +462,11 @@ paths:
     get:
       tags: [Config]
       summary: List available models
-      description: Lists models advertised by the currently configured provider.
+      description: |
+        Lists models advertised by the currently configured provider. For
+        `openai`/`anthropic`, this fetches the provider's live models API
+        (short timeout) and falls back to a static built-in list on any
+        failure. `ollama` lists what's pulled locally.
       operationId: listModels
       responses:
         "200":
@@ -379,6 +488,12 @@ paths:
     get:
       tags: [Config]
       summary: Check provider connectivity
+      description: |
+        Probes the **currently configured model** (not a hard-coded one):
+        remote providers call `models.retrieve(model)` (zero generation
+        tokens), Ollama checks the model is present in `/api/tags`. The same
+        model-parametrized check runs at `POST /config/llm` save time
+        (rejecting an invalid/retired model) and as the describe pre-flight.
       operationId: checkHealth
       responses:
         "200":
@@ -449,6 +564,33 @@ components:
           default: false
           description: Drop & rebuild the whole collection (all projects) before inserting.
 
+    DescribeRefreshRequest:
+      type: object
+      properties:
+        force:
+          type: boolean
+          default: false
+          description: Bypass the description cache — every eligible entity is regenerated, even if its source hasn't changed.
+
+    RefreshResult:
+      type: object
+      description: Result of a describe-refresh job.
+      properties:
+        project_name: { type: string }
+        chunks_indexed: { type: integer, description: Total chunks currently stored for this project in Weaviate. }
+        eligible: { type: integer, description: Chunks whose rebuilt chunk_text matched the stored one, and were passed to the descriptor. }
+        stale_source: { type: integer, description: "Rebuilt chunk_text differs from what's stored — source changed on disk since ingestion; skipped, never described." }
+        not_indexed: { type: integer, description: Rebuilt chunk with no stored counterpart (not yet ingested). }
+        updated: { type: integer, description: Description property changed and was written back. }
+        unchanged: { type: integer, description: New description matched the stored one — no write. }
+        preserved: { type: integer, description: A transient generation failure produced an empty description; the good stored one was kept. }
+        descriptions:
+          $ref: "#/components/schemas/DescriptionStats"
+        note:
+          type: string
+          description: Present only when stale_source > 0.
+          example: "3 entities changed on disk since ingestion — re-ingest to refresh them"
+
     DescriptionStats:
       type: object
       description: Tier-2 micro-description generation stats.
@@ -477,27 +619,53 @@ components:
       type: object
       properties:
         id: { type: string, format: uuid }
-        repo_path: { type: string }
+        repo_path: { type: string, description: Empty for refresh jobs (kind = refresh). }
         recreate: { type: boolean }
+        kind:
+          type: string
+          description: Which background job this is.
+          enum: [pipeline, refresh]
+          default: pipeline
+        project:
+          type: string
+          description: Refresh jobs only — the project being re-described.
+        force:
+          type: boolean
+          description: Refresh jobs only — whether the description cache was bypassed.
         status:
           type: string
           enum: [queued, running, succeeded, failed]
         stage:
           type: string
-          description: Current pipeline stage.
-          enum: ["", chunking, describing, embedding, done]
+          description: |
+            Current stage, in the unified vocabulary. Pipeline jobs progress
+            `cgr → chunk → describe → upsert → done`; refresh jobs progress
+            `chunk → describe → update → done`.
+          enum: ["", cgr, chunk, describe, upsert, update, done]
         done: { type: integer, description: Units completed in the current stage. }
         total: { type: integer, description: Units total in the current stage. }
-        result:
+        stage_progress:
           nullable: true
           type: object
+          description: Mirrors the current stage's done/total, kept alongside them for forward compatibility.
           properties:
-            ingest:
-              type: object
+            stage: { type: string }
+            done: { type: integer }
+            total: { type: integer }
+        result:
+          nullable: true
+          description: Shape depends on kind. Pipeline jobs nest ingest/vectorize; refresh jobs return a RefreshResult directly.
+          oneOf:
+            - type: object
+              title: PipelineResult
               properties:
-                output_json: { type: string }
-            vectorize:
-              $ref: "#/components/schemas/VectorizeResult"
+                ingest:
+                  type: object
+                  properties:
+                    output_json: { type: string }
+                vectorize:
+                  $ref: "#/components/schemas/VectorizeResult"
+            - $ref: "#/components/schemas/RefreshResult"
         error:
           type: string
           nullable: true

@@ -8,6 +8,7 @@ generator) methods.
 
 from __future__ import annotations
 
+import logging
 import os
 from abc import ABC, abstractmethod
 from typing import AsyncIterator, cast
@@ -18,6 +19,8 @@ import httpx
 from openai import AsyncOpenAI
 from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam
+
+logger = logging.getLogger(__name__)
 
 
 class LLMMessage:
@@ -68,10 +71,10 @@ class LLMProvider(ABC):
         ...
 
     @abstractmethod
-    async def health_check(self) -> tuple[bool, str]:
+    async def health_check(self, model: str | None = None) -> tuple[bool, str]:
         """
-        Check connectivity to the provider.
-        Returns (is_healthy, message).
+        Check connectivity to the provider. When ``model`` is given, also
+        verify that the model exists. Returns (is_healthy, message).
         """
         ...
 
@@ -125,18 +128,39 @@ class OpenAIProvider(LLMProvider):
             if delta and delta.content:
                 yield delta.content
 
-    async def list_models(self) -> list[str]:
-        models = await self._client.models.list()
-        return sorted(
-            m.id for m in models.data
-            if "gpt" in m.id or "o1" in m.id or "o3" in m.id
-        )
+    _FALLBACK_MODELS = [
+        "gpt-4o",
+        "gpt-4o-mini",
+        "gpt-4-turbo",
+        "gpt-3.5-turbo",
+        "o1",
+        "o1-mini",
+        "o3-mini",
+    ]
 
-    async def health_check(self) -> tuple[bool, str]:
+    async def list_models(self) -> list[str]:
         try:
+            models = await self._client.models.list()
+            return sorted(
+                m.id for m in models.data
+                if "gpt" in m.id or "o1" in m.id or "o3" in m.id
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to fetch live OpenAI model catalog, using static fallback: %s", e
+            )
+            return sorted(self._FALLBACK_MODELS)
+
+    async def health_check(self, model: str | None = None) -> tuple[bool, str]:
+        try:
+            if model:
+                await self._client.models.retrieve(model)
+                return True, f"Model '{model}' is available"
             await self._client.models.list()
             return True, "OpenAI API is reachable"
         except Exception as e:
+            if model:
+                return False, f"OpenAI model '{model}' error: {e}"
             return False, f"OpenAI API error: {e}"
 
 
@@ -190,23 +214,32 @@ class AnthropicProvider(LLMProvider):
             async for text in stream.text_stream:
                 yield text
 
-    async def list_models(self) -> list[str]:
-        return [
-            "claude-sonnet-4-20250514",
-            "claude-opus-4-20250514",
-            "claude-3-5-haiku-20241022",
-        ]
+    _FALLBACK_MODELS = [
+        "claude-sonnet-4-20250514",
+        "claude-opus-4-20250514",
+        "claude-3-5-haiku-20241022",
+    ]
 
-    async def health_check(self) -> tuple[bool, str]:
+    async def list_models(self) -> list[str]:
         try:
-            # A lightweight message to verify the key works
-            await self._client.messages.create(
-                model="claude-3-5-haiku-20241022",
-                messages=[{"role": "user", "content": "hi"}],
-                max_tokens=5,
+            models = await self._client.models.list(timeout=5.0)
+            return sorted([m.id async for m in models])
+        except Exception as e:
+            logger.warning(
+                "Failed to fetch live Anthropic model catalog, using static fallback: %s", e
             )
+            return list(self._FALLBACK_MODELS)
+
+    async def health_check(self, model: str | None = None) -> tuple[bool, str]:
+        try:
+            if model:
+                await self._client.models.retrieve(model)
+                return True, f"Model '{model}' is available"
+            await self._client.models.list()
             return True, "Anthropic API is reachable"
         except Exception as e:
+            if model:
+                return False, f"Anthropic model '{model}' error: {e}"
             return False, f"Anthropic API error: {e}"
 
     @staticmethod
@@ -349,11 +382,19 @@ class OllamaProvider(LLMProvider):
             data = resp.json()
             return [m["name"] for m in data.get("models", [])]
 
-    async def health_check(self) -> tuple[bool, str]:
+    async def health_check(self, model: str | None = None) -> tuple[bool, str]:
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.get(f"{self._base_url}/api/tags")
                 resp.raise_for_status()
+                if model:
+                    available = [m["name"] for m in resp.json().get("models", [])]
+                    matched = model in available or any(
+                        a.split(":")[0] == model for a in available
+                    )
+                    if not matched:
+                        return False, f"model '{model}' unavailable"
+                    return True, f"Model '{model}' is available"
                 return True, "Ollama is reachable"
         except Exception as e:
             return False, f"Ollama error: {e}"

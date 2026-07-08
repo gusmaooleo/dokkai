@@ -132,7 +132,100 @@
               "host": ["{{baseUrl}}"],
               "path": ["instances", "jobs", "{{jobId}}"]
             },
-            "description": "Poll a job's progress. Watch stage (chunking → describing → embedding → done), done/total, and result.vectorize.descriptions."
+            "description": "Poll a job's progress. Watch stage (cgr -> chunk -> describe -> upsert -> done for pipeline jobs, chunk -> describe -> update -> done for refresh jobs), stage_progress {stage,done,total}, and result.vectorize.descriptions (pipeline) or result.descriptions (refresh)."
+          },
+          "response": []
+        },
+        {
+          "name": "Refresh descriptions",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const res = pm.response.json();",
+                  "if (res.job_id) {",
+                  "  pm.collectionVariables.set('jobId', res.job_id);",
+                  "  console.log('Saved jobId =', res.job_id);",
+                  "}",
+                  "pm.test('job queued', function () {",
+                  "  pm.expect(res).to.have.property('job_id');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/instances/{{projectName}}/describe",
+              "host": ["{{baseUrl}}"],
+              "path": ["instances", "{{projectName}}", "describe"]
+            },
+            "description": "Re-run only the describe pass over an already-ingested project (background job; no cgr, no re-embedding of unchanged text). Cache is honored (default force:false) -- unchanged entities cost nothing. Same fail-loud descriptor pre-flight as the pipeline, plus 404 if the project has no chunks and 409 if its graph JSON is missing from ingested/. The test script saves job_id into {{jobId}}."
+          },
+          "response": [
+            {
+              "name": "404 - project has no chunks",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": { "mode": "raw", "raw": "{}" },
+                "url": {
+                  "raw": "{{baseUrl}}/instances/{{projectName}}/describe",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["instances", "{{projectName}}", "describe"]
+                }
+              },
+              "status": "Not Found",
+              "code": 404,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"project 'your-repo' has no chunks — ingest it first with POST /instances/pipeline\"\n}"
+            },
+            {
+              "name": "409 - no graph JSON found",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": { "mode": "raw", "raw": "{}" },
+                "url": {
+                  "raw": "{{baseUrl}}/instances/{{projectName}}/describe",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["instances", "{{projectName}}", "describe"]
+                }
+              },
+              "status": "Conflict",
+              "code": 409,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"no graph JSON found for project 'your-repo' in ingested/ — re-run POST /instances/pipeline to regenerate it\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Refresh descriptions (force)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"force\": true\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/instances/{{projectName}}/describe",
+              "host": ["{{baseUrl}}"],
+              "path": ["instances", "{{projectName}}", "describe"]
+            },
+            "description": "Same as 'Refresh descriptions' but bypasses the description cache -- every eligible entity is regenerated, even if its source hasn't changed."
           },
           "response": []
         }
@@ -280,7 +373,7 @@
               "host": ["{{baseUrl}}"],
               "path": ["config", "llm"]
             },
-            "description": "Configure a remote provider (openai|anthropic). Requires provider_data.key."
+            "description": "Configure a remote provider (openai|anthropic). Requires provider_data.key. The exact model is probed at save time (models.retrieve) -- an invalid/retired model is rejected with 400 and nothing is saved."
           },
           "response": []
         },
@@ -308,7 +401,7 @@
               "host": ["{{baseUrl}}"],
               "path": ["config", "llm", "models"]
             },
-            "description": "Models advertised by the active provider."
+            "description": "Models advertised by the active provider. openai/anthropic fetch the provider's live catalog with a short timeout, falling back to a static list on any failure; ollama lists what's pulled locally."
           },
           "response": []
         },
@@ -322,7 +415,7 @@
               "host": ["{{baseUrl}}"],
               "path": ["config", "llm", "health"]
             },
-            "description": "Connectivity check for the active provider."
+            "description": "Connectivity check for the active provider -- probes the currently configured model (not a hard-coded one): remote providers call models.retrieve(model), ollama checks /api/tags."
           },
           "response": []
         }

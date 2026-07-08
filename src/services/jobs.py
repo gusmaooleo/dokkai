@@ -1,8 +1,8 @@
 """
 Background job manager for the ingestion pipeline.
 
-The pipeline (graph extraction → chunking → descriptions → embedding) runs for
-minutes to hours on a large repo, so it must not block an HTTP request.
+The pipeline (cgr → chunk → describe → upsert) runs for minutes to hours on a
+large repo, so it must not block an HTTP request.
 ``POST /instances/pipeline`` enqueues a :class:`Job` and returns its id;
 progress and result are polled via ``GET /instances/jobs/{id}``.
 
@@ -20,7 +20,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 
 from services.ingest import ingestByLocalRepository
-from services.vectorize import process_and_store
+from services.vectorize import process_and_store, refresh_descriptions
 
 
 def _now() -> str:
@@ -33,10 +33,14 @@ class Job:
     repo_path: str
     recreate: bool = False
     describe: bool = True
+    kind: str = "pipeline"   # pipeline | refresh
+    project: str = ""        # refresh jobs only
+    force: bool = False      # refresh jobs only
     status: str = "queued"   # queued | running | succeeded | failed
-    stage: str = ""          # chunking | describing | embedding | done
+    stage: str = ""          # cgr | chunk | describe | upsert | update | done
     done: int = 0
     total: int = 0
+    stage_progress: dict | None = None  # {"stage": ..., "done": N, "total": N}
     result: dict | None = None
     error: str | None = None
     created_at: str = field(default_factory=_now)
@@ -54,6 +58,11 @@ class JobStore:
 
     def create(self, repo_path: str, recreate: bool = False, describe: bool = True) -> Job:
         job = Job(id=str(uuid.uuid4()), repo_path=repo_path, recreate=recreate, describe=describe)
+        self._jobs[job.id] = job
+        return job
+
+    def create_describe_refresh(self, project: str, force: bool = False) -> Job:
+        job = Job(id=str(uuid.uuid4()), repo_path="", kind="refresh", project=project, force=force)
         self._jobs[job.id] = job
         return job
 
@@ -83,9 +92,11 @@ def _run_pipeline_sync(job: Job) -> None:
 
     def report(stage: str, done: int, total: int) -> None:
         job.stage, job.done, job.total = stage, done, total
+        job.stage_progress = {"stage": stage, "done": done, "total": total}
         job.updated_at = _now()
 
     async def _pipeline() -> tuple[str, dict]:
+        report("cgr", 0, 0)
         ingest_result = await ingestByLocalRepository(job.repo_path)
         output_json = ingest_result["output_json"]
         vectorize_result = await process_and_store(
@@ -120,6 +131,45 @@ def submit_pipeline(repo_path: str, recreate: bool = False, describe: bool = Tru
     """
     job = get_job_store().create(repo_path, recreate=recreate, describe=describe)
     task = asyncio.create_task(asyncio.to_thread(_run_pipeline_sync, job))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return job
+
+
+def _run_describe_refresh_sync(job: Job) -> None:
+    """
+    Execute a describe-refresh job in a worker thread, mirroring
+    ``_run_pipeline_sync``'s thread/asyncio.run/status pattern.
+    """
+    job.status = "running"
+    job.updated_at = _now()
+
+    def report(stage: str, done: int, total: int) -> None:
+        job.stage, job.done, job.total = stage, done, total
+        job.stage_progress = {"stage": stage, "done": done, "total": total}
+        job.updated_at = _now()
+
+    try:
+        result = asyncio.run(
+            refresh_descriptions(job.project, force=job.force, progress=report)
+        )
+        job.result = result
+        job.status = "succeeded"
+        job.stage = "done"
+    except Exception as e:  # surface a readable error to the poller
+        job.status = "failed"
+        job.error = f"{type(e).__name__}: {e}"
+    finally:
+        job.updated_at = _now()
+
+
+def submit_describe_refresh(project: str, force: bool = False) -> Job:
+    """
+    Create a describe-refresh job and spawn it on a worker thread. Returns
+    immediately with the queued job.
+    """
+    job = get_job_store().create_describe_refresh(project, force=force)
+    task = asyncio.create_task(asyncio.to_thread(_run_describe_refresh_sync, job))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     return job

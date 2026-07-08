@@ -171,7 +171,7 @@ async def validate_and_save_config(
         # Quick connectivity check
         try:
             provider = get_provider(name, api_key=key, base_url=base_url)
-            is_healthy, msg = await provider.health_check()
+            is_healthy, msg = await provider.health_check(model)
             if not is_healthy:
                 return False, msg
         except Exception as e:
