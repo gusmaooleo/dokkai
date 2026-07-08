@@ -63,9 +63,32 @@
               "host": ["{{baseUrl}}"],
               "path": ["instances", "pipeline"]
             },
-            "description": "Enqueue the ingestion pipeline. Returns { job_id, status } immediately and runs in the background.\n\nSet recreate:true only once, to migrate the schema (it drops the whole collection). The test script saves job_id into {{jobId}}."
+            "description": "Enqueue the ingestion pipeline. Returns { job_id, status } immediately and runs in the background.\n\nSet recreate:true only once, to migrate the schema (it drops the whole collection). The test script saves job_id into {{jobId}}.\n\nFail-loud descriptor policy: the configured DESC_MODEL/DESC_PROVIDER is checked before the job is created. Missing or unavailable descriptor -> 400, no job created (see the '400 - no descriptor model' saved example)."
           },
-          "response": []
+          "response": [
+            {
+              "name": "400 - no descriptor model",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"repo_path\": \"{{repoPath}}\",\n  \"recreate\": false\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/instances/pipeline",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["instances", "pipeline"]
+                }
+              },
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"no descriptor model specified — set DESC_MODEL (e.g. qwen2.5-coder:3b) or configure a remote provider via DESC_PROVIDER\"\n}"
+            }
+          ]
         },
         {
           "name": "Start pipeline (recreate — schema migration)",
@@ -153,7 +176,7 @@
               "host": ["{{baseUrl}}"],
               "path": ["chat"]
             },
-            "description": "Streams a Server-Sent Events response: sources → token* → done (or error). project_name must match an ingested repo. audience ∈ developer|manager|customer.\n\nNote: Postman buffers the stream and shows it after completion; use curl -N for live tokens."
+            "description": "Streams a Server-Sent Events response: sources → token* → done (or error). project_name must match an ingested repo. audience ∈ developer|manager|customer.\n\nEach entry in the 'sources' event's data array includes both file_path (relative) and absolute_path (full path on disk, as persisted at ingest time).\n\nNote: Postman buffers the stream and shows it after completion; use curl -N for live tokens."
           },
           "response": []
         },

@@ -32,6 +32,7 @@ class Job:
     id: str
     repo_path: str
     recreate: bool = False
+    describe: bool = True
     status: str = "queued"   # queued | running | succeeded | failed
     stage: str = ""          # chunking | describing | embedding | done
     done: int = 0
@@ -51,8 +52,8 @@ class JobStore:
     def __init__(self) -> None:
         self._jobs: dict[str, Job] = {}
 
-    def create(self, repo_path: str, recreate: bool = False) -> Job:
-        job = Job(id=str(uuid.uuid4()), repo_path=repo_path, recreate=recreate)
+    def create(self, repo_path: str, recreate: bool = False, describe: bool = True) -> Job:
+        job = Job(id=str(uuid.uuid4()), repo_path=repo_path, recreate=recreate, describe=describe)
         self._jobs[job.id] = job
         return job
 
@@ -91,6 +92,7 @@ def _run_pipeline_sync(job: Job) -> None:
             output_json,
             source_root=job.repo_path,
             recreate=job.recreate,
+            describe=job.describe,
             progress=report,
         )
         return output_json, vectorize_result
@@ -110,13 +112,13 @@ def _run_pipeline_sync(job: Job) -> None:
         job.updated_at = _now()
 
 
-def submit_pipeline(repo_path: str, recreate: bool = False) -> Job:
+def submit_pipeline(repo_path: str, recreate: bool = False, describe: bool = True) -> Job:
     """
     Create a job and spawn it on a worker thread. Returns immediately with the
     queued job. The task reference is retained so it isn't garbage-collected
     mid-run.
     """
-    job = get_job_store().create(repo_path, recreate=recreate)
+    job = get_job_store().create(repo_path, recreate=recreate, describe=describe)
     task = asyncio.create_task(asyncio.to_thread(_run_pipeline_sync, job))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)

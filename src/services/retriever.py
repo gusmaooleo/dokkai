@@ -285,7 +285,7 @@ class Retriever:
 
         for i, chunk in enumerate(chunks, 1):
             header = f"--- Source {i}: [{chunk.entity_type}] {chunk.qualified_name} ---"
-            location = f"File: {chunk.file_path}"
+            location = f"File: {chunk.absolute_path or chunk.file_path}"
             if chunk.start_line is not None and chunk.end_line is not None:
                 location += f" (lines {chunk.start_line}-{chunk.end_line})"
 
@@ -337,8 +337,11 @@ class Retriever:
         total = 0
         for i, chunk in enumerate(chunks, 1):
             tag = "SEED · matched query" if chunk.hop == 0 else f"hop {chunk.hop} · {chunk.via}"
+            location = f"File: {chunk.absolute_path or chunk.file_path}"
+            if chunk.start_line is not None and chunk.end_line is not None:
+                location += f" (lines {chunk.start_line}-{chunk.end_line})"
             summary = f"Summary: {chunk.description}\n" if chunk.description else ""
-            section = f"--- Source {i} [{tag}] ---\n{summary}{chunk.chunk_text}"
+            section = f"--- Source {i} [{tag}] ---\n{location}\n{summary}{chunk.chunk_text}"
             if sections and total + len(section) > max_chars:
                 break
             sections.append(section)

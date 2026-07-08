@@ -72,6 +72,13 @@ paths:
         before inserting — needed only once after a schema change. Day-to-day
         ingestion should use `recreate: false`, which upserts entities in place
         by deterministic UUID and only removes this project's stale entities.
+
+        **Fail-loud descriptor policy**: this endpoint always ingests with
+        descriptions on. The configured descriptor (`DESC_MODEL` /
+        `DESC_PROVIDER`) is checked *before* the job is created — if it's
+        missing or unavailable, the request fails immediately with `400` and
+        **no job is created** (nothing is ingested). There is no request
+        parameter to skip descriptions.
       operationId: runPipeline
       requestBody:
         required: true
@@ -104,6 +111,21 @@ paths:
                   status:
                     type: string
                     example: queued
+        "400":
+          description: No descriptor model configured, or the configured descriptor is unavailable. No job was created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                no_model:
+                  summary: DESC_MODEL unset and no remote provider configured
+                  value:
+                    detail: "no descriptor model specified — set DESC_MODEL (e.g. qwen2.5-coder:3b) or configure a remote provider via DESC_PROVIDER"
+                model_unavailable:
+                  summary: DESC_MODEL not pulled in Ollama
+                  value:
+                    detail: "descriptor model 'qwen2.5-coder:3b' is not available in Ollama at http://localhost:11434 — pull it with 'ollama pull qwen2.5-coder:3b'"
         "422":
           $ref: "#/components/responses/ValidationError"
 
@@ -440,6 +462,7 @@ components:
         failed: { type: integer }
         pending: { type: integer, description: Queued but not generated (e.g. model unavailable). }
         skipped: { type: integer, description: Entities not eligible for a description. }
+        templated: { type: integer, description: "No-LLM template description (doc-less non-test Types, and Enums without methods)." }
 
     VectorizeResult:
       type: object
@@ -515,6 +538,7 @@ components:
         name: { type: string }
         qualified_name: { type: string }
         file_path: { type: string }
+        absolute_path: { type: string, description: "Absolute path on disk, as persisted at ingest time (empty if the project was ingested before this field existed)." }
         start_line: { type: integer, nullable: true }
         end_line: { type: integer, nullable: true }
         chunk_text: { type: string }
