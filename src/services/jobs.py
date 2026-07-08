@@ -15,6 +15,7 @@ free to serve status polls. Jobs are held in memory and reset on restart.
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -25,6 +26,15 @@ from services.vectorize import process_and_store, refresh_descriptions
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+class ProjectJobConflict(Exception):
+    """Raised when a job is submitted for a project that already has a
+    queued or running job (of either kind)."""
+
+    def __init__(self, project: str) -> None:
+        self.project = project
+        super().__init__(f"another job is running for project '{project}'")
 
 
 @dataclass
@@ -57,7 +67,14 @@ class JobStore:
         self._jobs: dict[str, Job] = {}
 
     def create(self, repo_path: str, recreate: bool = False, describe: bool = True) -> Job:
-        job = Job(id=str(uuid.uuid4()), repo_path=repo_path, recreate=recreate, describe=describe)
+        project = os.path.basename(os.path.normpath(repo_path))
+        job = Job(
+            id=str(uuid.uuid4()),
+            repo_path=repo_path,
+            recreate=recreate,
+            describe=describe,
+            project=project,
+        )
         self._jobs[job.id] = job
         return job
 
@@ -71,6 +88,13 @@ class JobStore:
 
     def list(self) -> list[Job]:
         return sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
+
+    def active_job_for_project(self, project: str) -> Job | None:
+        """The queued/running job (pipeline or refresh) for *project*, if any."""
+        for job in self._jobs.values():
+            if job.project == project and job.status in ("queued", "running"):
+                return job
+        return None
 
 
 _job_store = JobStore()
@@ -128,8 +152,19 @@ def submit_pipeline(repo_path: str, recreate: bool = False, describe: bool = Tru
     Create a job and spawn it on a worker thread. Returns immediately with the
     queued job. The task reference is retained so it isn't garbage-collected
     mid-run.
+
+    Raises ``ProjectJobConflict`` if a job is already queued/running for the
+    same project. The conflict check and job creation are plain synchronous
+    code with no ``await`` in between, so — running on the single asyncio
+    event loop — no other submit can interleave between them; this makes the
+    check-then-create atomic without needing an explicit lock.
     """
-    job = get_job_store().create(repo_path, recreate=recreate, describe=describe)
+    store = get_job_store()
+    project = os.path.basename(os.path.normpath(repo_path))
+    active = store.active_job_for_project(project)
+    if active is not None:
+        raise ProjectJobConflict(project)
+    job = store.create(repo_path, recreate=recreate, describe=describe)
     task = asyncio.create_task(asyncio.to_thread(_run_pipeline_sync, job))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
@@ -167,8 +202,16 @@ def submit_describe_refresh(project: str, force: bool = False) -> Job:
     """
     Create a describe-refresh job and spawn it on a worker thread. Returns
     immediately with the queued job.
+
+    Raises ``ProjectJobConflict`` if a job is already queued/running for the
+    same project — see ``submit_pipeline`` for why the check-then-create is
+    race-free on the event loop.
     """
-    job = get_job_store().create_describe_refresh(project, force=force)
+    store = get_job_store()
+    active = store.active_job_for_project(project)
+    if active is not None:
+        raise ProjectJobConflict(project)
+    job = store.create_describe_refresh(project, force=force)
     task = asyncio.create_task(asyncio.to_thread(_run_describe_refresh_sync, job))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)

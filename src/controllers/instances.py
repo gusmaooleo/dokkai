@@ -1,7 +1,8 @@
 from fastapi import APIRouter, HTTPException
+
 from models.dtos.receive import DescribeRefreshRequest, IngestRequest
 from services.describe import DescriptorError, ensure_descriptor_available
-from services.jobs import get_job_store, submit_describe_refresh, submit_pipeline
+from services.jobs import ProjectJobConflict, get_job_store, submit_describe_refresh, submit_pipeline
 from services.vectorize import find_latest_graph_json, no_graph_json_message
 from services.weaviate_client import get_client, project_has_chunks
 
@@ -24,7 +25,10 @@ async def runPipeline(data: IngestRequest):
         await ensure_descriptor_available()
     except DescriptorError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    job = submit_pipeline(data.repo_path, recreate=data.recreate)
+    try:
+        job = submit_pipeline(data.repo_path, recreate=data.recreate)
+    except ProjectJobConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
     return {"job_id": job.id, "status": job.status}
 
 
@@ -66,7 +70,10 @@ async def refreshDescriptions(project: str, data: DescribeRefreshRequest | None 
     except DescriptorError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    job = submit_describe_refresh(project, force=force)
+    try:
+        job = submit_describe_refresh(project, force=force)
+    except ProjectJobConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
     return {"job_id": job.id, "status": job.status}
 
 
@@ -81,3 +88,4 @@ async def getJob(job_id: str):
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
     return job.to_dict()
+
