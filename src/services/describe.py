@@ -277,9 +277,14 @@ async def describe_chunks(
     concurrency: int | None = None,
     cache: DescriptionCache | None = None,
     progress: Callable[[int, int], None] | None = None,
+    force: bool = False,
 ) -> dict:
     """
     Populate ``chunk.description`` in place for describable entities.
+
+    ``force=True`` skips cache reads — every describable target is
+    regenerated — while cache writes still persist the fresh results (a
+    later re-run without ``force`` sees them as cache hits).
 
     Raises :class:`DescriptorError` when no descriptor model is configured, or
     when the configured provider/model is unavailable and there is at least
@@ -314,11 +319,13 @@ async def describe_chunks(
     skipped = len(remaining) - len(targets)
 
     # Cache pass first — reuse descriptions for unchanged source (no LLM call).
+    # force=True skips reads only; every target below still gets its fresh
+    # result written back to the cache.
     to_generate: list[tuple[CodeChunk, str]] = []
     cached = 0
     for chunk in targets:
         source_hash = _source_hash(chunk)
-        hit = cache.get(source_hash)
+        hit = None if force else cache.get(source_hash)
         if hit is not None:
             chunk.description = hit
             cached += 1
