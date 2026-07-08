@@ -14,6 +14,7 @@ Everything runs **100% locally** — Weaviate for vectors, Ollama for both embed
 
 - [Why](#why)
 - [How it works](#how-it-works)
+- [Descriptions (Tier 2)](#descriptions-tier-2)
 - [Features](#features)
 - [Tech stack](#tech-stack)
 - [Prerequisites](#prerequisites)
@@ -71,12 +72,41 @@ Everything runs **100% locally** — Weaviate for vectors, Ollama for both embed
 
 ---
 
+## Descriptions (Tier 2)
+
+Every describable entity (not a test, has source, not a one‑liner) gets a one‑sentence natural‑language summary, stored in a dedicated `summary` named vector so conceptual queries reach implementation code.
+
+- **Two ways to get a description, no LLM call when avoidable:**
+  - **Template (no‑LLM)** — doc‑less, non‑test `Type` aliases and `Enum`s without methods get a deterministic templated sentence (e.g. `Enumeration Status with members ACTIVE, INACTIVE.`). Free and instant; a human docstring always wins over a template.
+  - **LLM‑generated** — everything else goes through the configured descriptor model with a **trimmed prompt**: entity type + qualified name, the extracted doc/leading comment (capped), and a capped source excerpt (cut at a line boundary) — instead of the full source. Measured ~21% faster per entity than the original full‑source prompt (0.61 s → 0.48 s/entity, qwen2.5-coder:3b, warm model, 20‑entity sample), with comparable quality.
+- **Cached by source hash** — unchanged source reuses its cached description on re‑ingestion, so incremental ingests only pay the LLM for what changed.
+- **Pluggable descriptor provider** — the descriptor is routed through the same LLM provider abstraction used for chat: `DESC_PROVIDER=ollama` (default, local) `| openai | anthropic`, selected via environment variables only (no `/config` endpoint for it).
+- **Fail‑loud policy** — `POST /instances/pipeline` always ingests with descriptions on. The descriptor is checked *before* the job is created: if it's missing or unavailable, the request fails immediately with **HTTP 400** and **no job is created** (nothing is ingested):
+  - No model configured: `no descriptor model specified — set DESC_MODEL (e.g. qwen2.5-coder:3b) or configure a remote provider via DESC_PROVIDER`
+  - Model not pulled: `descriptor model '<m>' is not available in Ollama at <base_url> — pull it with 'ollama pull <m>'`
+  - Ingesting without descriptions exists internally (`process_and_store(..., describe=False)`) but isn't exposed through the public API yet — that UX lands with the CLI (roadmap feature 04).
+
+### Ingestion cost (measured)
+
+Full pipeline run on `saffira_back-end` (medium TS/Python backend), local Ollama, `qwen2.5-coder:3b`, `DESC_CONCURRENCY=4`, cold description cache:
+
+| Metric | Value |
+| --- | --- |
+| Graph entities → chunks upserted | 2,771 → 2,770 |
+| Descriptions | 1,577 LLM‑generated + 162 templated = 1,739 described |
+| Skipped (tests / trivial / no source) | 1,032 |
+| Failed | 0 |
+| Full pipeline wall‑clock (graph + describe + embed/upsert) | **14 min 40 s** |
+
+---
+
 ## Features
 
 - ✅ Full repo → dependency graph → vectorized chunks pipeline
 - ✅ Real source code embedded (not just metadata)
 - ✅ Graph‑augmented retrieval (multi‑hop, decay, hub protection)
 - ✅ Deterministic UUIDs → idempotent re‑ingestion / upsert
+- ✅ Absolute file paths on every chunk — chat sources and LLM context cite real paths on disk (`/full/path/file.py:42`)
 - ✅ Streaming chat over the codebase (SSE) with 3 audiences: `developer`, `manager`, `customer`
 - ✅ 100% local: Weaviate + Ollama (embeddings **and** generation)
 - ✅ Pluggable providers — LLM: Ollama / OpenAI / Anthropic · embeddings: Ollama / OpenAI / Cohere
@@ -113,9 +143,10 @@ Everything runs **100% locally** — Weaviate for vectors, Ollama for both embed
 ollama serve                      # if not already running
 ollama pull nomic-embed-text      # embeddings (8k context) — REQUIRED before ingestion
 ollama pull qwen2.5-coder         # chat/generation (or :14b, :32b if your hardware allows)
+ollama pull qwen2.5-coder:3b      # descriptor model — REQUIRED before ingestion (see DESC_MODEL below)
 ```
 
-> ⚠️ Ollama must be up **before** you run the pipeline — Weaviate calls it to embed each chunk at insert time.
+> ⚠️ Ollama must be up **before** you run the pipeline — Weaviate calls it to embed each chunk at insert time, and `POST /instances/pipeline` rejects the request with HTTP 400 if the descriptor model (`DESC_MODEL`) isn't configured and pulled — see [Descriptions](#descriptions-tier-2).
 
 ### 2. Start Weaviate
 
@@ -150,6 +181,11 @@ OLLAMA_CHAT_MODEL=qwen2.5-coder:latest
 OLLAMA_KEEP_ALIVE=-1
 OLLAMA_NUM_CTX=8192
 OLLAMA_TIMEOUT=600
+
+# --- Descriptions (Tier 2, required for ingestion — see Descriptions section) ---
+DESC_MODEL=qwen2.5-coder:3b
+DESC_CONCURRENCY=4
+# DESC_PROVIDER=ollama       # ollama (default) | openai | anthropic
 ```
 
 ### 4. Run the API
@@ -222,7 +258,7 @@ All configuration is via environment variables (loaded from `.env` at startup).
 | `OPENAI_API_KEY` / `COHERE_API_KEY` | _(unset)_ | Only when using those vectorizer providers, or when `DESC_PROVIDER=openai` |
 | `ANTHROPIC_API_KEY` | _(unset)_ | Only required when `DESC_PROVIDER=anthropic` |
 | `DESC_PROVIDER` | `ollama` | Provider for per-entity descriptions: `ollama` \| `openai` \| `anthropic` |
-| `DESC_MODEL` | `qwen2.5-coder:3b` | Model used to generate per-entity descriptions (unset disables description generation) |
+| `DESC_MODEL` | _(unset)_ | Model used to generate per-entity descriptions (e.g. `qwen2.5-coder:3b`). If unset (or unavailable), `POST /instances/pipeline` fails with HTTP 400 before creating a job — see [Descriptions](#descriptions-tier-2) |
 | `DESC_CONCURRENCY` | `4` | Max concurrent description requests |
 | `RETRIEVAL_TEST_PENALTY` | `0.35` | Score multiplier applied to test-file results during retrieval |
 | `DOKKAI_RECREATE_COLLECTION` | _(unset)_ | If truthy: recreate the Weaviate collection instead of failing on schema mismatch |
@@ -285,10 +321,26 @@ These are known and tracked in the [Roadmap](#roadmap):
 - **Retrieval bias toward tests** — for "how does X work?" queries, test files often out‑rank the real implementation (test descriptions read like specs). End‑to‑end tests are also decoupled from implementation by the HTTP boundary, so graph expansion can't bridge them.
 - **The API is not yet containerized** — only Weaviate runs in `docker compose`; the API runs via `dev.sh`.
 - **Anonymous functions** (e.g. test closures) have weak graph edges and unstable identifiers.
+- **Absolute paths are denormalized per chunk at ingest time, not re‑derived.** If a repo moves on disk (or is cloned to a new location), re‑ingest it — there's no project‑root registry that keeps paths correct automatically. Re‑ingesting is cheap: deterministic UUIDs upsert unchanged entities in place, and their descriptions come from the source‑hash cache instead of a fresh LLM call — only the changed paths/content cost anything.
 
 ---
 
 ## Roadmap
+
+### Feature roadmap
+
+| # | Feature | Status |
+| --- | --- | --- |
+| 01 | Describe v2 (lighter descriptions, template descriptions, provider selection, fail‑loud policy) + absolute file paths | ✅ done |
+| 02 | Graph query API | planned |
+| 03 | MCP server (core) | planned |
+| 04 | npm CLI (`dokkai`) + SRCS mode | planned |
+| 05 | Postgres conversation history | planned |
+| 06 | Basic auth (root user via env) | planned |
+| 07 | Frontend UI (chat + graph + config) | planned |
+| 08 | PDF ingestion — local NotebookLM | planned |
+| 09 | Code review & bug‑hunt routines | planned |
+| 10 | Documentation site (en/pt/zh/es) | planned |
 
 ### Retrieval quality
 
