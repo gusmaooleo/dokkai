@@ -10,12 +10,23 @@ fast lookups by later steps (full-graph, neighborhood, file-level views).
 from __future__ import annotations
 
 import json
+import logging
+import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 from services.chunker import CODE_ENTITY_LABELS
-from services.vectorize import find_latest_graph_json
+from services.vectorize import _ingested_dir, find_latest_graph_json
+
+logger = logging.getLogger(__name__)
+
+# Mirrors vectorize._TIMESTAMP_SUFFIX_RE's "-<YYYYMMDDTHHMMSS>" suffix
+# pattern, anchored to the end of the stem instead of a known project-name
+# remainder — here the project name isn't known yet, it's what we're
+# deriving from the stem.
+_TRAILING_TIMESTAMP_RE = re.compile(r"-\d{8}T\d{6}$")
 
 
 class GraphNotFoundError(Exception):
@@ -165,6 +176,62 @@ def _get_graph(project_name: str, *, retried: bool) -> Graph:
 
     _cache[project_name] = (cache_key, graph)
     return graph
+
+
+def list_graphs() -> list[dict[str, Any]]:
+    """
+    List every project with an ingested graph in ``ingested/``.
+
+    Derives project names from ``ingested/*.json`` stems: a canonical stem
+    (``<project>.json``) passes through as-is; a timestamped stem
+    (``<project>-<YYYYMMDDTHHMMSS>.json``) has the trailing timestamp
+    stripped (see :data:`_TRAILING_TIMESTAMP_RE`). Names are deduped and
+    sorted, so a project with both a canonical and a timestamped file — or
+    several timestamped files — appears once.
+
+    For each project name, the latest graph (see
+    :func:`services.vectorize.find_latest_graph_json`) is loaded through the
+    cache (:func:`get_graph`); a candidate that vanished mid-scan or a
+    corrupt/unparseable JSON is skipped with a logged warning rather than
+    failing the whole listing. Returns ``[]`` when ``ingested/`` is absent
+    or empty.
+    """
+    ingested_dir = _ingested_dir()
+    if not ingested_dir.is_dir():
+        return []
+
+    project_names = {
+        _TRAILING_TIMESTAMP_RE.sub("", path.stem) for path in ingested_dir.glob("*.json")
+    }
+
+    projects: list[dict[str, Any]] = []
+    for project_name in sorted(project_names):
+        try:
+            graph = get_graph(project_name)
+            generated_at = graph.metadata.get("exported_at") or datetime.fromtimestamp(
+                graph.path.stat().st_mtime, tz=timezone.utc
+            ).isoformat()
+        except GraphNotFoundError as e:
+            logger.warning("skipping project '%s' in graph listing: %s", project_name, e)
+            continue
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(
+                "skipping project '%s' in graph listing: failed to load graph: %s",
+                project_name,
+                e,
+            )
+            continue
+        projects.append(
+            {
+                "project": project_name,
+                "file": graph.path.name,
+                "nodes": len(graph.nodes),
+                "edges": len(graph.relationships),
+                "generated_at": generated_at,
+            }
+        )
+
+    return projects
 
 
 def get_full_graph(project_name: str, *, structural: bool, limit: int) -> dict[str, Any]:

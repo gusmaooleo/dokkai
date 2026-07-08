@@ -9,6 +9,14 @@ from typing import Literal
 from pydantic import BaseModel
 
 
+class ProjectGraphDTO(BaseModel):
+    project: str
+    file: str
+    nodes: int
+    edges: int
+    generated_at: str
+
+
 class GraphNodeDTO(BaseModel):
     id: int
     kind: str

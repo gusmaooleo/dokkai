@@ -1,6 +1,7 @@
 """
 Graph API endpoints.
 
+GET /graph                          — list projects with ingested graphs
 GET /graph/{project}                — full project graph (code entities by
                                        default, or the full structural graph
                                        with ?include=structural)
@@ -14,16 +15,35 @@ from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
 
-from models.dtos.graph import FileViewResponse, GraphResponse, NeighborhoodResponse
+from models.dtos.graph import (
+    FileViewResponse,
+    GraphResponse,
+    NeighborhoodResponse,
+    ProjectGraphDTO,
+)
 from services.graph_store import (
     EntityNotFoundError,
     GraphNotFoundError,
     get_file_view,
     get_full_graph,
     get_neighborhood,
+    list_graphs,
 )
 
 router = APIRouter(prefix="/graph")
+
+
+# Registered before the "/{project}" routes below so a literal "/graph"
+# request can never be shadowed by the parameterized ones.
+@router.get("", response_model=list[ProjectGraphDTO])
+async def listGraphs():
+    """
+    List every project with an ingested graph.
+
+    Returns ``[]`` when nothing has been ingested yet. See
+    :func:`services.graph_store.list_graphs` for the full contract.
+    """
+    return list_graphs()
 
 
 @router.get("/{project}", response_model=GraphResponse)
