@@ -32,6 +32,7 @@ class SourceChunk(BaseModel):
     name: str
     qualified_name: str
     file_path: str
+    absolute_path: str = ""
     start_line: int | None = None
     end_line: int | None = None
     chunk_text: str

@@ -132,6 +132,7 @@ async def chat_with_codebase(
             "name": c.name,
             "qualified_name": c.qualified_name,
             "file_path": c.file_path,
+            "absolute_path": c.absolute_path,
             "start_line": c.start_line,
             "end_line": c.end_line,
             "chunk_text": c.chunk_text,
