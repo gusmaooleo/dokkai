@@ -1,0 +1,309 @@
+{
+  "info": {
+    "name": "Dokkai API",
+    "_postman_id": "d0kka1-0000-4000-8000-000000000001",
+    "description": "HTTP API for Dokkai — a graph-aware vector database over a codebase.\n\nUsage order:\n1. Config → Set LLM provider (or set OLLAMA_CHAT_MODEL on the server).\n2. Instances → Start pipeline (captures {{jobId}} automatically).\n3. Instances → Get job (poll until status = succeeded).\n4. Chat → Chat (SSE): note Postman shows the raw event stream.\n\nCollection variables let you avoid editing every request: set {{baseUrl}}, {{repoPath}}, {{projectName}} once.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8000", "type": "string" },
+    { "key": "repoPath", "value": "/absolute/path/to/your/repo", "type": "string" },
+    { "key": "projectName", "value": "your-repo", "type": "string" },
+    { "key": "jobId", "value": "", "type": "string" },
+    { "key": "conversationId", "value": "", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Root (health check)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/", "host": ["{{baseUrl}}"], "path": [""] },
+            "description": "Returns {\"status\":\"online\"} when the API is up."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Instances",
+      "item": [
+        {
+          "name": "Start pipeline",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const res = pm.response.json();",
+                  "if (res.job_id) {",
+                  "  pm.collectionVariables.set('jobId', res.job_id);",
+                  "  console.log('Saved jobId =', res.job_id);",
+                  "}",
+                  "pm.test('job queued', function () {",
+                  "  pm.expect(res).to.have.property('job_id');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"repo_path\": \"{{repoPath}}\",\n  \"recreate\": false\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/instances/pipeline",
+              "host": ["{{baseUrl}}"],
+              "path": ["instances", "pipeline"]
+            },
+            "description": "Enqueue the ingestion pipeline. Returns { job_id, status } immediately and runs in the background.\n\nSet recreate:true only once, to migrate the schema (it drops the whole collection). The test script saves job_id into {{jobId}}."
+          },
+          "response": []
+        },
+        {
+          "name": "Start pipeline (recreate — schema migration)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"repo_path\": \"{{repoPath}}\",\n  \"recreate\": true\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/instances/pipeline",
+              "host": ["{{baseUrl}}"],
+              "path": ["instances", "pipeline"]
+            },
+            "description": "DANGER: recreate:true drops the ENTIRE collection (all projects) before inserting. Use only once, after a schema change."
+          },
+          "response": []
+        },
+        {
+          "name": "List jobs",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/instances/jobs",
+              "host": ["{{baseUrl}}"],
+              "path": ["instances", "jobs"]
+            },
+            "description": "List all ingestion jobs, most recent first. In-memory; resets on server restart."
+          },
+          "response": []
+        },
+        {
+          "name": "Get job",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/instances/jobs/{{jobId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["instances", "jobs", "{{jobId}}"]
+            },
+            "description": "Poll a job's progress. Watch stage (chunking → describing → embedding → done), done/total, and result.vectorize.descriptions."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Chat",
+      "item": [
+        {
+          "name": "Chat (SSE)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// The response is an SSE stream. Postman shows it raw.",
+                  "// Extract conversation_id from the final 'done' event if present.",
+                  "const body = pm.response.text();",
+                  "const m = body.match(/\\\"conversation_id\\\":\\s*\\\"([^\\\"]+)\\\"/);",
+                  "if (m) {",
+                  "  pm.collectionVariables.set('conversationId', m[1]);",
+                  "  console.log('Saved conversationId =', m[1]);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "text/event-stream" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message\": \"how does the alarm flow work?\",\n  \"project_name\": \"{{projectName}}\",\n  \"audience\": \"developer\",\n  \"top_k\": 8\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/chat",
+              "host": ["{{baseUrl}}"],
+              "path": ["chat"]
+            },
+            "description": "Streams a Server-Sent Events response: sources → token* → done (or error). project_name must match an ingested repo. audience ∈ developer|manager|customer.\n\nNote: Postman buffers the stream and shows it after completion; use curl -N for live tokens."
+          },
+          "response": []
+        },
+        {
+          "name": "Chat (continue conversation)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "text/event-stream" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message\": \"and where are the false positives handled?\",\n  \"project_name\": \"{{projectName}}\",\n  \"audience\": \"developer\",\n  \"conversation_id\": \"{{conversationId}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/chat",
+              "host": ["{{baseUrl}}"],
+              "path": ["chat"]
+            },
+            "description": "Follow-up in the same conversation, using {{conversationId}} captured by the previous request."
+          },
+          "response": []
+        },
+        {
+          "name": "List conversations",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/chat/conversations",
+              "host": ["{{baseUrl}}"],
+              "path": ["chat", "conversations"]
+            },
+            "description": "List stored conversations (persisted as JSON under data/conversations/)."
+          },
+          "response": []
+        },
+        {
+          "name": "Get conversation",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/chat/conversations/{{conversationId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["chat", "conversations", "{{conversationId}}"]
+            },
+            "description": "Full history (messages + their sources) for one conversation."
+          },
+          "response": []
+        },
+        {
+          "name": "Delete conversation",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/chat/conversations/{{conversationId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["chat", "conversations", "{{conversationId}}"]
+            },
+            "description": "Delete a conversation and its history."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Config",
+      "item": [
+        {
+          "name": "Set LLM config (Ollama, local)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"is_local\": true,\n  \"provider_data\": {\n    \"provider_name\": \"ollama\",\n    \"model\": \"qwen2.5-coder:latest\"\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/config/llm",
+              "host": ["{{baseUrl}}"],
+              "path": ["config", "llm"]
+            },
+            "description": "Configure a local Ollama chat model. Validates that the model is installed."
+          },
+          "response": []
+        },
+        {
+          "name": "Set LLM config (OpenAI, remote)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"is_local\": false,\n  \"provider_data\": {\n    \"provider_name\": \"openai\",\n    \"model\": \"gpt-4o-mini\",\n    \"key\": \"sk-...\"\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/config/llm",
+              "host": ["{{baseUrl}}"],
+              "path": ["config", "llm"]
+            },
+            "description": "Configure a remote provider (openai|anthropic). Requires provider_data.key."
+          },
+          "response": []
+        },
+        {
+          "name": "Get LLM config",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/config/llm",
+              "host": ["{{baseUrl}}"],
+              "path": ["config", "llm"]
+            },
+            "description": "Current active LLM configuration (404 if none set)."
+          },
+          "response": []
+        },
+        {
+          "name": "List models",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/config/llm/models",
+              "host": ["{{baseUrl}}"],
+              "path": ["config", "llm", "models"]
+            },
+            "description": "Models advertised by the active provider."
+          },
+          "response": []
+        },
+        {
+          "name": "Provider health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/config/llm/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["config", "llm", "health"]
+            },
+            "description": "Connectivity check for the active provider."
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}

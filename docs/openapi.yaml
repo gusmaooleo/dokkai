@@ -1,0 +1,620 @@
+openapi: 3.0.3
+
+info:
+  title: Dokkai API
+  version: 0.1.0
+  description: |
+    **Dokkai** turns a codebase into a graph-aware vector database that local AI
+    agents can read, search and document.
+
+    This document describes the HTTP API. The running server also serves an
+    interactive Swagger UI at `/docs` and ReDoc at `/redoc`, both generated from
+    `/openapi.json`; this file is an enriched, portable copy (it additionally
+    documents the SSE chat stream and the async-job payloads, which the
+    auto-generated spec cannot express well).
+
+    ### Typical flow
+    1. `POST /config/llm` — configure the chat model (or set `OLLAMA_CHAT_MODEL`
+       so it is auto-configured on startup).
+    2. `POST /instances/pipeline` — ingest a repository. Returns a `job_id`.
+    3. `GET /instances/jobs/{job_id}` — poll until `status = succeeded`.
+    4. `POST /chat` — ask questions; the answer streams back over SSE.
+
+  license:
+    name: License TBD
+
+servers:
+  - url: http://localhost:8000
+    description: Local development server
+
+tags:
+  - name: Health
+    description: Liveness.
+  - name: Instances
+    description: Ingest repositories and track ingestion jobs.
+  - name: Chat
+    description: Ask questions about an ingested codebase (streaming) and manage history.
+  - name: Config
+    description: Configure and inspect the active LLM provider.
+
+paths:
+  /:
+    get:
+      tags: [Health]
+      summary: Health check
+      operationId: root
+      responses:
+        "200":
+          description: Service is online.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: online
+
+  # ---------------------------------------------------------------------------
+  # Instances
+  # ---------------------------------------------------------------------------
+  /instances/pipeline:
+    post:
+      tags: [Instances]
+      summary: Start an ingestion pipeline
+      description: |
+        Enqueue the full pipeline (graph extraction → chunking → descriptions →
+        embedding) as a **background job** and return immediately with a
+        `job_id`. Poll `GET /instances/jobs/{job_id}` for progress and the final
+        result.
+
+        `recreate` drops and rebuilds the **entire** collection (all projects)
+        before inserting — needed only once after a schema change. Day-to-day
+        ingestion should use `recreate: false`, which upserts entities in place
+        by deterministic UUID and only removes this project's stale entities.
+      operationId: runPipeline
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IngestRequest"
+            examples:
+              normal:
+                summary: Routine re-ingest
+                value:
+                  repo_path: /absolute/path/to/your/repo
+                  recreate: false
+              migration:
+                summary: One-time schema migration (wipes the collection)
+                value:
+                  repo_path: /absolute/path/to/your/repo
+                  recreate: true
+      responses:
+        "200":
+          description: Job accepted and queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    example: queued
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /instances/jobs:
+    get:
+      tags: [Instances]
+      summary: List ingestion jobs
+      description: Most recent first. Jobs are held in memory and reset on server restart.
+      operationId: listJobs
+      responses:
+        "200":
+          description: All known jobs.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Job"
+
+  /instances/jobs/{job_id}:
+    get:
+      tags: [Instances]
+      summary: Get an ingestion job
+      operationId: getJob
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The job's current state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ---------------------------------------------------------------------------
+  # Chat
+  # ---------------------------------------------------------------------------
+  /chat:
+    post:
+      tags: [Chat]
+      summary: Chat with the codebase (SSE stream)
+      description: |
+        Retrieves the connected code context for `message` and streams an
+        audience-specific answer over **Server-Sent Events**
+        (`Content-Type: text/event-stream`).
+
+        The stream emits these event types, in order:
+
+        | event    | `data` payload |
+        |----------|----------------|
+        | `sources`| JSON array of retrieved chunks (see `SourceChunk`). Sent once, first. |
+        | `token`  | A JSON-encoded string — one streamed chunk of the answer. Repeated. |
+        | `done`   | `{ "conversation_id": "...", "answer": "<full answer>" }`. Sent once, last. |
+        | `error`  | A JSON-encoded error string. Terminates the stream. |
+
+        `project_name` **must** match the `project_name` of an ingested repo
+        (the repo's top-level folder name). A non-matching value returns an
+        empty `sources` array and an ungrounded answer.
+
+        Note: curl needs `-N` to disable buffering and see tokens as they arrive.
+      operationId: chat
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatRequest"
+            examples:
+              developer:
+                summary: Developer question
+                value:
+                  message: how does the alarm flow work?
+                  project_name: your-repo
+                  audience: developer
+      responses:
+        "200":
+          description: |
+            An SSE stream. Each event is `event: <type>\ndata: <json>\n\n`.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              examples:
+                stream:
+                  summary: Example event sequence
+                  value: |
+                    event: sources
+                    data: [{"entity_type":"Class","name":"AlarmValidationUseCase","qualified_name":"src.alarms.AlarmValidationUseCase","file_path":"src/alarms/validation.ts","start_line":10,"end_line":80,"chunk_text":"...","description":"Validates a detection and notifies clients.","score":0.77,"hop":0,"via":"seed (matched query)"}]
+
+                    event: token
+                    data: "The alarm flow"
+
+                    event: token
+                    data: " works by ..."
+
+                    event: done
+                    data: {"conversation_id":"b0dc2159-5b52-4b73-a7ca-9f094496d64b","answer":"The alarm flow works by ..."}
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /chat/conversations:
+    get:
+      tags: [Chat]
+      summary: List conversations
+      operationId: listConversations
+      responses:
+        "200":
+          description: All stored conversations (persisted as JSON files under `data/`).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ConversationSummary"
+
+  /chat/conversations/{conversation_id}:
+    get:
+      tags: [Chat]
+      summary: Get a conversation
+      operationId: getConversation
+      parameters:
+        - name: conversation_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Full conversation history.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Conversation"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Chat]
+      summary: Delete a conversation
+      operationId: deleteConversation
+      parameters:
+        - name: conversation_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Conversation deleted
+                  conversation_id:
+                    type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ---------------------------------------------------------------------------
+  # Config
+  # ---------------------------------------------------------------------------
+  /config/llm:
+    post:
+      tags: [Config]
+      summary: Set the LLM provider
+      description: |
+        Configure and validate the active chat model. `is_local: true` targets a
+        local Ollama instance; `is_local: false` requires
+        `provider_data.key` and validates connectivity with the remote provider.
+      operationId: setLlmConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LLMConfigRequest"
+            examples:
+              ollama:
+                summary: Local Ollama
+                value:
+                  is_local: true
+                  provider_data:
+                    provider_name: ollama
+                    model: qwen2.5-coder:latest
+              openai:
+                summary: Remote OpenAI
+                value:
+                  is_local: false
+                  provider_data:
+                    provider_name: openai
+                    model: gpt-4o-mini
+                    key: sk-...
+      responses:
+        "200":
+          description: Active configuration.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LLMConfigResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+    get:
+      tags: [Config]
+      summary: Get the current LLM config
+      operationId: getLlmConfig
+      responses:
+        "200":
+          description: Active configuration.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LLMConfigResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /config/llm/models:
+    get:
+      tags: [Config]
+      summary: List available models
+      description: Lists models advertised by the currently configured provider.
+      operationId: listModels
+      responses:
+        "200":
+          description: Models for the active provider.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelsListResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "502":
+          description: The provider could not be reached to list models.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /config/llm/health:
+    get:
+      tags: [Config]
+      summary: Check provider connectivity
+      operationId: checkHealth
+      responses:
+        "200":
+          description: Health of the active provider.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderHealthResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+# =============================================================================
+components:
+  responses:
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    BadRequest:
+      description: Invalid configuration or provider validation failed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ValidationError:
+      description: Request body failed validation.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/HTTPValidationError"
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        detail:
+          type: string
+      example:
+        detail: job not found
+
+    HTTPValidationError:
+      type: object
+      properties:
+        detail:
+          type: array
+          items:
+            type: object
+            properties:
+              loc:
+                type: array
+                items:
+                  oneOf: [{ type: string }, { type: integer }]
+              msg: { type: string }
+              type: { type: string }
+
+    IngestRequest:
+      type: object
+      required: [repo_path]
+      properties:
+        repo_path:
+          type: string
+          description: Absolute path to the repository to ingest.
+          example: /Users/you/projects/your-repo
+        recreate:
+          type: boolean
+          default: false
+          description: Drop & rebuild the whole collection (all projects) before inserting.
+
+    DescriptionStats:
+      type: object
+      description: Tier-2 micro-description generation stats.
+      properties:
+        enabled: { type: boolean, description: False when DESC_MODEL is unset. }
+        reason: { type: string, description: Present when descriptions were skipped (e.g. model unavailable). }
+        model: { type: string }
+        describable: { type: integer, description: Entities eligible for a description (non-test, non-trivial, has source). }
+        cached: { type: integer, description: Reused from the source-hash cache (no LLM call). }
+        generated: { type: integer, description: Freshly generated this run. }
+        failed: { type: integer }
+        pending: { type: integer, description: Queued but not generated (e.g. model unavailable). }
+        skipped: { type: integer, description: Entities not eligible for a description. }
+
+    VectorizeResult:
+      type: object
+      properties:
+        project_name: { type: string }
+        chunks_created: { type: integer, description: Distinct objects upserted. }
+        ingestion_id: { type: string }
+        descriptions:
+          $ref: "#/components/schemas/DescriptionStats"
+
+    Job:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        repo_path: { type: string }
+        recreate: { type: boolean }
+        status:
+          type: string
+          enum: [queued, running, succeeded, failed]
+        stage:
+          type: string
+          description: Current pipeline stage.
+          enum: ["", chunking, describing, embedding, done]
+        done: { type: integer, description: Units completed in the current stage. }
+        total: { type: integer, description: Units total in the current stage. }
+        result:
+          nullable: true
+          type: object
+          properties:
+            ingest:
+              type: object
+              properties:
+                output_json: { type: string }
+            vectorize:
+              $ref: "#/components/schemas/VectorizeResult"
+        error:
+          type: string
+          nullable: true
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    ChatRequest:
+      type: object
+      required: [message, project_name]
+      properties:
+        message:
+          type: string
+          example: "how does the alarm flow work?"
+        project_name:
+          type: string
+          description: Must match an ingested repo's project name.
+          example: your-repo
+        audience:
+          type: string
+          enum: [developer, manager, customer]
+          default: developer
+        conversation_id:
+          type: string
+          nullable: true
+          description: Continue an existing conversation, or omit to start a new one.
+        top_k:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 8
+          description: Number of seed chunks to retrieve.
+
+    SourceChunk:
+      type: object
+      description: A retrieved code chunk, as emitted in the `sources` SSE event.
+      properties:
+        entity_type: { type: string, example: Class }
+        name: { type: string }
+        qualified_name: { type: string }
+        file_path: { type: string }
+        start_line: { type: integer, nullable: true }
+        end_line: { type: integer, nullable: true }
+        chunk_text: { type: string }
+        description: { type: string, description: Tier-2 micro-description (may be empty). }
+        score: { type: number, nullable: true }
+        hop: { type: integer, description: "0 = seed, 1 = direct neighbor, ..." }
+        via: { type: string, description: "Provenance, e.g. 'calls ← registerRoutes'." }
+
+    ConversationSummary:
+      type: object
+      properties:
+        conversation_id: { type: string }
+        project_name: { type: string }
+        message_count: { type: integer }
+        last_message_preview: { type: string }
+        created_at: { type: string }
+        updated_at: { type: string }
+
+    ConversationMessage:
+      type: object
+      properties:
+        role: { type: string, enum: [user, assistant, system] }
+        content: { type: string }
+        timestamp: { type: string }
+        sources:
+          type: array
+          items:
+            $ref: "#/components/schemas/SourceChunk"
+
+    Conversation:
+      type: object
+      properties:
+        conversation_id: { type: string }
+        project_name: { type: string }
+        audience: { type: string }
+        created_at: { type: string }
+        updated_at: { type: string }
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConversationMessage"
+
+    ProviderData:
+      type: object
+      required: [provider_name, model]
+      properties:
+        provider_name:
+          type: string
+          enum: [openai, anthropic, ollama]
+        model: { type: string, example: qwen2.5-coder:latest }
+        key:
+          type: string
+          default: ""
+          description: API key (empty for local providers).
+        base_url:
+          type: string
+          nullable: true
+          description: Custom base URL override.
+
+    LLMConfigRequest:
+      type: object
+      required: [is_local, provider_data]
+      properties:
+        is_local:
+          type: boolean
+          description: True for Ollama (local); False for remote providers.
+        provider_data:
+          $ref: "#/components/schemas/ProviderData"
+
+    LLMConfigResponse:
+      type: object
+      properties:
+        is_local: { type: boolean }
+        provider_name: { type: string }
+        model: { type: string }
+        has_key: { type: boolean }
+        base_url: { type: string, nullable: true }
+
+    AvailableModel:
+      type: object
+      properties:
+        name: { type: string }
+        provider: { type: string }
+
+    ModelsListResponse:
+      type: object
+      properties:
+        provider_name: { type: string }
+        models:
+          type: array
+          items:
+            $ref: "#/components/schemas/AvailableModel"
+
+    ProviderHealthResponse:
+      type: object
+      properties:
+        provider_name: { type: string }
+        model: { type: string }
+        is_local: { type: boolean }
+        status:
+          type: string
+          enum: [healthy, unhealthy]
+        message: { type: string }
