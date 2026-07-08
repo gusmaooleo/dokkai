@@ -2,8 +2,9 @@
 Weaviate client wrapper for Dokkai.
 
 Manages the connection to Weaviate and the ``CodeEntity`` collection schema.
-Supports both local ``text2vec-transformers`` (default) and API-based
-vectorizers (OpenAI, Cohere) via environment variables.
+The collection uses two named vectors — ``code`` and ``summary`` — produced by
+the configured provider (Ollama by default; OpenAI/Cohere/transformers also
+supported) via environment variables.
 
 Environment variables
 ---------------------
@@ -30,6 +31,13 @@ from services.chunker import CodeChunk
 
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "CodeEntity")
 
+# Named vectors (Tier 2). Each object carries two embeddings:
+#   - VECTOR_CODE    over ``chunk_text``  (header + terms + doc + real source)
+#   - VECTOR_SUMMARY over ``description`` (LLM micro-description, when present)
+# so retrieval can target literal code or natural-language intent.
+VECTOR_CODE = "code"
+VECTOR_SUMMARY = "summary"
+
 
 def uuid_for_entity(project_name: str, qualified_name: str) -> str:
     """
@@ -41,28 +49,36 @@ def uuid_for_entity(project_name: str, qualified_name: str) -> str:
     """
     return generate_uuid5(f"{project_name}:{qualified_name}")
 
-def _get_vectorizer_config():
+def _named_vectors():
+    """
+    Two named vectors — ``code`` (over ``chunk_text``) and ``summary`` (over the
+    LLM ``description``) — both produced by the configured embedding provider.
+    Objects with an empty ``description`` simply get no ``summary`` vector, so
+    only described entities are reachable through summary-targeted search.
+    """
     provider = os.getenv("VECTORIZER_PROVIDER", "ollama").lower()
 
+    def pair(factory, **kw):
+        return [
+            factory(name=VECTOR_CODE, source_properties=["chunk_text"], **kw),
+            factory(name=VECTOR_SUMMARY, source_properties=["description"], **kw),
+        ]
+
     if provider == "ollama":
-        # Embeddings via local Ollama. ``api_endpoint`` is resolved from the
-        # Weaviate *server's* perspective, so under Docker it must reach the
-        # host (host.docker.internal), not localhost.
-        return Configure.Vectorizer.text2vec_ollama(
+        # ``api_endpoint`` is resolved from the Weaviate *server's* perspective,
+        # so under Docker it must reach the host (host.docker.internal).
+        return pair(
+            Configure.NamedVectors.text2vec_ollama,
             api_endpoint=os.getenv("OLLAMA_EMBED_ENDPOINT", "http://host.docker.internal:11434"),
             model=os.getenv("EMBED_MODEL", "nomic-embed-text"),
             vectorize_collection_name=False,
         )
     elif provider == "openai":
-        return Configure.Vectorizer.text2vec_openai(
-            model="text-embedding-3-small",
-        )
+        return pair(Configure.NamedVectors.text2vec_openai, model="text-embedding-3-small")
     elif provider == "cohere":
-        return Configure.Vectorizer.text2vec_cohere(
-            model="embed-multilingual-v3.0",
-        )
+        return pair(Configure.NamedVectors.text2vec_cohere, model="embed-multilingual-v3.0")
     else:
-        return Configure.Vectorizer.text2vec_transformers()
+        return pair(Configure.NamedVectors.text2vec_transformers)
 
 def get_client() -> weaviate.WeaviateClient:
     '''
@@ -92,7 +108,8 @@ def get_client() -> weaviate.WeaviateClient:
     return client
 
 _PROPERTIES = [
-    Property(name="chunk_text",      data_type=DataType.TEXT,       skip_vectorization=False),
+    Property(name="chunk_text",      data_type=DataType.TEXT),
+    Property(name="description",     data_type=DataType.TEXT),
     Property(name="entity_type",     data_type=DataType.TEXT,       skip_vectorization=True),
     Property(name="name",            data_type=DataType.TEXT,       skip_vectorization=True),
     Property(name="qualified_name",  data_type=DataType.TEXT,       skip_vectorization=True),
@@ -115,13 +132,38 @@ _PROPERTIES = [
 ]
 
 
-def ensure_collection(client: weaviate.WeaviateClient) -> None:
-    if client.collections.exists(COLLECTION_NAME):
+def _assert_named_vectors(client: weaviate.WeaviateClient) -> None:
+    """Fail loudly if an existing collection predates the named-vector schema."""
+    cfg = client.collections.get(COLLECTION_NAME).config.get()
+    names = set((cfg.vector_config or {}).keys())
+    if not {VECTOR_CODE, VECTOR_SUMMARY} <= names:
+        raise RuntimeError(
+            f"Collection '{COLLECTION_NAME}' has an outdated schema "
+            f"(vectors: {sorted(names) or 'single default vector'}). Tier 2 needs "
+            f"named vectors '{VECTOR_CODE}' + '{VECTOR_SUMMARY}'. Recreate it once: "
+            "pass recreate=true to the pipeline (or set DOKKAI_RECREATE_COLLECTION=1), "
+            "or run `docker compose down -v && docker compose up -d`, then re-ingest."
+        )
+
+
+def ensure_collection(client: weaviate.WeaviateClient, *, recreate: bool = False) -> None:
+    # A one-time env escape hatch for the schema migration, mirrored in the
+    # _assert_named_vectors error message. Leaving it set drops the collection
+    # on every ingest, so prefer the per-request ``recreate`` flag.
+    recreate = recreate or os.getenv("DOKKAI_RECREATE_COLLECTION", "").lower() in ("1", "true", "yes")
+
+    exists = client.collections.exists(COLLECTION_NAME)
+    if exists and recreate:
+        client.collections.delete(COLLECTION_NAME)  # drops ALL projects in the collection
+        exists = False
+
+    if exists:
+        _assert_named_vectors(client)
         return
 
     client.collections.create(
         name=COLLECTION_NAME,
-        vectorizer_config=_get_vectorizer_config(),
+        vectorizer_config=_named_vectors(),
         properties=_PROPERTIES,
     )
 
@@ -138,15 +180,19 @@ def upsert_chunks(
     ingestion_id: str,
 ) -> int:
     collection = client.collections.get(COLLECTION_NAME)
+    if not chunks:
+        return 0
 
-    if chunks:
-        delete_project_chunks(client, chunks[0].project_name)
-
-    inserted = 0
+    project_name = chunks[0].project_name
+    seen_ids: set[str] = set()
     with collection.batch.dynamic() as batch:
         for chunk in chunks:
             properties = {
                 "chunk_text":      chunk.chunk_text,
+                # summary vector source: LLM description, falling back to any
+                # doc/JSDoc we extracted for free (Tier 1) so more entities are
+                # reachable via summary-targeted search.
+                "description":     chunk.description or chunk.doc,
                 "entity_type":     chunk.entity_type,
                 "name":            chunk.name,
                 "qualified_name":  chunk.qualified_name,
@@ -167,10 +213,27 @@ def upsert_chunks(
                 "defined_methods": chunk.defined_methods,
                 "ingestion_id":    ingestion_id,
             }
-            batch.add_object(
-                properties=properties,
-                uuid=uuid_for_entity(chunk.project_name, chunk.qualified_name),
-            )
-            inserted += 1
+            object_id = uuid_for_entity(chunk.project_name, chunk.qualified_name)
+            batch.add_object(properties=properties, uuid=object_id)
+            seen_ids.add(object_id)
 
-    return inserted
+    # The batch context does NOT raise on per-object embedding/insert errors —
+    # it only collects them. Fail loudly instead of silently under-reporting.
+    failed = collection.batch.failed_objects
+    if failed:
+        first = getattr(failed[0], "message", failed[0])
+        raise RuntimeError(
+            f"{len(failed)}/{len(seen_ids)} objects failed to insert; first error: {first}"
+        )
+
+    # Remove entities left over from earlier ingests of this project (deleted at
+    # the source). Done AFTER a successful insert — deterministic UUIDs upsert
+    # current entities in place, so there is no wipe-then-fail data-loss window.
+    collection.data.delete_many(
+        where=Filter.all_of([
+            Filter.by_property("project_name").equal(project_name),
+            Filter.by_property("ingestion_id").not_equal(ingestion_id),
+        ])
+    )
+
+    return len(seen_ids)

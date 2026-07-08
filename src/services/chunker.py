@@ -188,6 +188,7 @@ class CodeChunk:
     defined_methods: list[str] = field(default_factory=list)
     source_code: str = ""
     doc: str = ""
+    description: str = ""  # Tier 2: LLM-generated natural-language summary
     chunk_text: str = ""
 
     def build_text(self) -> str:
