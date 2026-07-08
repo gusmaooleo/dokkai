@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from services.chunker import CODE_ENTITY_LABELS
 from services.vectorize import find_latest_graph_json
 
 
@@ -143,3 +144,56 @@ def _get_graph(project_name: str, *, retried: bool) -> Graph:
 
     _cache[project_name] = (cache_key, graph)
     return graph
+
+
+def get_full_graph(project_name: str, *, structural: bool, limit: int) -> dict[str, Any]:
+    """
+    Assemble the full-graph response payload for *project_name*.
+
+    ``structural=False`` selects only code-entity nodes (labels in
+    :data:`services.chunker.CODE_ENTITY_LABELS`); ``structural=True`` selects
+    every node. ``limit`` caps the *selected* node list (in array order)
+    before normalization; edges are always filtered to the actually-returned
+    node ids, so the result never has a dangling endpoint. ``total_nodes``/
+    ``total_edges`` in ``stats`` are computed pre-limit, over the selected
+    set, so callers can tell whether the response was truncated.
+
+    Raises :class:`GraphNotFoundError` when no graph has been ingested for
+    the project yet (propagated from :func:`get_graph`).
+    """
+    graph = get_graph(project_name)
+
+    if structural:
+        selected_nodes = graph.nodes
+    else:
+        selected_nodes = [n for n in graph.nodes if n["labels"][0] in CODE_ENTITY_LABELS]
+
+    selected_ids = {n["node_id"] for n in selected_nodes}
+    total_nodes = len(selected_nodes)
+    total_edges = sum(
+        1
+        for rel in graph.relationships
+        if rel["from_id"] in selected_ids and rel["to_id"] in selected_ids
+    )
+
+    returned_nodes = selected_nodes[:limit]
+    returned_ids = {n["node_id"] for n in returned_nodes}
+    returned_edges = [
+        normalize_edge(rel)
+        for rel in graph.relationships
+        if rel["from_id"] in returned_ids and rel["to_id"] in returned_ids
+    ]
+
+    return {
+        "project": project_name,
+        "generated_at": graph.metadata.get("exported_at"),
+        "nodes": [normalize_node(n) for n in returned_nodes],
+        "edges": returned_edges,
+        "stats": {
+            "total_nodes": total_nodes,
+            "total_edges": total_edges,
+            "returned_nodes": len(returned_nodes),
+            "returned_edges": len(returned_edges),
+            "truncated": len(returned_nodes) < total_nodes,
+        },
+    }
