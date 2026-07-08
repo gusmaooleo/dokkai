@@ -4,6 +4,8 @@ DTOs for the graph endpoints.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel
 
 
@@ -38,3 +40,25 @@ class GraphResponse(BaseModel):
     nodes: list[GraphNodeDTO]
     edges: list[GraphEdgeDTO]
     stats: GraphStatsDTO
+
+
+class NeighborhoodNodeDTO(GraphNodeDTO):
+    hop: int
+
+
+class NeighborhoodStatsDTO(BaseModel):
+    depth: int
+    direction: Literal["in", "out", "both"]
+    limit: int
+    returned_nodes: int
+    returned_edges: int
+    truncated: bool
+
+
+class NeighborhoodResponse(BaseModel):
+    project: str
+    entity: str
+    center: GraphNodeDTO
+    nodes: list[NeighborhoodNodeDTO]
+    edges: list[GraphEdgeDTO]
+    stats: NeighborhoodStatsDTO

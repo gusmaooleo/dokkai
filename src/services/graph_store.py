@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from services.chunker import CODE_ENTITY_LABELS
 from services.vectorize import find_latest_graph_json
@@ -22,11 +22,32 @@ class GraphNotFoundError(Exception):
     """Raised when no ingested graph JSON exists for a project."""
 
 
+class EntityNotFoundError(Exception):
+    """Raised when a qualified name cannot be resolved in a project's graph."""
+
+    def __init__(self, project_name: str, qualified_name: str) -> None:
+        super().__init__(
+            f"entity '{qualified_name}' not found in project '{project_name}' graph"
+        )
+
+
 def _not_found_message(project_name: str) -> str:
     return (
         f"no graph found for project '{project_name}' — run POST "
         "/instances/pipeline to ingest it"
     )
+
+
+# The neighborhood endpoint's edge-type superset (decision N3): call/structural
+# relations only — never IMPORTS, CONTAINS_*, or DEPENDS_ON_EXTERNAL.
+NEIGHBORHOOD_EDGE_TYPES = {
+    "CALLS",
+    "INHERITS",
+    "IMPLEMENTS",
+    "OVERRIDES",
+    "DEFINES",
+    "DEFINES_METHOD",
+}
 
 
 @dataclass
@@ -195,5 +216,133 @@ def get_full_graph(project_name: str, *, structural: bool, limit: int) -> dict[s
             "returned_nodes": len(returned_nodes),
             "returned_edges": len(returned_edges),
             "truncated": len(returned_nodes) < total_nodes,
+        },
+    }
+
+
+def resolve_entity(graph: Graph, qualified_name: str) -> dict[str, Any] | None:
+    """
+    Resolve *qualified_name* to a node, preferring code-entity nodes.
+
+    ``graph.by_qualified_name`` is first-wins across *all* node kinds, so a
+    structural node (Package/Module) that shares a qualified name with a code
+    entity could shadow it — a defensive concern for future corpora; in the
+    current test corpus first-wins already favors the code entity. This
+    scans ``graph.nodes`` in array order and returns the first
+    node whose kind is a code-entity label (see
+    :data:`services.chunker.CODE_ENTITY_LABELS`); if none matches, it falls
+    back to the raw first-wins ``by_qualified_name`` lookup.
+    """
+    for node in graph.nodes:
+        if (
+            node.get("properties", {}).get("qualified_name") == qualified_name
+            and node["labels"][0] in CODE_ENTITY_LABELS
+        ):
+            return node
+    return graph.by_qualified_name.get(qualified_name)
+
+
+def get_neighborhood(
+    project_name: str,
+    *,
+    entity: str,
+    depth: int,
+    direction: Literal["in", "out", "both"],
+    limit: int,
+) -> dict[str, Any]:
+    """
+    Assemble the neighborhood-query response payload for *entity* in
+    *project_name*'s graph.
+
+    BFS from the resolved entity node over :data:`NEIGHBORHOOD_EDGE_TYPES`
+    only (CALLS, INHERITS, IMPLEMENTS, OVERRIDES, DEFINES, DEFINES_METHOD —
+    never IMPORTS/CONTAINS_*/DEPENDS_ON_EXTERNAL). ``direction`` picks the
+    adjacency followed while expanding: ``out`` outgoing edges only, ``in``
+    incoming only, ``both`` both.
+
+    Nodes are collected breadth-first, closest hop first, up to ``depth``
+    hops. The center is hop 0 and is included in both ``center`` and
+    ``nodes`` (UI convenience — ``stats.returned_nodes`` counts it too).
+    ``limit`` caps the *total* number of returned nodes, root included;
+    because collection order is BFS, truncation always drops the farthest
+    nodes first. ``truncated`` is true only when the node cap actually cut
+    off nodes BFS would otherwise have reached within ``depth`` hops —
+    simply exhausting ``depth`` without hitting the cap does not set it.
+
+    ``edges`` lists every :data:`NEIGHBORHOOD_EDGE_TYPES` relationship whose
+    both endpoints are in the returned node set, regardless of
+    ``direction`` (mirrors the full-graph endpoint's type+membership-only
+    edge filter — a node can be reached via one direction and still have
+    its edges in the other direction shown once it's in the result set).
+
+    Raises :class:`GraphNotFoundError` when no graph has been ingested for
+    the project, and :class:`EntityNotFoundError` when *entity* cannot be
+    resolved in the project's graph.
+    """
+    graph = get_graph(project_name)
+    center = resolve_entity(graph, entity)
+    if center is None:
+        raise EntityNotFoundError(project_name, entity)
+
+    center_id = center["node_id"]
+    hop_of: dict[int, int] = {center_id: 0}
+    order: list[int] = [center_id]
+    frontier = [center_id]
+    for hop in range(1, depth + 1):
+        next_frontier: list[int] = []
+        for node_id in frontier:
+            neighbor_ids: list[int] = []
+            if direction in ("out", "both"):
+                neighbor_ids += [
+                    nid
+                    for rtype, nid in graph.outgoing.get(node_id, [])
+                    if rtype in NEIGHBORHOOD_EDGE_TYPES
+                ]
+            if direction in ("in", "both"):
+                neighbor_ids += [
+                    nid
+                    for rtype, nid in graph.incoming.get(node_id, [])
+                    if rtype in NEIGHBORHOOD_EDGE_TYPES
+                ]
+            for nid in neighbor_ids:
+                if nid not in hop_of:
+                    hop_of[nid] = hop
+                    order.append(nid)
+                    next_frontier.append(nid)
+        frontier = next_frontier
+        if not frontier:
+            break
+
+    truncated = len(order) > limit
+    returned_ids = order[:limit]
+    returned_id_set = set(returned_ids)
+
+    returned_edges = [
+        normalize_edge(rel)
+        for rel in graph.relationships
+        if rel["type"] in NEIGHBORHOOD_EDGE_TYPES
+        and rel["from_id"] in returned_id_set
+        and rel["to_id"] in returned_id_set
+    ]
+
+    nodes_payload = []
+    for nid in returned_ids:
+        node = normalize_node(graph.node_by_id[nid])
+        node["hop"] = hop_of[nid]
+        nodes_payload.append(node)
+
+    return {
+        "project": project_name,
+        "entity": entity,
+        "center": normalize_node(center),
+        "nodes": nodes_payload,
+        "edges": returned_edges,
+        "stats": {
+            "depth": depth,
+            "direction": direction,
+            "limit": limit,
+            "returned_nodes": len(nodes_payload),
+            "returned_edges": len(returned_edges),
+            "truncated": truncated,
         },
     }
