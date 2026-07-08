@@ -191,10 +191,46 @@ async def _provider_available(
     return healthy, message
 
 
+_TRIMMED_DOC_CAP = 600
+_TRIMMED_BODY_CAP = 1200
+
+
+def _cut_at_line_boundary(text: str, cap: int) -> str:
+    """Truncate ``text`` to at most ``cap`` chars, cutting at a line boundary."""
+    if len(text) <= cap:
+        return text
+    truncated = text[:cap]
+    last_newline = truncated.rfind("\n")
+    if last_newline > 0:
+        truncated = truncated[:last_newline]
+    return truncated
+
+
+def build_describe_prompt(chunk: CodeChunk, mode: str = "full") -> str:
+    """
+    Build the per-entity user prompt sent to the descriptor LLM.
+
+    ``mode="full"`` reproduces today's prompt (entity type + qualified name +
+    the complete source) bit-for-bit. ``mode="trimmed"`` is an experimental,
+    token-cheaper variant (decision 1c) that adds the extracted doc/comment
+    (capped) and caps the source excerpt, cutting at a line boundary — it is
+    measured via ``scripts/measure_descriptions.py`` but not yet shipped.
+    """
+    if mode == "full":
+        return f"{chunk.entity_type} {chunk.qualified_name}\n\n{chunk.source_code}"
+    if mode == "trimmed":
+        parts = [f"{chunk.entity_type} {chunk.qualified_name}"]
+        if chunk.doc:
+            parts.append(f"Doc: {_cut_at_line_boundary(chunk.doc, _TRIMMED_DOC_CAP)}")
+        parts.append(_cut_at_line_boundary(chunk.source_code, _TRIMMED_BODY_CAP))
+        return "\n\n".join(parts)
+    raise ValueError(f"unknown prompt mode '{mode}'")
+
+
 async def _generate_one(provider: LLMProvider, model: str, chunk: CodeChunk) -> str:
     messages = [
         LLMMessage("system", DESC_SYSTEM_PROMPT),
-        LLMMessage("user", f"{chunk.entity_type} {chunk.qualified_name}\n\n{chunk.source_code}"),
+        LLMMessage("user", build_describe_prompt(chunk, "full")),
     ]
     response = await provider.chat(
         messages, model=model, temperature=_GEN_TEMPERATURE, max_tokens=_GEN_MAX_TOKENS
