@@ -8,6 +8,7 @@ generator) methods.
 
 from __future__ import annotations
 
+import logging
 import os
 from abc import ABC, abstractmethod
 from typing import AsyncIterator, cast
@@ -18,6 +19,8 @@ import httpx
 from openai import AsyncOpenAI
 from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam
+
+logger = logging.getLogger(__name__)
 
 
 class LLMMessage:
@@ -125,12 +128,28 @@ class OpenAIProvider(LLMProvider):
             if delta and delta.content:
                 yield delta.content
 
+    _FALLBACK_MODELS = [
+        "gpt-4o",
+        "gpt-4o-mini",
+        "gpt-4-turbo",
+        "gpt-3.5-turbo",
+        "o1",
+        "o1-mini",
+        "o3-mini",
+    ]
+
     async def list_models(self) -> list[str]:
-        models = await self._client.models.list()
-        return sorted(
-            m.id for m in models.data
-            if "gpt" in m.id or "o1" in m.id or "o3" in m.id
-        )
+        try:
+            models = await self._client.models.list()
+            return sorted(
+                m.id for m in models.data
+                if "gpt" in m.id or "o1" in m.id or "o3" in m.id
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to fetch live OpenAI model catalog, using static fallback: %s", e
+            )
+            return sorted(self._FALLBACK_MODELS)
 
     async def health_check(self) -> tuple[bool, str]:
         try:
@@ -190,12 +209,21 @@ class AnthropicProvider(LLMProvider):
             async for text in stream.text_stream:
                 yield text
 
+    _FALLBACK_MODELS = [
+        "claude-sonnet-4-20250514",
+        "claude-opus-4-20250514",
+        "claude-3-5-haiku-20241022",
+    ]
+
     async def list_models(self) -> list[str]:
-        return [
-            "claude-sonnet-4-20250514",
-            "claude-opus-4-20250514",
-            "claude-3-5-haiku-20241022",
-        ]
+        try:
+            models = await self._client.models.list(timeout=5.0)
+            return sorted([m.id async for m in models])
+        except Exception as e:
+            logger.warning(
+                "Failed to fetch live Anthropic model catalog, using static fallback: %s", e
+            )
+            return list(self._FALLBACK_MODELS)
 
     async def health_check(self) -> tuple[bool, str]:
         try:
