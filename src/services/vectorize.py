@@ -22,7 +22,7 @@ from services.describe import describe_chunks
 from services.weaviate_client import get_client, ensure_collection, upsert_chunks
 
 
-# progress(stage, done, total) — stage ∈ {"chunking","describing","embedding","done"}
+# progress(stage, done, total) — stage ∈ {"chunk","describe","upsert","done"}
 ProgressFn = Callable[[str, int, int], None]
 
 
@@ -67,29 +67,29 @@ async def process_and_store(
         if progress:
             progress(stage, done, total)
 
-    report("chunking", 0, 1)
+    report("chunk", 0, 1)
     chunks = chunk_graph(path, source_root=source_root)
-    report("chunking", len(chunks), len(chunks))
+    report("chunk", len(chunks), len(chunks))
 
     # Tier 2 — micro-descriptions. Raises DescriptorError (via describe_chunks)
     # when no descriptor model is configured or it's unavailable — describe=False
     # is the only way to skip this pass.
-    report("describing", 0, len(chunks))
+    report("describe", 0, len(chunks))
     if describe:
         desc_stats = await describe_chunks(
             chunks,
-            progress=lambda done, total: report("describing", done, total),
+            progress=lambda done, total: report("describe", done, total),
         )
     else:
         desc_stats = {"enabled": False, "reason": "descriptions disabled for this ingestion"}
-        report("describing", len(chunks), len(chunks))
+        report("describe", len(chunks), len(chunks))
 
     client = get_client()
     try:
         ensure_collection(client, recreate=recreate)
-        report("embedding", 0, len(chunks))
+        report("upsert", 0, len(chunks))
         inserted = upsert_chunks(client, chunks, ingestion_id)
-        report("embedding", inserted, len(chunks))
+        report("upsert", inserted, len(chunks))
     finally:
         client.close()
 

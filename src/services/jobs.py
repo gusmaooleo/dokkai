@@ -1,8 +1,8 @@
 """
 Background job manager for the ingestion pipeline.
 
-The pipeline (graph extraction → chunking → descriptions → embedding) runs for
-minutes to hours on a large repo, so it must not block an HTTP request.
+The pipeline (cgr → chunk → describe → upsert) runs for minutes to hours on a
+large repo, so it must not block an HTTP request.
 ``POST /instances/pipeline`` enqueues a :class:`Job` and returns its id;
 progress and result are polled via ``GET /instances/jobs/{id}``.
 
@@ -34,9 +34,10 @@ class Job:
     recreate: bool = False
     describe: bool = True
     status: str = "queued"   # queued | running | succeeded | failed
-    stage: str = ""          # chunking | describing | embedding | done
+    stage: str = ""          # cgr | chunk | describe | upsert | done
     done: int = 0
     total: int = 0
+    stage_progress: dict | None = None  # {"stage": ..., "done": N, "total": N}
     result: dict | None = None
     error: str | None = None
     created_at: str = field(default_factory=_now)
@@ -83,9 +84,11 @@ def _run_pipeline_sync(job: Job) -> None:
 
     def report(stage: str, done: int, total: int) -> None:
         job.stage, job.done, job.total = stage, done, total
+        job.stage_progress = {"stage": stage, "done": done, "total": total}
         job.updated_at = _now()
 
     async def _pipeline() -> tuple[str, dict]:
+        report("cgr", 0, 0)
         ingest_result = await ingestByLocalRepository(job.repo_path)
         output_json = ingest_result["output_json"]
         vectorize_result = await process_and_store(
