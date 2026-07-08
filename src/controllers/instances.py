@@ -1,4 +1,8 @@
+import asyncio
+import json
+
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 
 from models.dtos.receive import DescribeRefreshRequest, IngestRequest
 from services.describe import DescriptorError, ensure_descriptor_available
@@ -89,3 +93,43 @@ async def getJob(job_id: str):
         raise HTTPException(status_code=404, detail="job not found")
     return job.to_dict()
 
+
+@router.get("/jobs/{job_id}/events")
+async def streamJobEvents(job_id: str):
+    """
+    Stream a job's progress as Server-Sent Events, mirroring ``POST /chat``'s
+    SSE framing (``StreamingResponse`` over ``text/event-stream``, same
+    ``event: <type>\\ndata: <json>\\n\\n`` lines, same no-cache headers).
+
+    Emits the current job state immediately on connect, then again whenever
+    ``updated_at`` changes (polled internally every ~0.5s). Event type is
+    ``job`` for in-progress updates and ``done`` for the terminal state —
+    reusing chat's ``done`` name for "stream is now finished" — after which
+    the stream closes. Unknown job id is a plain 404, not a stream.
+    """
+    job = get_job_store().get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    async def event_stream():
+        last_updated_at = None
+        while True:
+            if job.updated_at != last_updated_at:
+                last_updated_at = job.updated_at
+                terminal = job.status in ("succeeded", "failed")
+                event_type = "done" if terminal else "job"
+                data = json.dumps(job.to_dict())
+                yield f"event: {event_type}\ndata: {data}\n\n"
+                if terminal:
+                    break
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
