@@ -174,6 +174,59 @@ def delete_project_chunks(client: weaviate.WeaviateClient, project_name: str) ->
     )
     return result.successful
 
+def fetch_project_chunk_index(client: weaviate.WeaviateClient, project_name: str) -> dict[str, dict]:
+    """
+    Fetch every chunk of a project, keyed by object uuid, carrying only the
+    ``qualified_name``, ``chunk_text`` and ``description`` properties.
+
+    Paged via offset/limit. Weaviate's default ``QUERY_MAXIMUM_RESULTS`` caps
+    offset-based pagination at 10,000 objects — the practical ceiling of this
+    approach, well above any single project's expected chunk count.
+    """
+    collection = client.collections.get(COLLECTION_NAME)
+    page_size = 500
+    index: dict[str, dict] = {}
+    offset = 0
+    while True:
+        response = collection.query.fetch_objects(
+            filters=Filter.by_property("project_name").equal(project_name),
+            limit=page_size,
+            offset=offset,
+            return_properties=["qualified_name", "chunk_text", "description"],
+        )
+        if not response.objects:
+            break
+        for obj in response.objects:
+            index[str(obj.uuid)] = {
+                "qualified_name": obj.properties.get("qualified_name"),
+                "chunk_text":     obj.properties.get("chunk_text"),
+                "description":    obj.properties.get("description"),
+            }
+        if len(response.objects) < page_size:
+            break
+        offset += page_size
+    return index
+
+def update_chunk_description(collection, uuid: str, description: str) -> None:
+    """
+    Merge-update only the ``description`` property of an existing object.
+
+    Updating a single property re-vectorizes only the named vector(s) sourced
+    from it — here the ``summary`` vector (sourced from ``description``) is
+    recomputed while ``code`` (sourced from ``chunk_text``) is left untouched.
+    """
+    collection.data.update(uuid=uuid, properties={"description": description})
+
+def project_has_chunks(client: weaviate.WeaviateClient, project_name: str) -> bool:
+    """Cheap existence check: does this project have any chunks at all?"""
+    collection = client.collections.get(COLLECTION_NAME)
+    response = collection.query.fetch_objects(
+        filters=Filter.by_property("project_name").equal(project_name),
+        limit=1,
+        return_properties=["qualified_name"],
+    )
+    return len(response.objects) > 0
+
 def upsert_chunks(
     client: weaviate.WeaviateClient,
     chunks: list[CodeChunk],
