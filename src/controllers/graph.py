@@ -5,6 +5,7 @@ GET /graph/{project}                — full project graph (code entities by
                                        default, or the full structural graph
                                        with ?include=structural)
 GET /graph/{project}/neighborhood   — BFS neighborhood of a single entity
+GET /graph/{project}/files          — file-level dependency view
 """
 
 from __future__ import annotations
@@ -13,10 +14,11 @@ from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
 
-from models.dtos.graph import GraphResponse, NeighborhoodResponse
+from models.dtos.graph import FileViewResponse, GraphResponse, NeighborhoodResponse
 from services.graph_store import (
     EntityNotFoundError,
     GraphNotFoundError,
+    get_file_view,
     get_full_graph,
     get_neighborhood,
 )
@@ -83,5 +85,27 @@ async def getNeighborhood(
     except GraphNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except EntityNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return payload
+
+
+@router.get("/{project}/files", response_model=FileViewResponse)
+async def getFileView(project: str):
+    """
+    Return *project*'s file-level dependency view.
+
+    Aggregates every relationship in the graph into file-to-file edges: each
+    edge endpoint is mapped to the file it belongs to (code entities,
+    modules, and files map via their path; folders, packages, the project,
+    and external packages are not files and drop the relationship). Edges
+    between the same pair of files are aggregated into one edge with a total
+    ``weight`` and a per relationship-type ``types`` breakdown. Self-loops
+    and external dependencies are excluded, so only internal file-to-file
+    dependencies remain. See :func:`services.graph_store.get_file_view` for
+    the full contract.
+    """
+    try:
+        payload = get_file_view(project)
+    except GraphNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return payload

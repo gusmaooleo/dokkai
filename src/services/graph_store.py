@@ -220,6 +220,84 @@ def get_full_graph(project_name: str, *, structural: bool, limit: int) -> dict[s
     }
 
 
+
+# The file-level view's node-to-file mapping (decision N2): only nodes whose
+# kind carries a real file path map to a file; everything else (Folder/
+# Package — a directory path, Project/ExternalPackage — no path) is skipped.
+_FILE_KINDS = CODE_ENTITY_LABELS | {"Module", "File"}
+
+
+def get_file_view(project_name: str) -> dict[str, Any]:
+    """
+    Assemble the file-level dependency view for *project_name*.
+
+    Aggregates *every* relationship in the graph (decision N2 — not just the
+    call/structural subset used by the neighborhood endpoint) into edges
+    between files. Each edge endpoint is mapped to a file path: nodes whose
+    kind is a code entity, ``Module``, or ``File`` map to their
+    ``properties.path``; any other kind (``Folder``/``Package`` — a
+    directory path, ``Project``/``ExternalPackage`` — no path at all) is
+    unmapped and the relationship is skipped, along with relationships where
+    either endpoint's path is missing or empty. Nodes flagged
+    ``properties.is_external`` are also unmapped — the corpus represents
+    some external dependencies as ``Module`` nodes (not only
+    ``ExternalPackage`` nodes), and decision N2 is "internal files only"
+    regardless of which node kind carries the external flag. Self-loops
+    (both endpoints resolve to the same file — e.g. a Module ``DEFINES`` its
+    own entities) are also skipped.
+
+    Relationships are aggregated per (source_path, target_path) pair into a
+    single edge with ``weight`` (total relationship count) and ``types`` (a
+    per relationship-type breakdown); ``weight`` always equals the sum of
+    ``types.values()``.
+
+    Raises :class:`GraphNotFoundError` when no graph has been ingested for
+    the project yet (propagated from :func:`get_graph`).
+    """
+    graph = get_graph(project_name)
+
+    path_of: dict[int, str] = {}
+    absolute_path_of: dict[str, str | None] = {}
+    for node in graph.nodes:
+        if node["labels"][0] not in _FILE_KINDS:
+            continue
+        props = node.get("properties", {})
+        path = props.get("path")
+        if not path or props.get("is_external"):
+            continue
+        path_of[node["node_id"]] = path
+        if path not in absolute_path_of or absolute_path_of[path] is None:
+            absolute_path_of[path] = props.get("absolute_path")
+
+    edges_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
+    for rel in graph.relationships:
+        source_path = path_of.get(rel["from_id"])
+        target_path = path_of.get(rel["to_id"])
+        if not source_path or not target_path or source_path == target_path:
+            continue
+        key = (source_path, target_path)
+        edge = edges_by_pair.get(key)
+        if edge is None:
+            edge = {"source": source_path, "target": target_path, "weight": 0, "types": {}}
+            edges_by_pair[key] = edge
+        edge["weight"] += 1
+        edge["types"][rel["type"]] = edge["types"].get(rel["type"], 0) + 1
+
+    file_paths = {p for pair in edges_by_pair for p in pair}
+    files = [
+        {"path": path, "name": Path(path).name, "absolute_path": absolute_path_of.get(path)}
+        for path in sorted(file_paths)
+    ]
+    edges = [edges_by_pair[key] for key in sorted(edges_by_pair)]
+
+    return {
+        "project": project_name,
+        "files": files,
+        "edges": edges,
+        "stats": {"files": len(files), "edges": len(edges)},
+    }
+
+
 def resolve_entity(graph: Graph, qualified_name: str) -> dict[str, Any] | None:
     """
     Resolve *qualified_name* to a node, preferring code-entity nodes.

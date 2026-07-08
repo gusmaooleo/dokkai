@@ -62,3 +62,28 @@ class NeighborhoodResponse(BaseModel):
     nodes: list[NeighborhoodNodeDTO]
     edges: list[GraphEdgeDTO]
     stats: NeighborhoodStatsDTO
+
+
+class FileDTO(BaseModel):
+    path: str
+    name: str
+    absolute_path: str | None = None
+
+
+class FileEdgeDTO(BaseModel):
+    source: str
+    target: str
+    weight: int
+    types: dict[str, int]
+
+
+class FileViewStatsDTO(BaseModel):
+    files: int
+    edges: int
+
+
+class FileViewResponse(BaseModel):
+    project: str
+    files: list[FileDTO]
+    edges: list[FileEdgeDTO]
+    stats: FileViewStatsDTO
