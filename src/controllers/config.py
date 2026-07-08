@@ -123,7 +123,7 @@ async def check_health():
 
     try:
         provider, _ = get_active_provider()
-        is_healthy, message = await provider.health_check()
+        is_healthy, message = await provider.health_check(config.model)
     except Exception as e:
         is_healthy = False
         message = str(e)
