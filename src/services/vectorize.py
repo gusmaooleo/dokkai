@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 
 from services.chunker import CodeChunk, chunk_graph
@@ -73,7 +74,12 @@ async def process_and_store(
     ``descriptions`` stats block.
     """
     path = Path(output_json_path)
-    ingestion_id = path.stem
+    # Unique per run — even with a constant canonical stem (post-promotion,
+    # ingested/<project>.json) — so upsert_chunks' stale-entity `not_equal`
+    # cleanup (see weaviate_client.upsert_chunks) still distinguishes "this
+    # run" from "an earlier run" of the same project.
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    ingestion_id = f"{path.stem}-{timestamp}"
 
     def report(stage: str, done: int, total: int) -> None:
         if progress:
@@ -120,18 +126,18 @@ def _ingested_dir() -> Path:
     return Path(__file__).resolve().parent.parent.parent / "ingested"
 
 
-def find_latest_graph_json(project_name: str) -> Path | None:
+def graph_json_candidates(project_name: str) -> list[Path]:
     """
-    Find the newest graph JSON for *project_name* in ``ingested/``.
+    Find every graph JSON for *project_name* in ``ingested/``.
 
     Matches only ``<project_name>.json`` or
     ``<project_name>-<YYYYMMDDTHHMMSS>.json`` — anchored so a project name
     that prefixes another (e.g. ``foo`` vs ``foo-bar``) never matches the
-    wrong file. Newest mtime wins when several candidates exist.
+    wrong file.
     """
     ingested_dir = _ingested_dir()
     if not ingested_dir.is_dir():
-        return None
+        return []
 
     candidates: list[Path] = []
     for path in ingested_dir.glob("*.json"):
@@ -141,6 +147,17 @@ def find_latest_graph_json(project_name: str) -> Path | None:
         elif stem.startswith(project_name) and _TIMESTAMP_SUFFIX_RE.match(stem[len(project_name):]):
             candidates.append(path)
 
+    return candidates
+
+
+def find_latest_graph_json(project_name: str) -> Path | None:
+    """
+    Find the newest graph JSON for *project_name* in ``ingested/``.
+
+    Newest mtime wins when several candidates exist (see
+    :func:`graph_json_candidates` for the matching rules).
+    """
+    candidates = graph_json_candidates(project_name)
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
