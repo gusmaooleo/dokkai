@@ -174,31 +174,6 @@ def _resolve_provider(provider_name: str, base_url: str) -> tuple[LLMProvider | 
     return None, f"unknown DESC_PROVIDER '{provider_name}'"
 
 
-async def _provider_available(
-    provider: LLMProvider, provider_name: str, model: str
-) -> tuple[bool, str]:
-    """Whether the configured provider/model is ready to generate."""
-    if provider_name == "ollama":
-        try:
-            available = await provider.list_models()
-        except Exception as e:
-            return False, f"Ollama unavailable: {e}"
-        matched = model in available or any(a.split(":")[0] == model for a in available)
-        if not matched:
-            return False, f"model '{model}' unavailable"
-        return True, ""
-    # Remote providers: probe with the actual configured model (a 1-token
-    # call) instead of provider.health_check(), whose hard-coded model can
-    # lag behind the vendor's catalog and 404 even when DESC_MODEL is valid.
-    try:
-        await provider.chat(
-            [LLMMessage("user", "hi")], model=model, temperature=0.0, max_tokens=1
-        )
-    except Exception as e:
-        return False, str(e)
-    return True, ""
-
-
 _TRIMMED_DOC_CAP = 600
 _TRIMMED_BODY_CAP = 1200
 
@@ -262,7 +237,7 @@ async def _require_provider(provider_name: str, base_url: str, model: str) -> LL
     if provider is None:
         raise DescriptorError(f"descriptor provider '{provider_name}' unavailable: {reason}")
 
-    available, reason = await _provider_available(provider, provider_name, model)
+    available, reason = await provider.health_check(model)
     if not available:
         if provider_name == "ollama":
             raise DescriptorError(
