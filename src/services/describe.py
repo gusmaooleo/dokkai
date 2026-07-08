@@ -2,18 +2,21 @@
 Tier 2 — per-entity micro-descriptions.
 
 Generates a one-sentence natural-language summary for each *describable* code
-entity with a small local Ollama model, so conceptual queries ("how does the
-alarm flow work?") reach implementation code through the ``summary`` vector.
+entity with a small LLM (local Ollama by default, or a remote provider), so
+conceptual queries ("how does the alarm flow work?") reach implementation
+code through the ``summary`` vector. Description calls go through the shared
+provider abstraction in ``services.llm_provider``.
 
 Cost control (a description is one LLM call — the pipeline's dominant cost):
   - **Selective**: skip tests, entities without source, and trivial one-liners.
   - **Cached by source hash**: unchanged source reuses its description across
     re-ingestions — pairs with the deterministic UUID for incremental ingest.
-  - **Concurrent**: bounded parallel requests to Ollama.
+  - **Concurrent**: bounded parallel requests to the configured provider.
 
-If no model is configured (``DESC_MODEL`` unset) or the model/Ollama is
-unavailable, description generation is skipped gracefully — ingestion still
-succeeds, entities simply get no ``summary`` vector.
+If no model is configured (``DESC_MODEL`` unset) or the configured provider
+is unavailable (missing API key, unreachable, or model not found),
+description generation is skipped gracefully — ingestion still succeeds,
+entities simply get no ``summary`` vector.
 """
 
 from __future__ import annotations
@@ -26,9 +29,8 @@ import re
 from collections.abc import Callable
 from pathlib import Path
 
-import httpx
-
 from services.chunker import CodeChunk
+from services.llm_provider import LLMMessage, LLMProvider, get_provider
 from services.retriever import _is_test_path
 
 
@@ -39,7 +41,8 @@ DESC_SYSTEM_PROMPT = (
 )
 
 _MIN_SOURCE_LINES = 3  # fewer non-blank lines ⇒ too trivial to be worth an LLM call
-_GEN_OPTIONS = {"temperature": 0.1, "num_predict": 64, "num_ctx": 4096}
+_GEN_TEMPERATURE = 0.1
+_GEN_MAX_TOKENS = 64
 _MAX_ENUM_MEMBERS = 10
 _LEADING_IDENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)")
 _ENUM_LINE_SKIP = ("//", "/*", "*", "#", "@", "{", "}")
@@ -149,35 +152,52 @@ class DescriptionCache:
 
 
 # ---------------------------------------------------------------------------
-# Ollama generation
+# Provider-backed generation (services.llm_provider)
 # ---------------------------------------------------------------------------
 
-async def _model_available(client: httpx.AsyncClient, base_url: str, model: str) -> bool:
-    try:
-        resp = await client.get(f"{base_url}/api/tags")
-        resp.raise_for_status()
-        available = [m["name"] for m in resp.json().get("models", [])]
-        return model in available or any(a.split(":")[0] == model for a in available)
-    except Exception:
-        return False
+def _resolve_provider(provider_name: str, base_url: str) -> tuple[LLMProvider | None, str]:
+    """Instantiate the configured provider, or return a graceful-skip reason."""
+    if provider_name == "openai":
+        api_key = os.getenv("OPENAI_API_KEY", "")
+        if not api_key:
+            return None, "OPENAI_API_KEY not set"
+        return get_provider("openai", api_key=api_key), ""
+    if provider_name == "anthropic":
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            return None, "ANTHROPIC_API_KEY not set"
+        return get_provider("anthropic", api_key=api_key), ""
+    if provider_name == "ollama":
+        return get_provider("ollama", base_url=base_url), ""
+    return None, f"unknown DESC_PROVIDER '{provider_name}'"
 
 
-async def _generate_one(
-    client: httpx.AsyncClient, base_url: str, model: str, chunk: CodeChunk, keep_alive: str
-) -> str:
-    resp = await client.post(
-        f"{base_url}/api/generate",
-        json={
-            "model": model,
-            "system": DESC_SYSTEM_PROMPT,
-            "prompt": f"{chunk.entity_type} {chunk.qualified_name}\n\n{chunk.source_code}",
-            "stream": False,
-            "keep_alive": keep_alive,
-            "options": _GEN_OPTIONS,
-        },
+async def _provider_available(
+    provider: LLMProvider, provider_name: str, model: str
+) -> tuple[bool, str]:
+    """Whether the configured provider/model is ready to generate."""
+    if provider_name == "ollama":
+        try:
+            available = await provider.list_models()
+        except Exception as e:
+            return False, f"Ollama unavailable: {e}"
+        matched = model in available or any(a.split(":")[0] == model for a in available)
+        if not matched:
+            return False, f"model '{model}' unavailable"
+        return True, ""
+    healthy, message = await provider.health_check()
+    return healthy, message
+
+
+async def _generate_one(provider: LLMProvider, model: str, chunk: CodeChunk) -> str:
+    messages = [
+        LLMMessage("system", DESC_SYSTEM_PROMPT),
+        LLMMessage("user", f"{chunk.entity_type} {chunk.qualified_name}\n\n{chunk.source_code}"),
+    ]
+    response = await provider.chat(
+        messages, model=model, temperature=_GEN_TEMPERATURE, max_tokens=_GEN_MAX_TOKENS
     )
-    resp.raise_for_status()
-    return (resp.json().get("response") or "").strip()
+    return response.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -218,9 +238,9 @@ async def describe_chunks(
                 "describable": 0, "cached": 0, "generated": 0, "failed": 0,
                 "skipped": skipped_total, "templated": templated}
 
+    provider_name = os.getenv("DESC_PROVIDER", "ollama").lower().strip()
     base_url = base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     concurrency = concurrency or int(os.getenv("DESC_CONCURRENCY", "4"))
-    keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "5m")
     cache = cache if cache is not None else DescriptionCache()
 
     targets = [c for c in remaining if _should_describe(c)]
@@ -239,10 +259,18 @@ async def describe_chunks(
             to_generate.append((chunk, source_hash))
 
     generated = failed = 0
-    timeout = httpx.Timeout(float(os.getenv("OLLAMA_TIMEOUT", "600")), connect=10.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        if to_generate and not await _model_available(client, base_url, model):
-            return {"enabled": True, "reason": f"model '{model}' unavailable",
+    if to_generate:
+        provider, reason = _resolve_provider(provider_name, base_url)
+        if provider is None:
+            return {"enabled": True, "reason": f"provider '{provider_name}' unavailable: {reason}",
+                    "model": model, "describable": len(targets),
+                    "cached": cached, "generated": 0, "failed": 0,
+                    "pending": len(to_generate), "skipped": skipped,
+                    "templated": templated}
+
+        available, reason = await _provider_available(provider, provider_name, model)
+        if not available:
+            return {"enabled": True, "reason": reason,
                     "model": model, "describable": len(targets),
                     "cached": cached, "generated": 0, "failed": 0,
                     "pending": len(to_generate), "skipped": skipped,
@@ -255,7 +283,7 @@ async def describe_chunks(
             nonlocal generated, failed, done
             async with sem:
                 try:
-                    desc = await _generate_one(client, base_url, model, chunk, keep_alive)
+                    desc = await _generate_one(provider, model, chunk)
                 except Exception:
                     desc = ""
                 if desc:
