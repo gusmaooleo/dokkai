@@ -134,9 +134,28 @@ def _clean_comment(text: str) -> str:
 
 
 def _python_docstring(source_code: str) -> str:
-    """Extract a leading triple-quoted docstring from a Python entity's body."""
-    match = _PY_DOCSTRING.search(source_code)
-    return match.group("body").strip() if match else ""
+    """
+    Extract a docstring only when it is the entity's *own* first statement, so a
+    class with no docstring isn't mis-assigned its first method's docstring.
+    """
+    lines = source_code.splitlines()
+    i = 0
+    while i < len(lines) and lines[i].lstrip().startswith("@"):  # skip decorators
+        i += 1
+    while i < len(lines) and not lines[i].rstrip().endswith(":"):  # past the signature
+        i += 1
+    i += 1  # first body line
+    while i < len(lines) and not lines[i].strip():  # skip blanks
+        i += 1
+    if i >= len(lines):
+        return ""
+    body = "\n".join(lines[i:]).lstrip()
+    for quote in ('"""', "'''"):
+        if body.startswith(quote):
+            end = body[len(quote):].find(quote)
+            if end != -1:
+                return " ".join(body[len(quote):len(quote) + end].split())
+    return ""
 
 
 def _extract_doc(

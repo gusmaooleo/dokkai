@@ -287,9 +287,9 @@ These are known and tracked in the [Roadmap](#roadmap):
 ### Retrieval quality
 
 **Tier 1 — zero‑cost enrichment** (no extra LLM calls; improves the embedded text and ranking):
-- [ ] **De‑prioritize test files** in seed retrieval (down‑weight `*.test.*` / `*.spec.*` / `/tests/`) so implementation surfaces first. _(highest impact / lowest effort — next up; re‑ranks existing data, no re‑ingest needed)_
-- [ ] **Identifier tokenization** — split `camelCase` / `snake_case` in the embedded text (`sendDetectionNotification` → "send detection notification") so code matches natural‑language queries.
-- [ ] **Reuse existing docstrings / leading comments** as the entity description when present, before falling back to LLM generation.
+- [x] **De‑prioritize test files** in seed retrieval (down‑weight `*.test.*` / `*.spec.*` / `/tests/`) so implementation surfaces first. _(highest impact / lowest effort — next up; re‑ranks existing data, no re‑ingest needed)_
+- [x] **Identifier tokenization** — split `camelCase` / `snake_case` in the embedded text (`sendDetectionNotification` → "send detection notification") so code matches natural‑language queries.
+- [x] **Reuse existing docstrings / leading comments** as the entity description when present, before falling back to LLM generation.
 
 **Tier 2 — LLM micro‑descriptions** (the big unlock for conceptual queries — a one‑time, incremental cost):
 - [ ] **Per‑entity natural‑language summary**, stored as a dedicated **named vector** (`summary` alongside `code`) so retrieval can target intent or literal code.

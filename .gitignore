@@ -57,3 +57,4 @@ ingested/*.json
 
 # Runtime data (chat history, etc.)
 data/
+commits.md
