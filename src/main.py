@@ -1,5 +1,6 @@
 import os
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -9,9 +10,34 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Connect to Postgres and apply pending migrations. Best-effort: if
+    # Postgres isn't up yet, log a clear degraded-mode warning and keep
+    # serving — services.db.get_pool() will retry lazily on first access.
+    from services.db import init_db
+
+    try:
+        await init_db()
+    except Exception as e:
+        logger.warning(
+            "cannot connect to Postgres — conversation history is "
+            "unavailable; start it with 'docker compose up -d' (%s)", e,
+        )
+    else:
+        # Any job still 'queued'/'running' in the DB belongs to a previous
+        # server run that died before it could reach a terminal state —
+        # mark it failed so job history doesn't show it stuck forever.
+        from services.jobs import sweep_interrupted_jobs
+
+        try:
+            await sweep_interrupted_jobs()
+        except Exception as e:
+            logger.warning("job history: failed to sweep interrupted jobs on boot: %s", e)
+
     # If OLLAMA_CHAT_MODEL is set, preconfigure the local LLM and warm it on
     # boot — so the first /chat isn't a cold start and the model stays resident
     # (keep_alive). Seeding the config also means you don't have to re-POST

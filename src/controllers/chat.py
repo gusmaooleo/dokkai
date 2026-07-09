@@ -22,6 +22,7 @@ from models.dtos.chat import (
 )
 from services.chat import chat_with_codebase
 from services.chat_store import get_chat_store
+from services.db import DatabaseUnavailableError
 
 router = APIRouter(prefix="/chat")
 
@@ -65,7 +66,10 @@ async def chat(data: ChatRequest):
 async def list_conversations():
     """List all stored conversations."""
     store = get_chat_store()
-    conversations = store.list_conversations()
+    try:
+        conversations = await store.list_conversations()
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
     return [
         ConversationSummary(
@@ -88,7 +92,10 @@ async def list_conversations():
 async def get_conversation(conversation_id: str):
     """Get the full message history for a conversation."""
     store = get_chat_store()
-    conv = store.get_conversation(conversation_id)
+    try:
+        conv = await store.get_conversation(conversation_id)
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
     if conv is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -115,7 +122,10 @@ async def get_conversation(conversation_id: str):
 async def delete_conversation(conversation_id: str):
     """Delete a conversation and its history."""
     store = get_chat_store()
-    deleted = store.delete_conversation(conversation_id)
+    try:
+        deleted = await store.delete_conversation(conversation_id)
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
     if not deleted:
         raise HTTPException(status_code=404, detail="Conversation not found")

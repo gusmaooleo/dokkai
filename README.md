@@ -309,6 +309,7 @@ Full pipeline run on `saffira_back-end` (medium TS/Python backend), local Ollama
 | --- | --- |
 | API | FastAPI (Python ≥ 3.14, managed with `uv`) |
 | Vector DB | Weaviate `1.28` (`text2vec-ollama`) |
+| Relational DB | Postgres `18` (`asyncpg`) — conversation and job history |
 | Graph extraction | code-graph-rag (`cgr`) + ephemeral Memgraph |
 | Embeddings | Ollama · `nomic-embed-text` |
 | Generation | Ollama · `qwen2.5-coder` (any Ollama chat model) |
@@ -339,19 +340,24 @@ ollama pull qwen2.5-coder:3b      # descriptor model — REQUIRED before ingesti
 
 > ⚠️ Ollama must be up **before** you run the pipeline — Weaviate calls it to embed each chunk at insert time, and `POST /instances/pipeline` rejects the request with HTTP 400 if the descriptor model (`DESC_MODEL`) isn't configured and pulled — see [Descriptions](#descriptions-tier-2).
 
-### 2. Start Weaviate
+### 2. Start Weaviate and Postgres
 
 ```bash
 docker compose up -d
 ```
 
-> ⚠️ If you ever change the vectorizer (e.g. `EMBED_MODEL` or `VECTORIZER_PROVIDER`), wipe the volume first so the collection is recreated with the new config: `docker compose down -v && docker compose up -d`.
+This brings up both **Weaviate** (vector storage) and **Postgres** (conversation and job history). If Postgres isn't up yet when the API starts, the API still serves — see [Current limitations](#current-limitations) — so it's not strictly required before ingestion, but is required for chat/conversations.
+
+> ⚠️ If you ever change the vectorizer (e.g. `EMBED_MODEL` or `VECTORIZER_PROVIDER`), wipe the Weaviate volume first so the collection is recreated with the new config: `docker compose down -v && docker compose up -d` (this also wipes Postgres data — back it up first if you need to keep conversation/job history).
 
 ### 3. Configure the environment
 
 Create a `.env` in the project root:
 
 ```dotenv
+# --- Postgres (conversation and job history) ---
+DATABASE_URL=postgresql://dokkai:dokkai@localhost:5432/dokkai
+
 # --- Weaviate (client side) ---
 WEAVIATE_HOST=localhost
 WEAVIATE_HTTP_PORT=8080
@@ -434,6 +440,7 @@ All configuration is via environment variables (loaded from `.env` at startup).
 
 | Variable | Default | Description |
 | --- | --- | --- |
+| `DATABASE_URL` | `postgresql://dokkai:dokkai@localhost:5432/dokkai` | Postgres connection string for conversation and job history (`docker compose up -d` starts a matching Postgres service). Boot-time SQL migrations run automatically. If Postgres is unreachable at startup, the API still serves — see [Current limitations](#current-limitations) |
 | `WEAVIATE_HOST` | `localhost` | Weaviate host (client side) |
 | `WEAVIATE_HTTP_PORT` | `8080` | Weaviate HTTP port |
 | `WEAVIATE_GRPC_PORT` | `50051` | Weaviate gRPC port |
@@ -471,7 +478,7 @@ All configuration is via environment variables (loaded from `.env` at startup).
 | `POST` | `/instances/pipeline` | Run the full ingestion pipeline for a `repo_path`, `describe: true` by default (409 if a job is already running for that project; `describe: false` skips the descriptor pre-flight and ingests without descriptions) |
 | `POST` | `/instances/graph` | Graph-only run for a `repo_path` — `cgr` only, no LLM, no vectorization, no Weaviate (stages `cgr → done`, `kind: "graph"`; 409 if a job is already running for that project) |
 | `POST` | `/instances/{project}/describe` | Refresh descriptions for an already-ingested project (background job; optional `{"force": true}`; 409 if a job is already running for that project) — see [Refreshing descriptions](#refreshing-descriptions) |
-| `GET` | `/instances/jobs` | List ingestion/refresh jobs |
+| `GET` | `/instances/jobs` | List ingestion/refresh jobs — merges live (in-memory) jobs with history persisted in Postgres, so results survive a restart |
 | `GET` | `/instances/jobs/{id}` | Get a job's status, `stage`/`stage_progress` and result |
 | `GET` | `/instances/jobs/{id}/events` | Stream a job's progress as Server‑Sent Events (`event: job` on each update, `event: done` when it finishes) |
 | `GET` | `/graph` | List projects with an ingested graph |
@@ -479,9 +486,9 @@ All configuration is via environment variables (loaded from `.env` at startup).
 | `GET` | `/graph/{project}/neighborhood` | BFS neighborhood of an entity — `?entity=<qualified_name>&depth=&direction=&limit=` |
 | `GET` | `/graph/{project}/files` | File‑to‑file dependency view (internal files only) |
 | `POST` | `/chat` | Chat over the codebase (SSE: `sources` → `token` → `done`) |
-| `GET` | `/chat/conversations` | List conversations |
-| `GET` | `/chat/conversations/{id}` | Get a conversation's history |
-| `DELETE` | `/chat/conversations/{id}` | Delete a conversation |
+| `GET` | `/chat/conversations` | List conversations (persisted in Postgres; 503 if Postgres is unreachable) |
+| `GET` | `/chat/conversations/{id}` | Get a conversation's history (503 if Postgres is unreachable) |
+| `DELETE` | `/chat/conversations/{id}` | Delete a conversation (503 if Postgres is unreachable) |
 | `POST` | `/config/llm` | Set the active LLM provider/model (rejects an invalid/retired remote model) |
 | `GET` | `/config/llm` | Get the current LLM config |
 | `GET` | `/config/llm/models` | List available models for the provider (live catalog, static fallback on failure) |
@@ -493,6 +500,8 @@ Jobs report `stage` through the unified vocabulary `cgr → chunk → describe �
 **Per‑project job lock** — only one job (pipeline, refresh, or graph-only) may run at a time for a given project; submitting a second one (any of `/instances/pipeline`, `/instances/{project}/describe`, `/instances/graph`) returns HTTP 409 `another job is running for project '<project>'` and creates no job.
 
 **Job progress over SSE** — instead of polling `GET /instances/jobs/{id}`, `GET /instances/jobs/{id}/events` streams the same job payload over Server‑Sent Events (same framing as `/chat`): it emits `event: job` on every `updated_at` change and a terminal `event: done` with the final payload, then closes the stream. An unknown job id is a plain 404, not a stream.
+
+**Job history across restarts** — jobs live in memory while running (the source of truth for live progress) and are write‑through persisted to Postgres on lifecycle transitions (queued/running/terminal), so results survive a server restart. On boot, any job still `queued`/`running` from a previous run is swept and marked `failed` (`"interrupted by server restart"`), since its worker thread no longer exists. If Postgres is unreachable, job history is silently unavailable and only in-memory (live) jobs are returned — never a 503.
 
 ### Graph API
 
@@ -524,12 +533,14 @@ dokkai/
 │   │   ├── jobs.py              # background job store (per-project lock, SSE events)
 │   │   ├── llm_provider.py      # Ollama / OpenAI / Anthropic abstraction
 │   │   ├── llm_config.py        # provider config store + validation
-│   │   └── chat_store.py        # conversation history (in-memory)
+│   │   ├── chat_store.py        # conversation history (Postgres)
+│   │   └── db.py                # asyncpg connection pool + boot-time migrations
+│   ├── db/migrations/           # boot-time SQL migrations, applied in order
 │   └── models/dtos/             # pydantic request/response models
 ├── shell/run_cgr.sh             # code-graph-rag runner (ephemeral Memgraph)
 ├── cli/                         # npm CLI package (`dokkai`) — see CLI section
 ├── frontend/                    # Next.js app (WIP)
-├── docker-compose.yml           # Weaviate (text2vec-ollama)
+├── docker-compose.yml           # Weaviate (text2vec-ollama) + Postgres (conversation/job history)
 ├── dev.sh                       # dev server launcher
 └── ingested/                    # canonical graph JSON per project — <project>.json,
                                   # promoted from cgr's timestamped output after each
@@ -542,7 +553,7 @@ dokkai/
 
 These are known and tracked in the [Roadmap](#roadmap):
 
-- **In‑memory LLM config** — the active LLM provider/model resets on restart (re‑seedable via `OLLAMA_CHAT_MODEL`). Chat history *is* persisted — as JSON files under `data/conversations/` — but not yet in a database.
+- **In‑memory LLM config** — the active LLM provider/model resets on restart (re‑seedable via `OLLAMA_CHAT_MODEL`). Chat history is persisted in Postgres (see [Configuration](#configuration)); if Postgres is unreachable, the conversation endpoints and `/chat` degrade gracefully (503 / SSE `error` event) instead of crashing the API.
 - **Single repository at a time** per collection.
 - **Retrieval bias toward tests** — for "how does X work?" queries, test files often out‑rank the real implementation (test descriptions read like specs). End‑to‑end tests are also decoupled from implementation by the HTTP boundary, so graph expansion can't bridge them.
 - **The API is not yet containerized** — only Weaviate runs in `docker compose`; the API runs via `dev.sh`.
@@ -561,7 +572,7 @@ These are known and tracked in the [Roadmap](#roadmap):
 | 02 | Graph query API | ✅ done |
 | 03 | MCP server (core) | ✅ done (pending merge) |
 | 04 | npm CLI (`dokkai`) + SRCS mode | ✅ done (pending merge) |
-| 05 | Postgres conversation history | planned |
+| 05 | Postgres conversation history | ✅ done (pending merge) |
 | 06 | Basic auth (root user via env) | planned |
 | 07 | Frontend UI (chat + graph + config) | planned |
 | 08 | PDF ingestion — local NotebookLM | planned |
@@ -596,7 +607,8 @@ These are known and tracked in the [Roadmap](#roadmap):
 - [ ] Containerize the API (fill in the `Dockerfile`) and add the API + frontend to `docker-compose.yml`, so `docker compose up` brings up the **entire** stack.
 
 ### Persistence & multi‑environment
-- [ ] Move state to a database — the in‑memory LLM config and the JSON‑file chat history.
+- [x] Move chat/conversation history to a database (Postgres) — see [feature 05](#feature-roadmap).
+- [ ] Move the remaining in‑memory state to a database — the LLM config (live job progress is expected to stay in-memory; job history is already persisted, see [feature 05](#feature-roadmap)).
 - [ ] **Encrypted storage** of environments and API keys.
 - [ ] **Remote environment configuration** (manage environments from the UI) — with `.env` kept as a fallback.
 

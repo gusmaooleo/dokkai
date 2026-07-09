@@ -209,7 +209,12 @@ paths:
     get:
       tags: [Instances]
       summary: List ingestion jobs
-      description: Most recent first. Jobs are held in memory and reset on server restart.
+      description: |
+        Most recent first. Merges live (in-memory) jobs with job history
+        persisted in Postgres — results survive a server restart; only the
+        live progress of an in-flight job is in-memory only. If Postgres is
+        unreachable, history is silently unavailable and just the live jobs
+        are returned.
       operationId: listJobs
       responses:
         "200":
@@ -661,7 +666,7 @@ paths:
       operationId: listConversations
       responses:
         "200":
-          description: All stored conversations (persisted as JSON files under `data/`).
+          description: All stored conversations (persisted in Postgres).
           content:
             application/json:
               schema:

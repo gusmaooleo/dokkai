@@ -1,20 +1,24 @@
 """
 Chat persistence layer with storage abstraction.
 
-Stores conversation history as JSON files for now. The ``ChatStore``
-interface guarantees a seamless migration to a database later.
+Stores conversation history in Postgres. The ``ChatStore`` interface keeps
+the chat service and controllers decoupled from the storage backend.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, asdict
+from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from functools import wraps
 from typing import Any
+
+import asyncpg
+
+from services.db import DatabaseUnavailableError, get_pool
 
 
 @dataclass
@@ -59,12 +63,11 @@ class ChatStore(ABC):
     Interface for chat persistence.
 
     Implementations:
-        - JsonChatStore (current)
-        - DatabaseChatStore (future — same interface, zero code changes)
+        - PostgresChatStore (current)
     """
 
     @abstractmethod
-    def save_message(
+    async def save_message(
         self,
         conversation_id: str,
         message: ChatMessage,
@@ -76,22 +79,22 @@ class ChatStore(ABC):
         ...
 
     @abstractmethod
-    def get_conversation(self, conversation_id: str) -> Conversation | None:
+    async def get_conversation(self, conversation_id: str) -> Conversation | None:
         """Return a full conversation, or None."""
         ...
 
     @abstractmethod
-    def list_conversations(self) -> list[Conversation]:
+    async def list_conversations(self) -> list[Conversation]:
         """Return all conversations (without full message bodies for speed)."""
         ...
 
     @abstractmethod
-    def delete_conversation(self, conversation_id: str) -> bool:
+    async def delete_conversation(self, conversation_id: str) -> bool:
         """Delete a conversation. Returns True if it existed."""
         ...
 
     @abstractmethod
-    def create_conversation(
+    async def create_conversation(
         self,
         project_name: str,
         audience: str = "developer",
@@ -101,65 +104,80 @@ class ChatStore(ABC):
 
 
 # -----------------------------------------------------------------------
-# JSON file-based implementation
+# Postgres-based implementation
 # -----------------------------------------------------------------------
 
-class JsonChatStore(ChatStore):
+def _row_to_message(row: Any) -> ChatMessage:
+    raw_sources = row["sources"]
+    sources = json.loads(raw_sources) if isinstance(raw_sources, str) else (raw_sources or [])
+    return ChatMessage(
+        role=row["role"],
+        content=row["content"],
+        timestamp=row["created_at"].isoformat(),
+        sources=sources,
+    )
+
+
+def _translate_connection_errors(fn):
     """
-    Stores each conversation as a separate JSON file under ``data_dir``.
-
-    File layout::
-
-        data/conversations/
-            <conversation_id>.json
+    ``get_pool()`` only raises ``DatabaseUnavailableError`` when no pool has
+    ever been created. Once a pool exists, a query against a since-downed
+    Postgres raises a raw connection error instead — normalize that to the
+    same ``DatabaseUnavailableError`` so callers only handle one error type.
     """
 
-    def __init__(self, data_dir: str | None = None) -> None:
-        if data_dir is None:
-            base = Path(__file__).resolve().parent.parent.parent
-            data_dir = str(base / "data" / "conversations")
-        self._dir = Path(data_dir)
-        self._dir.mkdir(parents=True, exist_ok=True)
+    @wraps(fn)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        except DatabaseUnavailableError:
+            raise
+        except (OSError, asyncpg.PostgresError) as e:
+            raise DatabaseUnavailableError(
+                f"cannot reach Postgres — conversation history is unavailable ({e})"
+            ) from e
 
-    def _path(self, conversation_id: str) -> Path:
-        return self._dir / f"{conversation_id}.json"
+    return wrapper
 
-    def _load(self, conversation_id: str) -> Conversation | None:
-        path = self._path(conversation_id)
-        if not path.exists():
+
+class PostgresChatStore(ChatStore):
+    """Stores conversations and messages in Postgres via ``services.db.get_pool()``."""
+
+    def _parse_id(self, conversation_id: str) -> uuid.UUID | None:
+        try:
+            return uuid.UUID(conversation_id)
+        except (ValueError, AttributeError, TypeError):
             return None
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        messages = [ChatMessage(**m) for m in data.get("messages", [])]
-        return Conversation(
-            conversation_id=data["conversation_id"],
-            project_name=data.get("project_name", ""),
-            audience=data.get("audience", "developer"),
-            messages=messages,
-            created_at=data.get("created_at", ""),
-            updated_at=data.get("updated_at", ""),
-        )
 
-    def _save(self, conv: Conversation) -> None:
-        conv.updated_at = datetime.now(timezone.utc).isoformat()
-        path = self._path(conv.conversation_id)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(asdict(conv), f, indent=2, ensure_ascii=False)
-
-    def create_conversation(
+    @_translate_connection_errors
+    async def create_conversation(
         self,
         project_name: str,
         audience: str = "developer",
     ) -> Conversation:
-        conv = Conversation(
-            conversation_id=str(uuid.uuid4()),
-            project_name=project_name,
-            audience=audience,
+        pool = await get_pool()
+        conv_id = uuid.uuid4()
+        row = await pool.fetchrow(
+            """
+            INSERT INTO conversations (id, project_name, audience)
+            VALUES ($1, $2, $3)
+            RETURNING id, project_name, audience, created_at, updated_at
+            """,
+            conv_id,
+            project_name,
+            audience,
         )
-        self._save(conv)
-        return conv
+        return Conversation(
+            conversation_id=str(row["id"]),
+            project_name=row["project_name"],
+            audience=row["audience"],
+            messages=[],
+            created_at=row["created_at"].isoformat(),
+            updated_at=row["updated_at"].isoformat(),
+        )
 
-    def save_message(
+    @_translate_connection_errors
+    async def save_message(
         self,
         conversation_id: str,
         message: ChatMessage,
@@ -167,41 +185,133 @@ class JsonChatStore(ChatStore):
         project_name: str = "",
         audience: str = "developer",
     ) -> Conversation:
-        conv = self._load(conversation_id)
-        if conv is None:
-            conv = Conversation(
-                conversation_id=conversation_id,
-                project_name=project_name,
-                audience=audience,
-            )
-        conv.messages.append(message)
-        self._save(conv)
+        pool = await get_pool()
+        conv_uuid = uuid.UUID(conversation_id)
+
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO conversations (id, project_name, audience)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    conv_uuid,
+                    project_name,
+                    audience,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO messages (conversation_id, role, content, sources)
+                    VALUES ($1, $2, $3, $4::jsonb)
+                    """,
+                    conv_uuid,
+                    message.role,
+                    message.content,
+                    _dump_sources(message.sources),
+                )
+                row = await conn.fetchrow(
+                    """
+                    UPDATE conversations SET updated_at = now()
+                    WHERE id = $1
+                    RETURNING id, project_name, audience, created_at, updated_at
+                    """,
+                    conv_uuid,
+                )
+
+        conv = await self.get_conversation(str(row["id"]))
+        assert conv is not None
         return conv
 
-    def get_conversation(self, conversation_id: str) -> Conversation | None:
-        return self._load(conversation_id)
+    @_translate_connection_errors
+    async def get_conversation(self, conversation_id: str) -> Conversation | None:
+        conv_uuid = self._parse_id(conversation_id)
+        if conv_uuid is None:
+            return None
 
-    def list_conversations(self) -> list[Conversation]:
-        conversations: list[Conversation] = []
-        for path in sorted(self._dir.glob("*.json"), key=os.path.getmtime, reverse=True):
-            conv = self._load(path.stem)
-            if conv:
-                conversations.append(conv)
-        return conversations
+        pool = await get_pool()
+        conv_row = await pool.fetchrow(
+            """
+            SELECT id, project_name, audience, created_at, updated_at
+            FROM conversations WHERE id = $1
+            """,
+            conv_uuid,
+        )
+        if conv_row is None:
+            return None
 
-    def delete_conversation(self, conversation_id: str) -> bool:
-        path = self._path(conversation_id)
-        if path.exists():
-            path.unlink()
-            return True
-        return False
+        message_rows = await pool.fetch(
+            """
+            SELECT role, content, sources, created_at
+            FROM messages WHERE conversation_id = $1
+            ORDER BY id
+            """,
+            conv_uuid,
+        )
+
+        return Conversation(
+            conversation_id=str(conv_row["id"]),
+            project_name=conv_row["project_name"],
+            audience=conv_row["audience"],
+            messages=[_row_to_message(r) for r in message_rows],
+            created_at=conv_row["created_at"].isoformat(),
+            updated_at=conv_row["updated_at"].isoformat(),
+        )
+
+    @_translate_connection_errors
+    async def list_conversations(self) -> list[Conversation]:
+        pool = await get_pool()
+        conv_rows = await pool.fetch(
+            """
+            SELECT id, project_name, audience, created_at, updated_at
+            FROM conversations ORDER BY updated_at DESC
+            """
+        )
+        message_rows = await pool.fetch(
+            """
+            SELECT conversation_id, role, content, sources, created_at
+            FROM messages ORDER BY conversation_id, id
+            """
+        )
+
+        messages_by_conv: dict[uuid.UUID, list[ChatMessage]] = defaultdict(list)
+        for row in message_rows:
+            messages_by_conv[row["conversation_id"]].append(_row_to_message(row))
+
+        return [
+            Conversation(
+                conversation_id=str(row["id"]),
+                project_name=row["project_name"],
+                audience=row["audience"],
+                messages=messages_by_conv.get(row["id"], []),
+                created_at=row["created_at"].isoformat(),
+                updated_at=row["updated_at"].isoformat(),
+            )
+            for row in conv_rows
+        ]
+
+    @_translate_connection_errors
+    async def delete_conversation(self, conversation_id: str) -> bool:
+        conv_uuid = self._parse_id(conversation_id)
+        if conv_uuid is None:
+            return False
+
+        pool = await get_pool()
+        result = await pool.execute(
+            "DELETE FROM conversations WHERE id = $1", conv_uuid
+        )
+        return result == "DELETE 1"
+
+
+def _dump_sources(sources: list[dict[str, Any]]) -> str:
+    return json.dumps(sources, ensure_ascii=False)
 
 
 # -----------------------------------------------------------------------
 # Singleton chat store instance
 # -----------------------------------------------------------------------
 
-_chat_store: ChatStore = JsonChatStore()
+_chat_store: ChatStore = PostgresChatStore()
 
 
 def get_chat_store() -> ChatStore:
