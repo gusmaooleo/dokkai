@@ -6,6 +6,7 @@ import chalk from "chalk";
 import { runUp } from "./commands/up.js";
 import { runStatus } from "./commands/status.js";
 import { runIngest } from "./commands/ingest.js";
+import { runGraph } from "./commands/graph.js";
 
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json") as { version: string };
@@ -63,7 +64,10 @@ program
       "no vectorization",
   )
   .option("--out <file>", "write the graph JSON to this file")
-  .action(() => notImplemented("graph"));
+  .action(
+    (target: string, options: { out?: string }) =>
+      runGraph(target, { ...program.opts(), ...options }),
+  );
 
 program
   .command("srcs")

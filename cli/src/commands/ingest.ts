@@ -5,7 +5,7 @@ import chalk from "chalk";
 import ora from "ora";
 import { resolveApiUrl } from "../lib/config.js";
 import { postJson } from "../lib/http.js";
-import { followJob, type JobDTO } from "../lib/jobs.js";
+import { followJob, type JobDTO, stageLabel } from "../lib/jobs.js";
 
 interface IngestFlags {
   api?: string;
@@ -34,14 +34,6 @@ async function confirmRecreate(): Promise<boolean> {
   } finally {
     rl.close();
   }
-}
-
-function stageLabel(job: JobDTO): string {
-  const stage = job.stage || "queued";
-  const progress = job.stage_progress;
-  if (!progress) return stage;
-  if (progress.total > 0) return `${stage} ${progress.done}/${progress.total}`;
-  return `${stage} ${progress.done}`;
 }
 
 function printSummary(job: JobDTO): void {

@@ -156,3 +156,12 @@ export async function* followJob(
 
   yield* followViaPolling(apiUrl, jobId);
 }
+
+
+export function stageLabel(job: JobDTO): string {
+  const stage = job.stage || "queued";
+  const progress = job.stage_progress;
+  if (!progress) return stage;
+  if (progress.total > 0) return `${stage} ${progress.done}/${progress.total}`;
+  return `${stage} ${progress.done}`;
+}
