@@ -17,6 +17,7 @@ from services.retriever import Retriever, RetrievedChunk
 from services.llm_provider import LLMMessage
 from services.llm_config import get_active_provider
 from services.chat_store import get_chat_store, ChatMessage
+from services.db import DatabaseUnavailableError
 from services.weaviate_client import get_client
 
 
@@ -96,12 +97,16 @@ async def chat_with_codebase(
     store = get_chat_store()
 
     # Resolve or create conversation
-    if conversation_id:
-        conv = store.get_conversation(conversation_id)
-        if conv is None:
+    try:
+        if conversation_id:
+            conv = await store.get_conversation(conversation_id)
+            if conv is None:
+                conversation_id = str(uuid.uuid4())
+        else:
             conversation_id = str(uuid.uuid4())
-    else:
-        conversation_id = str(uuid.uuid4())
+    except DatabaseUnavailableError as e:
+        yield {"type": "error", "data": str(e)}
+        return
 
     # ---- Step 1: Retrieve relevant code (graph-expanded) ----
     # The Weaviate client is synchronous (blocking gRPC), so run the whole
@@ -158,22 +163,26 @@ async def chat_with_codebase(
     ]
 
     # Add previous conversation history (if any)
-    conv = store.get_conversation(conversation_id)
-    if conv and conv.messages:
-        for msg in conv.messages:
-            if msg.role in ("user", "assistant"):
-                llm_messages.append(LLMMessage(role=msg.role, content=msg.content))
+    try:
+        conv = await store.get_conversation(conversation_id)
+        if conv and conv.messages:
+            for msg in conv.messages:
+                if msg.role in ("user", "assistant"):
+                    llm_messages.append(LLMMessage(role=msg.role, content=msg.content))
 
-    # Add current user message
-    llm_messages.append(LLMMessage(role="user", content=message))
+        # Add current user message
+        llm_messages.append(LLMMessage(role="user", content=message))
 
-    # Save user message
-    store.save_message(
-        conversation_id,
-        ChatMessage(role="user", content=message),
-        project_name=project_name,
-        audience=audience,
-    )
+        # Save user message
+        await store.save_message(
+            conversation_id,
+            ChatMessage(role="user", content=message),
+            project_name=project_name,
+            audience=audience,
+        )
+    except DatabaseUnavailableError as e:
+        yield {"type": "error", "data": str(e)}
+        return
 
     # ---- Step 3: Stream LLM response ----
     try:
@@ -196,16 +205,20 @@ async def chat_with_codebase(
         return
 
     # Save assistant response
-    store.save_message(
-        conversation_id,
-        ChatMessage(
-            role="assistant",
-            content=full_answer,
-            sources=source_dicts,
-        ),
-        project_name=project_name,
-        audience=audience,
-    )
+    try:
+        await store.save_message(
+            conversation_id,
+            ChatMessage(
+                role="assistant",
+                content=full_answer,
+                sources=source_dicts,
+            ),
+            project_name=project_name,
+            audience=audience,
+        )
+    except DatabaseUnavailableError as e:
+        yield {"type": "error", "data": str(e)}
+        return
 
     yield {
         "type": "done",
