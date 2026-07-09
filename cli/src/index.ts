@@ -5,6 +5,7 @@ import { Command } from "commander";
 import chalk from "chalk";
 import { runUp } from "./commands/up.js";
 import { runStatus } from "./commands/status.js";
+import { runIngest } from "./commands/ingest.js";
 
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json") as { version: string };
@@ -48,7 +49,12 @@ program
       "search quality is reduced",
   )
   .option("--yes", "skip the --recreate confirmation prompt")
-  .action(() => notImplemented("ingest"));
+  .action(
+    (
+      repoPath: string,
+      options: { recreate?: boolean; describe: boolean; yes?: boolean },
+    ) => runIngest(repoPath, { ...program.opts(), ...options }),
+  );
 
 program
   .command("graph <repo-path|project>")
