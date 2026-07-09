@@ -8,7 +8,9 @@ from models.dtos.receive import DescribeRefreshRequest, GraphOnlyRequest, Ingest
 from services.describe import DescriptorError, ensure_descriptor_available
 from services.jobs import (
     ProjectJobConflict,
+    get_job_from_db,
     get_job_store,
+    list_jobs,
     submit_describe_refresh,
     submit_graph_only,
     submit_pipeline,
@@ -37,7 +39,7 @@ async def runPipeline(data: IngestRequest):
         except DescriptorError as e:
             raise HTTPException(status_code=400, detail=str(e))
     try:
-        job = submit_pipeline(data.repo_path, recreate=data.recreate, describe=data.describe)
+        job = await submit_pipeline(data.repo_path, recreate=data.recreate, describe=data.describe)
     except ProjectJobConflict as e:
         raise HTTPException(status_code=409, detail=str(e))
     return {"job_id": job.id, "status": job.status}
@@ -56,7 +58,7 @@ async def runGraphOnly(data: GraphOnlyRequest):
     happens inside ``ingestByLocalRepository``.
     """
     try:
-        job = submit_graph_only(data.repo_path)
+        job = await submit_graph_only(data.repo_path)
     except ProjectJobConflict as e:
         raise HTTPException(status_code=409, detail=str(e))
     return {"job_id": job.id, "status": job.status}
@@ -101,7 +103,7 @@ async def refreshDescriptions(project: str, data: DescribeRefreshRequest | None 
         raise HTTPException(status_code=400, detail=str(e))
 
     try:
-        job = submit_describe_refresh(project, force=force)
+        job = await submit_describe_refresh(project, force=force)
     except ProjectJobConflict as e:
         raise HTTPException(status_code=409, detail=str(e))
     return {"job_id": job.id, "status": job.status}
@@ -109,15 +111,24 @@ async def refreshDescriptions(project: str, data: DescribeRefreshRequest | None 
 
 @router.get("/jobs")
 async def listJobs():
-    return [job.to_dict() for job in get_job_store().list()]
+    """
+    Merges live (in-memory) jobs with Postgres-persisted job history —
+    memory wins on id collisions, sorted by ``created_at`` descending. If
+    Postgres is unreachable, history is quietly absent and only live jobs
+    are returned (never a 503 — live job status must keep working).
+    """
+    return await list_jobs()
 
 
 @router.get("/jobs/{job_id}")
 async def getJob(job_id: str):
     job = get_job_store().get(job_id)
-    if job is None:
+    if job is not None:
+        return job.to_dict()
+    db_job = await get_job_from_db(job_id)
+    if db_job is None:
         raise HTTPException(status_code=404, detail="job not found")
-    return job.to_dict()
+    return db_job
 
 
 @router.get("/jobs/{job_id}/events")
@@ -132,10 +143,29 @@ async def streamJobEvents(job_id: str):
     ``job`` for in-progress updates and ``done`` for the terminal state —
     reusing chat's ``done`` name for "stream is now finished" — after which
     the stream closes. Unknown job id is a plain 404, not a stream.
+
+    A job that only exists in Postgres (not in memory — the server restarted
+    since it ran) is, by construction, always terminal after the boot sweep;
+    its stream is a single ``done`` event with the stored payload.
     """
     job = get_job_store().get(job_id)
     if job is None:
-        raise HTTPException(status_code=404, detail="job not found")
+        db_job = await get_job_from_db(job_id)
+        if db_job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+
+        async def db_event_stream():
+            yield f"event: done\ndata: {json.dumps(db_job)}\n\n"
+
+        return StreamingResponse(
+            db_event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     async def event_stream():
         last_updated_at = None

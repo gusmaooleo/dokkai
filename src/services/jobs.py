@@ -9,19 +9,30 @@ progress and result are polled via ``GET /instances/jobs/{id}``.
 The pipeline mixes blocking work (the ``cgr`` subprocess, file reads, the sync
 Weaviate client) with async work (Ollama description calls), so each job runs
 in a **worker thread** with its own event loop — the server's main loop stays
-free to serve status polls. Jobs are held in memory and reset on restart.
+free to serve status polls. Jobs are held in memory (the source of truth for
+live jobs) and write-through to Postgres on lifecycle transitions only
+(created/running/terminal — never per progress tick) so history survives a
+restart; see the module docstring notes on ``_persist_job_via_pool`` and
+``_persist_job_direct`` for why two different DB-access paths are used.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import os
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 
+import asyncpg
+
+from services.db import DatabaseUnavailableError, _database_url, get_pool
 from services.ingest import ingestByLocalRepository
 from services.vectorize import process_and_store, refresh_descriptions
+
+logger = logging.getLogger(__name__)
 
 
 def _now() -> str:
@@ -111,6 +122,150 @@ def get_job_store() -> JobStore:
     return _job_store
 
 
+# -----------------------------------------------------------------------
+# Job history persistence (best-effort write-through to Postgres)
+# -----------------------------------------------------------------------
+#
+# Two write paths, chosen for the same reason: asyncpg pools/connections are
+# bound to the event loop that created them.
+#
+#   - _persist_job_via_pool: used for the "created" (queued) transition,
+#     which happens in submit_* on the server's MAIN event loop — safe to
+#     use the shared app pool (services.db.get_pool()) and awaited before the
+#     worker thread is spawned, so the queued row always lands before any
+#     running/terminal write from that job's worker.
+#   - _persist_job_direct: used for the "running" and "terminal" transitions,
+#     which happen inside a job worker THREAD's own private loop
+#     (asyncio.run in _run_*_sync). That loop must never touch the main
+#     loop's pool, so it opens a short-lived direct asyncpg.connect() and
+#     closes it right after. Cheap enough since it only fires twice per job.
+#
+# Both paths are best-effort: any Postgres failure is logged as a warning
+# and swallowed — the in-memory job is unaffected, persistence is a nice-to-have.
+
+async def _write_job_row(job: Job, conn: asyncpg.Connection) -> None:
+    await conn.execute(
+        """
+        INSERT INTO jobs (id, project, status, created_at, updated_at, data)
+        VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+        ON CONFLICT (id) DO UPDATE
+        SET status = EXCLUDED.status,
+            updated_at = EXCLUDED.updated_at,
+            data = EXCLUDED.data
+        """,
+        uuid.UUID(job.id),
+        job.project,
+        job.status,
+        datetime.fromisoformat(job.created_at),
+        datetime.fromisoformat(job.updated_at),
+        json.dumps(job.to_dict()),
+    )
+
+
+async def _persist_job_via_pool(job: Job) -> None:
+    """Write-through via the app pool. Main event loop only — see note above."""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await _write_job_row(job, conn)
+    except DatabaseUnavailableError as e:
+        logger.warning("job history: Postgres unavailable, skipping persist for job %s: %s", job.id, e)
+    except Exception as e:
+        logger.warning("job history: failed to persist job %s: %s", job.id, e)
+
+
+async def _persist_job_direct(job: Job) -> None:
+    """Write-through via a short-lived direct connection. Worker threads only — see note above."""
+    try:
+        conn = await asyncpg.connect(_database_url())
+    except Exception as e:
+        logger.warning("job history: could not reach Postgres to persist job %s: %s", job.id, e)
+        return
+    try:
+        await _write_job_row(job, conn)
+    except Exception as e:
+        logger.warning("job history: failed to persist job %s: %s", job.id, e)
+    finally:
+        await conn.close()
+
+
+def _persist_job_from_worker(job: Job) -> None:
+    """Sync wrapper so worker threads (running plain functions, not coroutines) can call _persist_job_direct."""
+    asyncio.run(_persist_job_direct(job))
+
+
+async def list_jobs() -> list[dict]:
+    """
+    Merge in-memory (live) jobs with Postgres-persisted history for
+    ``GET /instances/jobs``. Memory wins on id collisions. Falls back to
+    memory-only, quietly, when Postgres is unreachable — job listings for
+    live jobs must keep working regardless of DB health.
+    """
+    memory_jobs = {job.id: job.to_dict() for job in get_job_store().list()}
+
+    db_jobs: dict[str, dict] = {}
+    try:
+        pool = await get_pool()
+        rows = await pool.fetch("SELECT id, data FROM jobs")
+        for row in rows:
+            raw = row["data"]
+            db_jobs[str(row["id"])] = json.loads(raw) if isinstance(raw, str) else raw
+    except DatabaseUnavailableError as e:
+        logger.warning("job history: Postgres unavailable, listing live jobs only: %s", e)
+    except Exception as e:
+        logger.warning("job history: failed to read job history: %s", e)
+
+    merged = {**db_jobs, **memory_jobs}
+    return sorted(merged.values(), key=lambda j: j["created_at"], reverse=True)
+
+
+async def get_job_from_db(job_id: str) -> dict | None:
+    """DB-only job lookup, used as a fallback when a job isn't in memory."""
+    try:
+        job_uuid = uuid.UUID(job_id)
+    except ValueError:
+        return None
+    try:
+        pool = await get_pool()
+        row = await pool.fetchrow("SELECT data FROM jobs WHERE id = $1", job_uuid)
+    except DatabaseUnavailableError as e:
+        logger.warning("job history: Postgres unavailable, cannot fetch job %s: %s", job_id, e)
+        return None
+    except Exception as e:
+        logger.warning("job history: failed to read job %s: %s", job_id, e)
+        return None
+    if row is None:
+        return None
+    raw = row["data"]
+    return json.loads(raw) if isinstance(raw, str) else raw
+
+
+async def sweep_interrupted_jobs() -> None:
+    """
+    Mark any job left 'queued' or 'running' from a previous server run as
+    failed — a crash or restart killed its worker thread, so it will never
+    reach a terminal state on its own. Call once at boot, after init_db()
+    succeeds. Patches both the status column and the JSONB data payload so
+    reads stay Job.to_dict()-shaped.
+    """
+    pool = await get_pool()
+    await pool.execute(
+        """
+        UPDATE jobs
+        SET status = 'failed',
+            updated_at = now(),
+            data = jsonb_set(
+                jsonb_set(
+                    jsonb_set(data, '{status}', '"failed"'),
+                    '{error}', to_jsonb('interrupted by server restart'::text)
+                ),
+                '{updated_at}', to_jsonb(now()::text)
+            )
+        WHERE status IN ('queued', 'running')
+        """
+    )
+
+
 def _run_pipeline_sync(job: Job) -> None:
     """
     Execute the full pipeline for a job, in a worker thread. Updates ``job`` in
@@ -119,6 +274,7 @@ def _run_pipeline_sync(job: Job) -> None:
     """
     job.status = "running"
     job.updated_at = _now()
+    _persist_job_from_worker(job)
 
     def report(stage: str, done: int, total: int) -> None:
         job.stage, job.done, job.total = stage, done, total
@@ -151,9 +307,10 @@ def _run_pipeline_sync(job: Job) -> None:
         job.error = f"{type(e).__name__}: {e}"
     finally:
         job.updated_at = _now()
+        _persist_job_from_worker(job)
 
 
-def submit_pipeline(repo_path: str, recreate: bool = False, describe: bool = True) -> Job:
+async def submit_pipeline(repo_path: str, recreate: bool = False, describe: bool = True) -> Job:
     """
     Create a job and spawn it on a worker thread. Returns immediately with the
     queued job. The task reference is retained so it isn't garbage-collected
@@ -171,6 +328,7 @@ def submit_pipeline(repo_path: str, recreate: bool = False, describe: bool = Tru
     if active is not None:
         raise ProjectJobConflict(project)
     job = store.create(repo_path, recreate=recreate, describe=describe)
+    await _persist_job_via_pool(job)
     task = asyncio.create_task(asyncio.to_thread(_run_pipeline_sync, job))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
@@ -184,6 +342,7 @@ def _run_describe_refresh_sync(job: Job) -> None:
     """
     job.status = "running"
     job.updated_at = _now()
+    _persist_job_from_worker(job)
 
     def report(stage: str, done: int, total: int) -> None:
         job.stage, job.done, job.total = stage, done, total
@@ -202,9 +361,10 @@ def _run_describe_refresh_sync(job: Job) -> None:
         job.error = f"{type(e).__name__}: {e}"
     finally:
         job.updated_at = _now()
+        _persist_job_from_worker(job)
 
 
-def submit_describe_refresh(project: str, force: bool = False) -> Job:
+async def submit_describe_refresh(project: str, force: bool = False) -> Job:
     """
     Create a describe-refresh job and spawn it on a worker thread. Returns
     immediately with the queued job.
@@ -218,6 +378,7 @@ def submit_describe_refresh(project: str, force: bool = False) -> Job:
     if active is not None:
         raise ProjectJobConflict(project)
     job = store.create_describe_refresh(project, force=force)
+    await _persist_job_via_pool(job)
     task = asyncio.create_task(asyncio.to_thread(_run_describe_refresh_sync, job))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
@@ -233,6 +394,7 @@ def _run_graph_only_sync(job: Job) -> None:
     """
     job.status = "running"
     job.updated_at = _now()
+    _persist_job_from_worker(job)
 
     def report(stage: str, done: int, total: int) -> None:
         job.stage, job.done, job.total = stage, done, total
@@ -253,9 +415,10 @@ def _run_graph_only_sync(job: Job) -> None:
         job.error = f"{type(e).__name__}: {e}"
     finally:
         job.updated_at = _now()
+        _persist_job_from_worker(job)
 
 
-def submit_graph_only(repo_path: str) -> Job:
+async def submit_graph_only(repo_path: str) -> Job:
     """
     Create a graph-only job and spawn it on a worker thread. Returns
     immediately with the queued job.
@@ -272,6 +435,7 @@ def submit_graph_only(repo_path: str) -> Job:
     if active is not None:
         raise ProjectJobConflict(project)
     job = store.create_graph_only(repo_path)
+    await _persist_job_via_pool(job)
     task = asyncio.create_task(asyncio.to_thread(_run_graph_only_sync, job))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)

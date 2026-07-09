@@ -27,6 +27,16 @@ async def lifespan(app: FastAPI):
             "cannot connect to Postgres — conversation history is "
             "unavailable; start it with 'docker compose up -d' (%s)", e,
         )
+    else:
+        # Any job still 'queued'/'running' in the DB belongs to a previous
+        # server run that died before it could reach a terminal state —
+        # mark it failed so job history doesn't show it stuck forever.
+        from services.jobs import sweep_interrupted_jobs
+
+        try:
+            await sweep_interrupted_jobs()
+        except Exception as e:
+            logger.warning("job history: failed to sweep interrupted jobs on boot: %s", e)
 
     # If OLLAMA_CHAT_MODEL is set, preconfigure the local LLM and warm it on
     # boot — so the first /chat isn't a cold start and the model stays resident
