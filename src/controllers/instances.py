@@ -1,10 +1,11 @@
 import asyncio
 import json
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from models.dtos.receive import DescribeRefreshRequest, GraphOnlyRequest, IngestRequest
+from services.auth import require_auth, require_role
 from services.describe import DescriptorError, ensure_descriptor_available
 from services.jobs import (
     ProjectJobConflict,
@@ -18,10 +19,13 @@ from services.jobs import (
 from services.vectorize import find_latest_graph_json, no_graph_json_message
 from services.weaviate_client import get_client, project_has_chunks
 
-router = APIRouter(prefix="/instances")
+router = APIRouter(prefix="/instances", dependencies=[Depends(require_auth)])
+
+# Ingestion/refresh routes mutate state — role 'viewer' is read-only (6k).
+require_write = require_role("admin", "user")
 
 
-@router.post("/pipeline")
+@router.post("/pipeline", dependencies=[Depends(require_write)])
 async def runPipeline(data: IngestRequest):
     """
     Enqueue the ingestion pipeline (graph → chunk → describe → embed) as a
@@ -45,7 +49,7 @@ async def runPipeline(data: IngestRequest):
     return {"job_id": job.id, "status": job.status}
 
 
-@router.post("/graph")
+@router.post("/graph", dependencies=[Depends(require_write)])
 async def runGraphOnly(data: GraphOnlyRequest):
     """
     Enqueue a graph-ONLY run (decision 1b-graph) as a background job and
@@ -64,7 +68,7 @@ async def runGraphOnly(data: GraphOnlyRequest):
     return {"job_id": job.id, "status": job.status}
 
 
-@router.post("/{project}/describe")
+@router.post("/{project}/describe", dependencies=[Depends(require_write)])
 async def refreshDescriptions(project: str, data: DescribeRefreshRequest | None = None):
     """
     Re-run ONLY the describe pass over a project's already-ingested chunks

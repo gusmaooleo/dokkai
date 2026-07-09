@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from models.dtos.chat import (
@@ -20,14 +20,19 @@ from models.dtos.chat import (
     SourceChunk,
     ConversationSummary,
 )
+from services.auth import require_auth, require_role
 from services.chat import chat_with_codebase
 from services.chat_store import get_chat_store
 from services.db import DatabaseUnavailableError
 
-router = APIRouter(prefix="/chat")
+router = APIRouter(prefix="/chat", dependencies=[Depends(require_auth)])
+
+# Sending a message / deleting a conversation mutate state — role 'viewer'
+# is read-only (6k).
+require_write = require_role("admin", "user")
 
 
-@router.post("")
+@router.post("", dependencies=[Depends(require_write)])
 async def chat(data: ChatRequest):
     """
     Send a message and receive a Server-Sent Events (SSE) streaming response.
@@ -118,7 +123,7 @@ async def get_conversation(conversation_id: str):
     }
 
 
-@router.delete("/conversations/{conversation_id}")
+@router.delete("/conversations/{conversation_id}", dependencies=[Depends(require_write)])
 async def delete_conversation(conversation_id: str):
     """Delete a conversation and its history."""
     store = get_chat_store()

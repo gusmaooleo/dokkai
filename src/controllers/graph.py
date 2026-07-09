@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from models.dtos.graph import (
     FileViewResponse,
@@ -21,6 +21,7 @@ from models.dtos.graph import (
     NeighborhoodResponse,
     ProjectGraphDTO,
 )
+from services.auth import require_auth
 from services.graph_store import (
     EntityNotFoundError,
     GraphNotFoundError,
@@ -30,7 +31,7 @@ from services.graph_store import (
     list_graphs,
 )
 
-router = APIRouter(prefix="/graph")
+router = APIRouter(prefix="/graph", dependencies=[Depends(require_auth)])
 
 
 # Registered before the "/{project}" routes below so a literal "/graph"

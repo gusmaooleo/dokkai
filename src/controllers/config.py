@@ -9,7 +9,7 @@ GET  /config/llm/health   — check provider connectivity
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from models.dtos.config import (
     LLMConfigRequest,
@@ -18,16 +18,20 @@ from models.dtos.config import (
     ModelsListResponse,
     AvailableModel,
 )
+from services.auth import require_auth, require_role
 from services.llm_config import (
     get_config_store,
     validate_and_save_config,
     get_active_provider,
 )
 
-router = APIRouter(prefix="/config")
+router = APIRouter(prefix="/config", dependencies=[Depends(require_auth)])
+
+# Global LLM config writes are admin-only (6k).
+require_admin = require_role("admin")
 
 
-@router.post("/llm", response_model=LLMConfigResponse)
+@router.post("/llm", response_model=LLMConfigResponse, dependencies=[Depends(require_admin)])
 async def set_llm_config(data: LLMConfigRequest):
     """
     Configure the LLM provider.
