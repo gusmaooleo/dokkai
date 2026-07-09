@@ -147,6 +147,8 @@ npm link       # `dokkai` is now on PATH
 
 > Will be available as `npm install -g dokkai` once published to npm — for now, `npm link` from `cli/`.
 
+Something not working? `dokkai doctor` complements `up`/`status`: it checks the whole local toolchain (node, docker, uv, `DOKKAI_HOME`) as well as Weaviate/Ollama/API reachability, and prints the exact command to fix whatever's missing.
+
 ### Commands
 
 | Command | Description |
@@ -155,7 +157,9 @@ npm link       # `dokkai` is now on PATH
 | `dokkai status` | Read-only health check (API, Weaviate, Ollama + model presence) plus a list of ingested projects. Always exits 0. |
 | `dokkai ingest <repo-path> [--recreate] [--no-describe] [--yes]` | Validates the path, confirms `--recreate` interactively (or via `--yes`), calls `POST /instances/pipeline`, and streams live stage progress (SSE with a polling fallback) to a result summary. |
 | `dokkai graph <repo-path\|project> [--out <file>]` | Graph-only run: a **directory** argument enqueues `POST /instances/graph` (cgr only, no LLM/Weaviate) and prints the canonical graph JSON path (with `--out`, also exports the normalized graph); a **project name** argument fetches and prints/writes its normalized structural graph (`GET /graph/{project}?include=structural`) — stdout output pipes cleanly when `--out` is omitted. |
-| `dokkai srcs --model <claude\|codex\|ollama:<name>> [--project <name>]` | `claude`/`codex`: idempotently (re-)registers the dokkai MCP server, then launches the tool interactively. `ollama:<name>`: sets the API's global chat model (`POST /config/llm`) and starts a terminal REPL over `/chat`'s SSE stream, with conversation continuity across turns. |
+| `dokkai srcs --model <claude\|codex\|ollama:<name>> [--project <name>] [--agent]` | `claude`/`codex`: idempotently (re-)registers the dokkai MCP server, then launches the tool interactively. `ollama:<name>`: sets the API's global chat model (`POST /config/llm`) and starts a terminal REPL over `/chat`'s SSE stream, with conversation continuity across turns. With `--agent` (ollama only): agentic mode — the CLI spawns the dokkai MCP server itself and navigates the codebase locally with MCP tools, no API server needed (only Weaviate + Ollama). |
+| `dokkai watch <repo-path> [--debounce <seconds>=3] [--no-describe]` | Runs an initial ingest cycle, then watches the repo and debounces file changes into incremental re-ingestions (`POST /instances/pipeline`, `recreate: false`) via the API. Ignores `.git`, `node_modules`, build/venv/data dirs and dotfiles; skips a cycle (and reschedules) on a 409 (job already running for the project); Ctrl-C stops cleanly. |
+| `dokkai doctor` | Read-only environment diagnosis: node/docker/uv/`DOKKAI_HOME` (required), Weaviate readiness, Ollama reachability + `EMBED_MODEL`/`DESC_MODEL` presence, and API reachability (warnings). Prints the exact fix command for each missing/warning item. Exits 1 if a required item is missing, 0 otherwise. |
 
 Global flag: `--api <url>` — dokkai API URL (default `http://localhost:8000`).
 
@@ -167,7 +171,12 @@ Global flag: `--api <url>` — dokkai API URL (default `http://localhost:8000`).
 
 `graph`-only flag: `--out <file>` — write the graph JSON to a file instead of stdout.
 
-`srcs`-only flag: `--project <name>` — with `ollama:<name>`, the project to chat about; auto-detected when exactly one project is ingested (errors listing the options if zero or multiple are ingested and `--project` is omitted).
+`watch`-only flags: `--debounce <seconds>` (default `3`) — seconds to wait after the last change before re-ingesting; `--no-describe` — same as `ingest`'s flag, applied on every cycle.
+
+`srcs`-only flags:
+
+- `--project <name>` — with `ollama:<name>`, the project to chat about; auto-detected when exactly one project is ingested (errors listing the options if zero or multiple are ingested and `--project` is omitted).
+- `--agent` — with `ollama:<name>` only (errors otherwise): agentic MCP loop instead of the `/chat` REPL. The CLI spawns the dokkai MCP server itself over a hand-rolled stdio JSON-RPC client (`DOKKAI_MCP_PROFILE=small-model`), mirrors its live tool schemas into Ollama `/api/chat` tool calling, and runs the same search/read/answer loop as `scripts/mcp_harness.py` — fallback tool-call parser, tool-result reminder, 8-round cap, identical-call dedupe — in the same `dokkai>` REPL. Prints a per-call token line and a session total. Requires only Weaviate + Ollama running (no FastAPI). Measured live with the API stopped: the canonical question ("how does the alarm flow work?") answered via one `search` call, ≈679 tokens.
 
 ### Environment (CLI-side)
 
@@ -184,7 +193,19 @@ dokkai srcs --model codex
 
 # Local Ollama model, terminal chat loop over dokkai retrieval
 dokkai srcs --model ollama:qwen2.5-coder:latest --project your-repo
+
+# Local Ollama model, agentic MCP loop — no API server needed
+dokkai srcs --model ollama:qwen2.5-coder:latest --project your-repo --agent
 ```
+
+### Keeping the index fresh
+
+```bash
+dokkai watch /absolute/path/to/your-repo
+dokkai watch /absolute/path/to/your-repo --debounce 5 --no-describe
+```
+
+Runs an initial catch-up ingest, then re-ingests incrementally on every save (deterministic UUIDs + the description cache keep each cycle cheap). Leave it running alongside your editor while using `srcs` against the same project.
 
 ### Graph-only runs
 
@@ -277,7 +298,7 @@ Full pipeline run on `saffira_back-end` (medium TS/Python backend), local Ollama
 - ✅ Pluggable providers — LLM: Ollama / OpenAI / Anthropic · embeddings: Ollama / OpenAI / Cohere
 - ✅ Auto‑configure + warm the chat model on startup (no cold starts)
 - ✅ **MCP server** — 7 tools (search, literal grep, graph navigation, entity/file lookup) for Claude Code, Codex and any stdio MCP client, with a small-model instructions profile and a session usage watchdog (see [MCP server](#mcp-server))
-- ✅ **npm CLI** (`dokkai`) — `up`/`status`/`ingest`/`graph`/`srcs` commands with live job progress and one-command SRCS sessions (Claude Code, Codex, or a local Ollama REPL) (see [CLI](#cli))
+- ✅ **npm CLI** (`dokkai`) — `up`/`status`/`ingest`/`graph`/`srcs`/`watch`/`doctor` commands: live job progress, one-command SRCS sessions (Claude Code, Codex, a local Ollama REPL, or an agentic local-model MCP loop), debounced incremental re-ingestion on save, and environment diagnostics (see [CLI](#cli))
 - ✅ **Graph-only ingestion** (`POST /instances/graph`, `dokkai graph`) — run just `cgr` with no LLM/Weaviate involved
 
 ---
@@ -548,6 +569,7 @@ These are known and tracked in the [Roadmap](#roadmap):
 | 10 | Documentation site (en/pt/zh/es) | planned |
 | 11 | Post‑01 polish (live provider model catalogs, stage‑level job progress, describe refresh endpoint) | ✅ done |
 | 12 | MCP polish (`grep_project` tool, small-model instructions profile, session watchdog) | ✅ done (pending merge) |
+| 13 | CLI polish (agentic `srcs --agent` MCP loop, `watch` incremental re-ingestion, `doctor` diagnostics) | ✅ done (pending merge) |
 
 ### Retrieval quality
 

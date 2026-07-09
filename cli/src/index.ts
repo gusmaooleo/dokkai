@@ -8,6 +8,8 @@ import { runStatus } from "./commands/status.js";
 import { runIngest } from "./commands/ingest.js";
 import { runGraph } from "./commands/graph.js";
 import { runSrcs } from "./commands/srcs.js";
+import { runWatch } from "./commands/watch.js";
+import { runDoctor } from "./commands/doctor.js";
 
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json") as { version: string };
@@ -80,10 +82,43 @@ program
     "project to chat about with ollama:<name> (default: auto-detect if " +
       "exactly one project is ingested)",
   )
+  .option(
+    "--agent",
+    "agentic MCP loop for ollama:<name> instead of the /chat REPL " +
+      "(no FastAPI required — only Weaviate + Ollama)",
+  )
   .action(
-    (options: { model: string; project?: string }) =>
+    (options: { model: string; project?: string; agent?: boolean }) =>
       runSrcs({ ...program.opts(), ...options }),
   );
+
+program
+  .command("watch <repo-path>")
+  .description(
+    "watch a repo and incrementally re-ingest it via the API on file changes",
+  )
+  .option(
+    "--debounce <seconds>",
+    "seconds to wait after the last change before re-ingesting",
+    "3",
+  )
+  .option(
+    "--no-describe",
+    "ingest without LLM descriptions on each cycle — the summary vector " +
+      "stays empty; search quality is reduced",
+  )
+  .action(
+    (repoPath: string, options: { debounce?: string; describe: boolean }) =>
+      runWatch(repoPath, { ...program.opts(), ...options }),
+  );
+
+program
+  .command("doctor")
+  .description(
+    "diagnose the local environment: node/docker/uv/DOKKAI_HOME, Weaviate, " +
+      "Ollama, and the dokkai API",
+  )
+  .action(() => runDoctor(program.opts()));
 
 program.parseAsync(process.argv).catch((error: unknown) => {
   console.error(

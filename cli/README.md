@@ -32,6 +32,8 @@ npm link
 
 `dokkai up` and `dokkai status` need to find the dokkai repo (for `docker-compose.yml` and to read its `.env`) — either run CLI commands from inside that repo, or set `DOKKAI_HOME`.
 
+Not sure what's missing? `dokkai doctor` checks node/docker/uv/`DOKKAI_HOME` plus Weaviate/Ollama/API reachability and prints the fix command for each problem it finds.
+
 ## Commands
 
 | Command | Description |
@@ -40,16 +42,20 @@ npm link
 | `dokkai status` | Read-only health check (API, Weaviate, Ollama + model presence) and a list of ingested projects; always exits 0 |
 | `dokkai ingest <repo-path> [--recreate] [--no-describe] [--yes]` | Run the full ingestion pipeline via the API, with live stage progress (SSE, polling fallback) |
 | `dokkai graph <repo-path\|project> [--out <file>]` | Graph-only run (no LLM, no vectorization) for a directory, or a normalized graph export for an already-ingested project name |
-| `dokkai srcs --model <claude\|codex\|ollama:<name>> [--project <name>]` | Register the dokkai MCP server and launch Claude Code / Codex, or start a terminal chat loop against a local Ollama model |
+| `dokkai srcs --model <claude\|codex\|ollama:<name>> [--project <name>] [--agent]` | Register the dokkai MCP server and launch Claude Code / Codex, or start a terminal chat loop against a local Ollama model. With `--agent` (ollama only): agentic mode — the CLI spawns the dokkai MCP server itself and navigates the codebase with MCP tools locally, no API server needed. |
+| `dokkai watch <repo-path> [--debounce <seconds>=3] [--no-describe]` | Initial catch-up ingest, then debounced incremental re-ingestion on every file save; skips a cycle if one is already running for the project; Ctrl-C exits cleanly |
+| `dokkai doctor` | Diagnose the local environment (node/docker/uv/`DOKKAI_HOME`, Weaviate, Ollama, API) with fix commands for anything missing; exits 1 if a required item is missing |
 
 Flags:
 
 - `--api <url>` (global) — dokkai API URL. Default `http://localhost:8000`.
 - `--recreate` (`ingest`) — drop and rebuild the **entire** Weaviate collection (all projects) before inserting. Prompts for confirmation unless `--yes` is also passed.
-- `--no-describe` (`ingest`) — skip per-entity LLM descriptions for this run; the `summary` vector stays empty and search quality is reduced. Skips the descriptor pre-flight the API otherwise enforces.
+- `--no-describe` (`ingest`, `watch`) — skip per-entity LLM descriptions; the `summary` vector stays empty and search quality is reduced. Skips the descriptor pre-flight the API otherwise enforces.
 - `--yes` (`ingest`) — skip the `--recreate` confirmation prompt.
 - `--out <file>` (`graph`) — write the graph JSON to a file instead of stdout.
 - `--project <name>` (`srcs`, with `ollama:<name>`) — project to chat about; auto-detected if exactly one project is ingested.
+- `--agent` (`srcs`, with `ollama:<name>` only) — agentic MCP loop instead of the `/chat` REPL; requires only Weaviate + Ollama (no FastAPI). Per-call token lines + session total printed in the REPL.
+- `--debounce <seconds>` (`watch`) — seconds to wait after the last change before re-ingesting. Default `3`.
 
 ## Environment variables
 
@@ -71,9 +77,21 @@ dokkai srcs --model codex
 
 # Local Ollama model, terminal chat loop over dokkai retrieval
 dokkai srcs --model ollama:qwen2.5-coder:latest --project your-repo
+
+# Local Ollama model, agentic MCP loop — no API server needed
+dokkai srcs --model ollama:qwen2.5-coder:latest --project your-repo --agent
 ```
 
-The `claude`/`codex` variants (re-)register the dokkai MCP server idempotently, then launch the tool interactively. The `ollama:<name>` variant sets the dokkai API's global chat model and starts a REPL (`/exit` or Ctrl-D to quit) with conversation continuity across turns.
+The `claude`/`codex` variants (re-)register the dokkai MCP server idempotently, then launch the tool interactively. The `ollama:<name>` variant sets the dokkai API's global chat model and starts a REPL (`/exit` or Ctrl-D to quit) with conversation continuity across turns. `--agent` (ollama only) skips the API entirely: the CLI spawns the dokkai MCP server itself and the model navigates the codebase locally with MCP tools — measured live, the canonical question ("how does the alarm flow work?") was answered via one `search` call, ≈679 tokens.
+
+## Keeping the index fresh
+
+```bash
+dokkai watch /absolute/path/to/your-repo
+dokkai watch /absolute/path/to/your-repo --debounce 5 --no-describe
+```
+
+Runs an initial catch-up ingest, then re-ingests incrementally on every save.
 
 ## License
 
