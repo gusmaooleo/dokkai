@@ -14,8 +14,12 @@ info:
     auto-generated spec cannot express well).
 
     ### Typical flow
+    0. `POST /auth/login` — every route below is authenticated (see the
+       `Auth` tag); log in (default `admin`/`admin` on first boot) and send
+       the returned token as `Authorization: Bearer <token>` on every
+       subsequent request.
     1. `POST /config/llm` — configure the chat model (or set `OLLAMA_CHAT_MODEL`
-       so it is auto-configured on startup).
+       so it is auto-configured on startup). Requires the `admin` role.
     2. `POST /instances/pipeline` — ingest a repository. Returns a `job_id`.
     3. `GET /instances/jobs/{job_id}` — poll until `status = succeeded`.
     4. `POST /chat` — ask questions; the answer streams back over SSE.
@@ -27,9 +31,18 @@ servers:
   - url: http://localhost:8000
     description: Local development server
 
+security:
+  - bearerAuth: []
+
 tags:
   - name: Health
     description: Liveness.
+  - name: Auth
+    description: >-
+      Always-on bearer-token authentication. Roles: `admin` (everything, plus
+      user management and `POST /config/llm`), `user` (chat, ingestion,
+      deletes, all reads — no user management, no `POST /config/llm`),
+      `viewer` (read-only GETs only).
   - name: Instances
     description: Ingest repositories and track ingestion jobs.
   - name: Chat
@@ -45,6 +58,7 @@ paths:
       tags: [Health]
       summary: Health check
       operationId: root
+      security: []
       responses:
         "200":
           description: Service is online.
@@ -56,6 +70,270 @@ paths:
                   status:
                     type: string
                     example: online
+
+  # ---------------------------------------------------------------------------
+  # Auth
+  # ---------------------------------------------------------------------------
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in
+      description: |
+        Authenticate with `username`/`password` and receive a bearer token
+        valid for 30 days. Public — no token required.
+
+        Bad credentials return a single `401` message regardless of whether
+        the username or the password was wrong. Also runs the admin-seeding
+        check (self-heals a boot that happened while Postgres was down) and
+        purges expired sessions opportunistically.
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+            examples:
+              default:
+                value:
+                  username: admin
+                  password: admin
+      responses:
+        "200":
+          description: Authenticated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginResponse"
+        "401":
+          description: Wrong username or password.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "invalid username or password"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /auth/status:
+    get:
+      tags: [Auth]
+      summary: Auth status
+      description: |
+        Public. Reports that auth is enabled (always `true`) and whether the
+        default `admin`/`admin` credentials are still active
+        (`default_admin_active`) — the CLI and the planned UI use this to
+        warn until the default password is changed.
+      operationId: authStatus
+      security: []
+      responses:
+        "200":
+          description: Auth status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Log out
+      description: Invalidate the session (bearer token) used for this request. Requires any authenticated role.
+      operationId: logout
+      responses:
+        "200":
+          description: Logged out.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: "logged out" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user
+      description: Requires any authenticated role.
+      operationId: getMe
+      responses:
+        "200":
+          description: The authenticated user.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /auth/users:
+    get:
+      tags: [Auth]
+      summary: List users
+      description: Requires the `admin` role. Never includes password hashes.
+      operationId: listUsers
+      responses:
+        "200":
+          description: All users.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/UserDTO"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    post:
+      tags: [Auth]
+      summary: Create a user
+      description: Requires the `admin` role.
+      operationId: createUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateUserRequest"
+            examples:
+              default:
+                value:
+                  username: alice
+                  password: "correct horse battery staple"
+                  role: user
+      responses:
+        "201":
+          description: User created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateUserResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: Username already taken.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "username 'alice' already exists"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /auth/users/{user_id}:
+    delete:
+      tags: [Auth]
+      summary: Delete a user
+      description: |
+        Requires the `admin` role. Guards: you cannot delete your own user
+        (`400`), and you cannot delete the last remaining admin (`400`).
+      operationId: deleteUser
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: User deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: "user deleted" }
+        "400":
+          description: Self-delete or last-admin guard triggered.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                self_delete:
+                  summary: Deleting your own user
+                  value:
+                    detail: "you cannot delete your own user"
+                last_admin:
+                  summary: Deleting the last admin
+                  value:
+                    detail: "cannot delete the last admin user"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: No user with that id.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "user not found"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /auth/users/me/password:
+    patch:
+      tags: [Auth]
+      summary: Change your own password
+      description: |
+        Requires any authenticated role. Verifies `current_password` first
+        (`401` on mismatch). Invalidates every *other* session for this
+        user — the session making this request stays valid.
+      operationId: changeOwnPassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChangePasswordRequest"
+      responses:
+        "200":
+          description: Password updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: "password updated" }
+        "401":
+          description: Missing/invalid session, or `current_password` didn't match.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                bad_session:
+                  summary: Missing or invalid bearer token
+                  value:
+                    detail: "missing bearer token"
+                bad_current_password:
+                  summary: current_password didn't match
+                  value:
+                    detail: "invalid current password"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   # ---------------------------------------------------------------------------
   # Instances
@@ -83,6 +361,8 @@ paths:
         opt out explicitly: the pre-flight is skipped and the pipeline runs
         without descriptions (the `summary` named vector stays empty for
         this run's chunks).
+
+        Requires the `admin` or `user` role.
       operationId: runPipeline
       requestBody:
         required: true
@@ -144,8 +424,14 @@ paths:
                 $ref: "#/components/schemas/Error"
               example:
                 detail: "another job is running for project 'your-repo'"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "422":
           $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /instances/graph:
     post:
@@ -168,6 +454,8 @@ paths:
         `/instances/{project}/describe` — a graph-only run can't race a
         pipeline/refresh run (or another graph-only run) for the same
         project.
+
+        Requires the `admin` or `user` role.
       operationId: runGraphOnly
       requestBody:
         required: true
@@ -202,8 +490,14 @@ paths:
                 $ref: "#/components/schemas/Error"
               example:
                 detail: "another job is running for project 'your-repo'"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "422":
           $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /instances/jobs:
     get:
@@ -214,7 +508,12 @@ paths:
         persisted in Postgres — results survive a server restart; only the
         live progress of an in-flight job is in-memory only. If Postgres is
         unreachable, history is silently unavailable and just the live jobs
-        are returned.
+        are returned — unless Postgres is unreachable *entirely*, in which
+        case this route (like every non-public route) 503s at the
+        auth layer before its own handler runs, since resolving the bearer
+        token also requires Postgres.
+
+        Requires any authenticated role.
       operationId: listJobs
       responses:
         "200":
@@ -225,6 +524,10 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Job"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /instances/{project}/describe:
     post:
@@ -258,6 +561,8 @@ paths:
         its latest graph JSON must still be present in `ingested/` (`409`),
         and the descriptor model must be available (`400`, same messages as
         `POST /instances/pipeline`).
+
+        Requires the `admin` or `user` role.
       operationId: refreshDescriptions
       parameters:
         - name: project
@@ -332,8 +637,14 @@ paths:
                   summary: Another job already running for this project
                   value:
                     detail: "another job is running for project 'your-repo'"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "422":
           $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /instances/jobs/{job_id}/events:
     get:
@@ -352,6 +663,8 @@ paths:
         `GET /instances/jobs/{job_id}`.
 
         An unknown `job_id` returns a plain `404` (not a stream).
+
+        Requires any authenticated role.
       operationId: streamJobEvents
       parameters:
         - name: job_id
@@ -377,13 +690,18 @@ paths:
 
                     event: done
                     data: {"id":"b0dc2159-...","status":"succeeded","stage":"done","kind":"pipeline", "...": "..."}
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /instances/jobs/{job_id}:
     get:
       tags: [Instances]
       summary: Get an ingestion job
+      description: Requires any authenticated role.
       operationId: getJob
       parameters:
         - name: job_id
@@ -399,8 +717,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Job"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   # ---------------------------------------------------------------------------
   # Graph
@@ -413,6 +735,8 @@ paths:
         Lists every project with a graph JSON in `ingested/`. Read directly
         off the filesystem — restart-proof, no separate registry. Returns
         `[]` when nothing has been ingested yet.
+
+        Requires any authenticated role.
       operationId: listGraphs
       responses:
         "200":
@@ -423,6 +747,10 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/ProjectGraphDTO"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /graph/{project}:
     get:
@@ -439,6 +767,8 @@ paths:
         modules, packages, the project, external packages) and every edge.
         Edges are always restricted to pairs where both endpoints are in the
         returned node set — no dangling endpoints.
+
+        Requires any authenticated role.
       operationId: getGraph
       parameters:
         - name: project
@@ -476,8 +806,12 @@ paths:
                 $ref: "#/components/schemas/Error"
               example:
                 detail: "no graph found for project 'your-repo' — run POST /instances/pipeline to ingest it"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "422":
           $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /graph/{project}/neighborhood:
     get:
@@ -494,6 +828,8 @@ paths:
         count (root included, closest hop first). Returned nodes carry a
         `hop` field (0 = the center entity); the center is also returned
         separately as `center`.
+
+        Requires any authenticated role.
       operationId: getNeighborhood
       parameters:
         - name: project
@@ -554,8 +890,12 @@ paths:
                   summary: Qualified name not in this project's graph
                   value:
                     detail: "entity 'src.alarms.AlarmValidationUseCase' not found in project 'your-repo' graph"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "422":
           $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /graph/{project}/files:
     get:
@@ -570,6 +910,8 @@ paths:
         into one edge with a total `weight` and a per relationship-type
         `types` breakdown. Self-loops and external dependencies are
         excluded — only internal file-to-file dependencies remain.
+
+        Requires any authenticated role.
       operationId: getFileView
       parameters:
         - name: project
@@ -592,6 +934,10 @@ paths:
                 $ref: "#/components/schemas/Error"
               example:
                 detail: "no graph found for project 'your-repo' — run POST /instances/pipeline to ingest it"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   # ---------------------------------------------------------------------------
   # Chat
@@ -619,6 +965,8 @@ paths:
         empty `sources` array and an ungrounded answer.
 
         Note: curl needs `-N` to disable buffering and see tokens as they arrive.
+
+        Requires the `admin` or `user` role.
       operationId: chat
       requestBody:
         required: true
@@ -656,13 +1004,20 @@ paths:
 
                     event: done
                     data: {"conversation_id":"b0dc2159-5b52-4b73-a7ca-9f094496d64b","answer":"The alarm flow works by ..."}
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "422":
           $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /chat/conversations:
     get:
       tags: [Chat]
       summary: List conversations
+      description: Requires any authenticated role.
       operationId: listConversations
       responses:
         "200":
@@ -673,11 +1028,16 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/ConversationSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /chat/conversations/{conversation_id}:
     get:
       tags: [Chat]
       summary: Get a conversation
+      description: Requires any authenticated role.
       operationId: getConversation
       parameters:
         - name: conversation_id
@@ -692,11 +1052,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Conversation"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     delete:
       tags: [Chat]
       summary: Delete a conversation
+      description: Requires the `admin` or `user` role.
       operationId: deleteConversation
       parameters:
         - name: conversation_id
@@ -717,8 +1082,14 @@ paths:
                     example: Conversation deleted
                   conversation_id:
                     type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   # ---------------------------------------------------------------------------
   # Config
@@ -734,6 +1105,8 @@ paths:
         Validation probes the exact `provider_data.model` given (see
         `GET /config/llm/health`) — an invalid or retired remote model is
         rejected with `400` and nothing is saved.
+
+        Requires the `admin` role.
       operationId: setLlmConfig
       requestBody:
         required: true
@@ -766,11 +1139,16 @@ paths:
                 $ref: "#/components/schemas/LLMConfigResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "422":
           $ref: "#/components/responses/ValidationError"
     get:
       tags: [Config]
       summary: Get the current LLM config
+      description: Requires any authenticated role.
       operationId: getLlmConfig
       responses:
         "200":
@@ -779,6 +1157,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/LLMConfigResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
 
@@ -791,6 +1171,8 @@ paths:
         `openai`/`anthropic`, this fetches the provider's live models API
         (short timeout) and falls back to a static built-in list on any
         failure. `ollama` lists what's pulled locally.
+
+        Requires any authenticated role.
       operationId: listModels
       responses:
         "200":
@@ -799,6 +1181,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ModelsListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
         "502":
@@ -818,6 +1202,8 @@ paths:
         tokens), Ollama checks the model is present in `/api/tags`. The same
         model-parametrized check runs at `POST /config/llm` save time
         (rejecting an invalid/retired model) and as the describe pre-flight.
+
+        Requires any authenticated role.
       operationId: checkHealth
       responses:
         "200":
@@ -826,6 +1212,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ProviderHealthResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
 
@@ -850,6 +1238,52 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/HTTPValidationError"
+    Unauthorized:
+      description: Missing, invalid or expired bearer token.
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+            example: Bearer
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          examples:
+            missing:
+              summary: No Authorization header
+              value:
+                detail: "missing bearer token"
+            invalid:
+              summary: Unknown or expired token
+              value:
+                detail: "invalid or expired session"
+    Forbidden:
+      description: Authenticated, but the user's role cannot perform this action.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            detail: "role 'viewer' cannot perform this action"
+    ServiceUnavailable:
+      description: >-
+        Postgres is unreachable. Auth itself is Postgres-backed, so this can
+        surface on *any* non-public route (the bearer token can't be
+        resolved), not just the ones that store data in Postgres.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        Opaque session token returned by `POST /auth/login`, sent as
+        `Authorization: Bearer <token>`. 30-day TTL, revoked by
+        `POST /auth/logout` or a password change. See the Auth tag.
 
   schemas:
     Error:
@@ -859,6 +1293,67 @@ components:
           type: string
       example:
         detail: job not found
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string }
+        password: { type: string, format: password }
+
+    LoginResponse:
+      type: object
+      properties:
+        token: { type: string, description: "Bearer token — shown only once, at login." }
+        expires_at: { type: string, format: date-time }
+        role: { type: string, enum: [admin, user, viewer] }
+        default_admin_active:
+          type: boolean
+          description: True if a user named `admin` still verifies against password `admin`.
+
+    MeResponse:
+      type: object
+      properties:
+        username: { type: string }
+        role: { type: string, enum: [admin, user, viewer] }
+        expires_at: { type: string, format: date-time, description: Expiry of the session used for this request. }
+        default_admin_active: { type: boolean }
+
+    StatusResponse:
+      type: object
+      properties:
+        enabled: { type: boolean, description: Always true — auth cannot be disabled. }
+        default_admin_active: { type: boolean }
+
+    UserDTO:
+      type: object
+      properties:
+        id: { type: integer }
+        username: { type: string }
+        role: { type: string, enum: [admin, user, viewer] }
+        created_at: { type: string, format: date-time }
+
+    CreateUserRequest:
+      type: object
+      required: [username, password, role]
+      properties:
+        username: { type: string }
+        password: { type: string, format: password }
+        role: { type: string, enum: [admin, user, viewer] }
+
+    CreateUserResponse:
+      type: object
+      properties:
+        id: { type: integer }
+        username: { type: string }
+        role: { type: string, enum: [admin, user, viewer] }
+
+    ChangePasswordRequest:
+      type: object
+      required: [current_password, new_password]
+      properties:
+        current_password: { type: string, format: password }
+        new_password: { type: string, format: password }
 
     HTTPValidationError:
       type: object
