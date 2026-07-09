@@ -20,17 +20,18 @@ async def runPipeline(data: IngestRequest):
     background job and return its id immediately. Poll ``/instances/jobs/{id}``
     for progress and the final result.
 
-    Descriptions are always on via this endpoint (the no-describe mode is an
-    internal-only opt-in until feature 04's CLI/API UX), so the descriptor
-    model is checked *before* creating the job: a missing/unavailable
-    descriptor fails the request immediately with no job created.
+    Descriptions are on by default; the descriptor model is checked *before*
+    creating the job, so a missing/unavailable descriptor fails the request
+    immediately with no job created. Set ``describe: false`` to opt out and
+    skip that pre-flight — the pipeline then runs without descriptions.
     """
+    if data.describe:
+        try:
+            await ensure_descriptor_available()
+        except DescriptorError as e:
+            raise HTTPException(status_code=400, detail=str(e))
     try:
-        await ensure_descriptor_available()
-    except DescriptorError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    try:
-        job = submit_pipeline(data.repo_path, recreate=data.recreate)
+        job = submit_pipeline(data.repo_path, recreate=data.recreate, describe=data.describe)
     except ProjectJobConflict as e:
         raise HTTPException(status_code=409, detail=str(e))
     return {"job_id": job.id, "status": job.status}
