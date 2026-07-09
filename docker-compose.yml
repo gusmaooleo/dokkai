@@ -18,5 +18,25 @@ services:
     # (macOS/Windows) host.docker.internal resolves to the host automatically;
     # on Linux, add: extra_hosts: ["host.docker.internal:host-gateway"].
 
+  postgres:
+    image: postgres:18-alpine
+    restart: on-failure:0
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: dokkai
+      POSTGRES_PASSWORD: dokkai
+      POSTGRES_DB: dokkai
+    # postgres:18+ moved the default data directory from
+    # /var/lib/postgresql/data to /var/lib/postgresql — mount the volume there.
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dokkai -d dokkai"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   weaviate_data:
+  postgres_data:
