@@ -4,6 +4,8 @@ import { envVar, resolveApiUrl, resolveDokkaiHome } from "../lib/config.js";
 import { getJson } from "../lib/http.js";
 import { modelInstalled, probeOllama } from "../lib/ollama.js";
 
+const API_HEALTH_TIMEOUT_MS = 5_000;
+
 interface ProjectGraphDTO {
   project: string;
   file: string;
@@ -37,13 +39,20 @@ export async function runStatus(flags: { api?: string }): Promise<void> {
   const home = tryResolveHome();
   const apiUrl = resolveApiUrl(flags);
 
+  // Plain, unauthenticated probe: `/` is public, and the up/down row must
+  // stay true regardless of whether DOKKAI_ROOT_USER/PASSWORD are valid — a
+  // credential problem is reported separately below, not as "down".
   const apiSpinner = ora(`Checking dokkai API at ${apiUrl}...`).start();
   let apiUp = false;
   try {
-    await getJson(`${apiUrl}/`);
-    apiUp = true;
-    apiSpinner.succeed(chalk.green(`dokkai API: up (${apiUrl})`));
+    const response = await fetchWithTimeout(`${apiUrl}/`, API_HEALTH_TIMEOUT_MS);
+    apiUp = response.ok;
   } catch {
+    apiUp = false;
+  }
+  if (apiUp) {
+    apiSpinner.succeed(chalk.green(`dokkai API: up (${apiUrl})`));
+  } else {
     apiSpinner.fail(chalk.red(`dokkai API: down (${apiUrl})`));
     console.log(
       chalk.red(

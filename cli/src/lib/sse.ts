@@ -16,6 +16,8 @@ export interface StreamSseOptions {
    * connection-liveness watchdog upstream (a full frame may not have
    * arrived yet, but bytes did). */
   onChunk?: () => void;
+  /** Extra headers to send with the request (e.g. `Authorization`). */
+  headers?: Record<string, string>;
 }
 
 /** Thrown when the SSE endpoint itself responds 404 (unknown resource). */
@@ -51,7 +53,7 @@ export async function* streamSse(
 ): AsyncGenerator<SseFrame> {
   const response = await fetch(url, {
     signal: options.signal,
-    headers: { Accept: "text/event-stream" },
+    headers: { Accept: "text/event-stream", ...options.headers },
   });
 
   if (response.status === 404) {

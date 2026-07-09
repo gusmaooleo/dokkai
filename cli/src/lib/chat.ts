@@ -6,6 +6,7 @@
 
 import { createInterface } from "node:readline";
 import chalk from "chalk";
+import { authHeaders, describeAuthFailure, invalidateAuthCache } from "./auth.js";
 import { resolveApiUrl } from "./config.js";
 import { getJson, postJson } from "./http.js";
 
@@ -132,24 +133,45 @@ function parseFrame(raw: string): SseFrame | null {
   return { event, data: dataLines.join("\n") };
 }
 
+async function postChat(
+  apiUrl: string,
+  body: unknown,
+  signal: AbortSignal,
+): Promise<Response> {
+  return fetch(`${apiUrl}/chat`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+      ...(await authHeaders(apiUrl)),
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
 /**
  * POST to `/chat` and yield each SSE frame (`sources`, `token`, `done`,
  * `error`) as it arrives. `signal` aborts the underlying fetch.
+ *
+ * On a 401 (e.g. the server-side session was invalidated mid-REPL),
+ * invalidates the cached token, logs in again, and retries once — same as
+ * `lib/http.ts`. A second 401 throws the actionable auth error.
  */
 async function* streamChat(
   apiUrl: string,
   body: unknown,
   signal: AbortSignal,
 ): AsyncGenerator<SseFrame> {
-  const response = await fetch(`${apiUrl}/chat`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "text/event-stream",
-    },
-    body: JSON.stringify(body),
-    signal,
-  });
+  let response = await postChat(apiUrl, body, signal);
+
+  if (response.status === 401) {
+    invalidateAuthCache();
+    response = await postChat(apiUrl, body, signal);
+    if (response.status === 401) {
+      throw describeAuthFailure();
+    }
+  }
 
   if (!response.ok || !response.body) {
     const detail = await response.text().catch(() => "");

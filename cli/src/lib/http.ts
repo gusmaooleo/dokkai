@@ -5,6 +5,8 @@
 // Bounded so a hung API can't hang the CLI. Long-lived requests (the SSE job
 // follow in lib/sse.ts) don't go through this module — they get their own
 // no-data watchdog instead.
+import { authHeaders, describeAuthFailure, invalidateAuthCache } from "./auth.js";
+
 const REQUEST_TIMEOUT_MS = 10_000;
 
 function connectionHint(apiUrl: string, cause: unknown): Error {
@@ -34,17 +36,35 @@ async function extractErrorDetail(response: Response): Promise<string> {
   return response.statusText || `HTTP ${response.status}`;
 }
 
-async function request(url: string, init?: RequestInit): Promise<Response> {
+async function fetchOnce(url: string, init: RequestInit): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
-  let response: Response;
   try {
-    response = await fetch(url, { ...init, signal: controller.signal });
+    return await fetch(url, { ...init, signal: controller.signal });
   } catch (cause) {
     throw connectionHint(url, cause);
   } finally {
     clearTimeout(timer);
+  }
+}
+
+async function request(url: string, init: RequestInit = {}): Promise<Response> {
+  const apiUrl = new URL(url).origin;
+
+  let response = await fetchOnce(url, {
+    ...init,
+    headers: { ...init.headers, ...(await authHeaders(apiUrl)) },
+  });
+
+  if (response.status === 401) {
+    invalidateAuthCache();
+    response = await fetchOnce(url, {
+      ...init,
+      headers: { ...init.headers, ...(await authHeaders(apiUrl)) },
+    });
+    if (response.status === 401) {
+      throw describeAuthFailure();
+    }
   }
 
   if (!response.ok) {
