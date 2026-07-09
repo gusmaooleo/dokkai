@@ -227,6 +227,23 @@ def project_has_chunks(client: weaviate.WeaviateClient, project_name: str) -> bo
     )
     return len(response.objects) > 0
 
+def count_chunks_by_project(client: weaviate.WeaviateClient) -> list[dict]:
+    """
+    Chunk count per ingested project, via a group-by aggregate over
+    ``project_name`` (no vector search, no per-object fetch).
+
+    Returns ``[{"project": <name>, "chunks": <count>}, ...]`` sorted by
+    project name.
+    """
+    collection = client.collections.get(COLLECTION_NAME)
+    result = collection.aggregate.over_all(group_by="project_name")
+    counts = [
+        {"project": group.grouped_by.value, "chunks": group.total_count}
+        for group in result.groups
+    ]
+    counts.sort(key=lambda c: c["project"])
+    return counts
+
 def upsert_chunks(
     client: weaviate.WeaviateClient,
     chunks: list[CodeChunk],
