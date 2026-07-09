@@ -12,6 +12,7 @@ stderr via the module logger below.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 
 from dotenv import load_dotenv
@@ -31,12 +32,29 @@ from services.graph_store import resolve_file
 from services.retriever import Retriever
 from services.weaviate_client import count_chunks_by_project, get_client
 
+# DOKKAI_MCP_PROFILE unset (default) keeps the original instructions; "small-model"
+# swaps in a more directive, anti-loop variant for small local models (observed
+# to loop/re-call tools without it — see scripts/mcp_harness.py's SYSTEM_PROMPT
+# for the same phrasing pattern proven there).
+_INSTRUCTIONS_DEFAULT = (
+    "Explore an ingested codebase: start with search(query) to find seed entities, "
+    "then use neighbors()/get_entity() to explore call graph and read code, and "
+    "get_file() for raw file ranges. Use context() for a one-shot answer bundle."
+)
+_INSTRUCTIONS_SMALL_MODEL = (
+    "Explore an ingested codebase. Call ONE tool, then check if its result already "
+    "answers the question. Start with search(query) or context(query) for seed "
+    "entities, grep_project(pattern) for a known identifier, neighbors()/get_entity() "
+    "for call graph and code, get_file() for raw ranges. Never call the same tool "
+    "with the same arguments twice. As soon as you have enough information, STOP "
+    "calling tools and answer as plain text."
+)
+_MCP_PROFILE = os.getenv("DOKKAI_MCP_PROFILE")
+
 mcp = FastMCP(
     "dokkai",
     instructions=(
-        "Explore an ingested codebase: start with search(query) to find seed entities, "
-        "then use neighbors()/get_entity() to explore call graph and read code, and "
-        "get_file() for raw file ranges. Use context() for a one-shot answer bundle."
+        _INSTRUCTIONS_SMALL_MODEL if _MCP_PROFILE == "small-model" else _INSTRUCTIONS_DEFAULT
     ),
 )
 
