@@ -43,7 +43,7 @@ class Job:
     repo_path: str
     recreate: bool = False
     describe: bool = True
-    kind: str = "pipeline"   # pipeline | refresh
+    kind: str = "pipeline"   # pipeline | refresh | graph
     project: str = ""        # refresh jobs only
     force: bool = False      # refresh jobs only
     status: str = "queued"   # queued | running | succeeded | failed
@@ -83,6 +83,12 @@ class JobStore:
         self._jobs[job.id] = job
         return job
 
+    def create_graph_only(self, repo_path: str) -> Job:
+        project = os.path.basename(os.path.normpath(repo_path))
+        job = Job(id=str(uuid.uuid4()), repo_path=repo_path, kind="graph", project=project)
+        self._jobs[job.id] = job
+        return job
+
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
 
@@ -90,7 +96,7 @@ class JobStore:
         return sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
 
     def active_job_for_project(self, project: str) -> Job | None:
-        """The queued/running job (pipeline or refresh) for *project*, if any."""
+        """The queued/running job (any kind) for *project*, if any."""
         for job in self._jobs.values():
             if job.project == project and job.status in ("queued", "running"):
                 return job
@@ -213,6 +219,60 @@ def submit_describe_refresh(project: str, force: bool = False) -> Job:
         raise ProjectJobConflict(project)
     job = store.create_describe_refresh(project, force=force)
     task = asyncio.create_task(asyncio.to_thread(_run_describe_refresh_sync, job))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return job
+
+
+def _run_graph_only_sync(job: Job) -> None:
+    """
+    Execute a graph-only job in a worker thread, mirroring
+    ``_run_pipeline_sync``'s thread/asyncio.run/status pattern. Runs ONLY
+    ``ingestByLocalRepository`` — no describe, no vectorize, no Weaviate
+    (decisions 1b-arch/1b-graph).
+    """
+    job.status = "running"
+    job.updated_at = _now()
+
+    def report(stage: str, done: int, total: int) -> None:
+        job.stage, job.done, job.total = stage, done, total
+        job.stage_progress = {"stage": stage, "done": done, "total": total}
+        job.updated_at = _now()
+
+    async def _graph() -> dict:
+        report("cgr", 0, 0)
+        return await ingestByLocalRepository(job.repo_path)
+
+    try:
+        ingest_result = asyncio.run(_graph())
+        job.result = {"ingest": {"output_json": ingest_result["output_json"]}}
+        job.status = "succeeded"
+        job.stage = "done"
+    except Exception as e:  # surface a readable error to the poller
+        job.status = "failed"
+        job.error = f"{type(e).__name__}: {e}"
+    finally:
+        job.updated_at = _now()
+
+
+def submit_graph_only(repo_path: str) -> Job:
+    """
+    Create a graph-only job and spawn it on a worker thread. Returns
+    immediately with the queued job.
+
+    Raises ``ProjectJobConflict`` if a job is already queued/running for the
+    same project (pipeline, refresh, or graph) — see ``submit_pipeline`` for
+    why the check-then-create is race-free on the event loop. The lock is
+    shared with the other job kinds so a graph run and a pipeline/refresh run
+    on the same project can't clobber each other's graph JSON concurrently.
+    """
+    store = get_job_store()
+    project = os.path.basename(os.path.normpath(repo_path))
+    active = store.active_job_for_project(project)
+    if active is not None:
+        raise ProjectJobConflict(project)
+    job = store.create_graph_only(repo_path)
+    task = asyncio.create_task(asyncio.to_thread(_run_graph_only_sync, job))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     return job

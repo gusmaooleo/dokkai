@@ -15,3 +15,7 @@ class IngestRequest(BaseModel):
 class DescribeRefreshRequest(BaseModel):
     # Bypass the description cache — every eligible entity is regenerated.
     force: bool = False
+
+
+class GraphOnlyRequest(BaseModel):
+    repo_path: str
