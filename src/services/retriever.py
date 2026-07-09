@@ -167,6 +167,39 @@ class Retriever:
             chunks.sort(key=lambda c: -(c.score or 0.0))
         return chunks[:top_k]
 
+    def search_seeds(
+        self,
+        query: str,
+        *,
+        project_name: str | None = None,
+        top_k: int = 8,
+        alpha: float = 0.7,
+    ) -> list[RetrievedChunk]:
+        """
+        Hybrid-search for seed chunks on BOTH named vectors, merged: the
+        summary vector catches conceptual matches, the code vector catches
+        literal ones (and undescribed entities that have no summary vector).
+
+        Returns
+        -------
+        list[RetrievedChunk]
+        """
+        summary_seeds = self.search(
+            query, project_name=project_name, top_k=top_k, alpha=alpha,
+            target_vector=VECTOR_SUMMARY,
+        )
+        code_seeds = self.search(
+            query, project_name=project_name, top_k=top_k, alpha=alpha,
+            target_vector=VECTOR_CODE,
+        )
+        return self._merge_seeds(summary_seeds, code_seeds, top_k)
+
+    def get_by_qualified_name(
+        self, qualified_name: str, project_name: str
+    ) -> RetrievedChunk | None:
+        """Fetch a single chunk by its exact qualified_name, or None if absent."""
+        return self._fetch_by_qnames([qualified_name], project_name).get(qualified_name)
+
     def search_graph(
         self,
         query: str,
@@ -198,18 +231,10 @@ class Retriever:
         if direction in ("backward", "both"):
             edges |= _BACKWARD_EDGES
 
-        # 1) seeds via hybrid search on BOTH named vectors, merged: the summary
-        #    vector catches conceptual matches, the code vector catches literal
-        #    ones (and undescribed entities that have no summary vector).
-        summary_seeds = self.search(
+        # 1) seeds via hybrid search, merged across the summary and code vectors.
+        seeds = self.search_seeds(
             query, project_name=project_name, top_k=top_k_seeds, alpha=alpha,
-            target_vector=VECTOR_SUMMARY,
         )
-        code_seeds = self.search(
-            query, project_name=project_name, top_k=top_k_seeds, alpha=alpha,
-            target_vector=VECTOR_CODE,
-        )
-        seeds = self._merge_seeds(summary_seeds, code_seeds, top_k_seeds)
         selected: dict[str, RetrievedChunk] = {}
         for seed in seeds:
             seed.hop, seed.via = 0, "seed (matched query)"
