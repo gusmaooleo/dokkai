@@ -387,6 +387,56 @@ def resolve_entity(graph: Graph, qualified_name: str) -> dict[str, Any] | None:
     return graph.by_qualified_name.get(qualified_name)
 
 
+# resolve_file's node universe: File/Module nodes only — narrower than
+# _FILE_KINDS (which also folds in code-entity nodes for the file-level
+# dependency view). A caller-supplied path must resolve to an actual
+# file/module node, not merely an entity defined inside one.
+_RESOLVABLE_FILE_KINDS = {"Module", "File"}
+
+
+def _normalize_path_for_match(path: str) -> str:
+    """Light normalization for exact-match comparison: strip trailing slashes."""
+    return path.rstrip("/")
+
+
+def resolve_file(project_name: str, path: str) -> dict[str, Any] | None:
+    """
+    Resolve a caller-supplied *path* (relative, e.g. ``src/a/b.ts``, or
+    absolute) against *project_name*'s File/Module graph nodes ONLY.
+
+    This is the traversal guard behind the MCP ``get_file`` tool: the server
+    must NEVER read an arbitrary caller path from disk — it may only read a
+    file whose path resolves through this function to a node in the
+    project's own graph.
+
+    A node matches when its ``properties.path`` or ``properties.absolute_path``
+    equals *path* exactly, after stripping trailing slashes from both sides —
+    no fuzzy matching. Nodes flagged ``properties.is_external`` never match.
+    Returns the normalized node (:func:`normalize_node`), or ``None`` if
+    nothing matches.
+
+    Raises :class:`GraphNotFoundError` when no graph has been ingested for
+    the project yet (propagated from :func:`get_graph`).
+    """
+    graph = get_graph(project_name)
+    target = _normalize_path_for_match(path)
+
+    for node in graph.nodes:
+        if node["labels"][0] not in _RESOLVABLE_FILE_KINDS:
+            continue
+        props = node.get("properties", {})
+        if props.get("is_external"):
+            continue
+        node_path = props.get("path")
+        node_absolute_path = props.get("absolute_path")
+        if (node_path and _normalize_path_for_match(node_path) == target) or (
+            node_absolute_path and _normalize_path_for_match(node_absolute_path) == target
+        ):
+            return normalize_node(node)
+
+    return None
+
+
 def get_neighborhood(
     project_name: str,
     *,
