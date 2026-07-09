@@ -121,8 +121,8 @@ export async function runSrcs(flags: SrcsFlags): Promise<void> {
 
   console.error(
     chalk.red(
-      `unsupported --model '${model}' — srcs supports: claude, codex ` +
-        `(ollama:<name> is coming); ${README_POINTER}.`,
+      `unsupported --model '${model}' — srcs supports: claude, codex, ` +
+        `ollama:<name>; ${README_POINTER}.`,
     ),
   );
   process.exit(1);
