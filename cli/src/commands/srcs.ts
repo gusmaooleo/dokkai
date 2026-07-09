@@ -1,9 +1,12 @@
 import { spawn } from "node:child_process";
 import chalk from "chalk";
 import { resolveDokkaiHome } from "../lib/config.js";
+import { runOllamaChat } from "../lib/chat.js";
 
 export interface SrcsFlags {
   model?: string;
+  api?: string;
+  project?: string;
 }
 
 const SUPPORTED_TOOLS = ["claude", "codex"] as const;
@@ -105,13 +108,15 @@ export async function runSrcs(flags: SrcsFlags): Promise<void> {
   }
 
   if (model.startsWith("ollama:")) {
-    console.error(
-      chalk.yellow(
-        "ollama support lands in the next step (dokkai srcs --model " +
-          "ollama:<name>) — supported today: claude, codex.",
-      ),
-    );
-    process.exit(1);
+    const ollamaModel = model.slice("ollama:".length);
+    if (!ollamaModel) {
+      console.error(
+        chalk.red("--model ollama:<name> requires a model name after 'ollama:'"),
+      );
+      process.exit(1);
+    }
+    await runOllamaChat(ollamaModel, flags);
+    return;
   }
 
   console.error(

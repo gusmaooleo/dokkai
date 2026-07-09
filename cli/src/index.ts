@@ -75,7 +75,15 @@ program
     "--model <target>",
     "claude | codex | ollama:<name>",
   )
-  .action((options: { model: string }) => runSrcs(options));
+  .option(
+    "--project <name>",
+    "project to chat about with ollama:<name> (default: auto-detect if " +
+      "exactly one project is ingested)",
+  )
+  .action(
+    (options: { model: string; project?: string }) =>
+      runSrcs({ ...program.opts(), ...options }),
+  );
 
 program.parseAsync(process.argv).catch((error: unknown) => {
   console.error(
