@@ -3,6 +3,7 @@ import chalk from "chalk";
 import ora from "ora";
 import { envVar, resolveApiUrl, resolveDokkaiHome } from "../lib/config.js";
 import { getJson } from "../lib/http.js";
+import { modelInstalled, probeOllama } from "../lib/ollama.js";
 
 const WEAVIATE_READY_TIMEOUT_MS = 60_000;
 const WEAVIATE_POLL_INTERVAL_MS = 1_000;
@@ -54,28 +55,13 @@ async function waitForWeaviateReady(url: string): Promise<boolean> {
   return false;
 }
 
-/** Base-name match, mirroring `src/services/llm_config.py`'s check. */
-function modelInstalled(installed: string[], model: string): boolean {
-  return installed.some(
-    (m) =>
-      m === model ||
-      m.startsWith(`${model}:`) ||
-      model.startsWith(m.split(":")[0]),
-  );
-}
-
 async function checkOllama(
   baseUrl: string,
   embedModel: string,
   descModel: string,
 ): Promise<void> {
-  let tagsResponse: Response;
-  try {
-    tagsResponse = await fetchWithTimeout(
-      `${baseUrl}/api/tags`,
-      OLLAMA_PROBE_TIMEOUT_MS,
-    );
-  } catch {
+  const probe = await probeOllama(baseUrl, OLLAMA_PROBE_TIMEOUT_MS);
+  if (!probe.reachable) {
     console.log(
       chalk.yellow(
         `warning: Ollama is not reachable at ${baseUrl} — chat/describe need ` +
@@ -84,26 +70,12 @@ async function checkOllama(
     );
     return;
   }
-  if (!tagsResponse.ok) {
-    console.log(
-      chalk.yellow(
-        `warning: Ollama is not reachable at ${baseUrl} — chat/describe need ` +
-          "it; graph-only works without it",
-      ),
-    );
-    return;
-  }
-
-  const data = (await tagsResponse.json()) as {
-    models?: Array<{ name: string }>;
-  };
-  const installed = (data.models ?? []).map((m) => m.name);
 
   for (const [label, model] of [
     ["EMBED_MODEL", embedModel],
     ["DESC_MODEL", descModel],
   ] as const) {
-    if (!modelInstalled(installed, model)) {
+    if (!modelInstalled(probe.installed, model)) {
       console.log(
         chalk.yellow(
           `warning: ${label} '${model}' is not installed in Ollama — run ` +

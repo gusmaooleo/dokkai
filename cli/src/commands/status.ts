@@ -2,6 +2,7 @@ import chalk from "chalk";
 import ora from "ora";
 import { envVar, resolveApiUrl, resolveDokkaiHome } from "../lib/config.js";
 import { getJson } from "../lib/http.js";
+import { modelInstalled, probeOllama } from "../lib/ollama.js";
 
 interface ProjectGraphDTO {
   project: string;
@@ -30,16 +31,6 @@ async function fetchWithTimeout(
   } finally {
     clearTimeout(timer);
   }
-}
-
-/** Base-name match, mirroring `src/services/llm_config.py`'s check. */
-function modelInstalled(installed: string[], model: string): boolean {
-  return installed.some(
-    (m) =>
-      m === model ||
-      m.startsWith(`${model}:`) ||
-      model.startsWith(m.split(":")[0]),
-  );
 }
 
 export async function runStatus(flags: { api?: string }): Promise<void> {
@@ -85,30 +76,14 @@ export async function runStatus(flags: { api?: string }): Promise<void> {
   const embedModel = envVar("EMBED_MODEL", "nomic-embed-text");
   const descModel = envVar("DESC_MODEL", "qwen2.5-coder:3b");
   const ollamaSpinner = ora(`Checking Ollama at ${ollamaBaseUrl}...`).start();
-  let ollamaUp = false;
-  let installed: string[] = [];
-  try {
-    const response = await fetchWithTimeout(
-      `${ollamaBaseUrl}/api/tags`,
-      5_000,
-    );
-    if (response.ok) {
-      ollamaUp = true;
-      const data = (await response.json()) as {
-        models?: Array<{ name: string }>;
-      };
-      installed = (data.models ?? []).map((m) => m.name);
-    }
-  } catch {
-    ollamaUp = false;
-  }
-  if (ollamaUp) {
+  const ollamaProbe = await probeOllama(ollamaBaseUrl, 5_000);
+  if (ollamaProbe.reachable) {
     ollamaSpinner.succeed(chalk.green(`Ollama: up (${ollamaBaseUrl})`));
     for (const [label, model] of [
       ["EMBED_MODEL", embedModel],
       ["DESC_MODEL", descModel],
     ] as const) {
-      if (modelInstalled(installed, model)) {
+      if (modelInstalled(ollamaProbe.installed, model)) {
         console.log(chalk.green(`  ${label} '${model}': present`));
       } else {
         console.log(

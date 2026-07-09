@@ -9,6 +9,7 @@ import { runIngest } from "./commands/ingest.js";
 import { runGraph } from "./commands/graph.js";
 import { runSrcs } from "./commands/srcs.js";
 import { runWatch } from "./commands/watch.js";
+import { runDoctor } from "./commands/doctor.js";
 
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json") as { version: string };
@@ -111,3 +112,17 @@ program
       runWatch(repoPath, { ...program.opts(), ...options }),
   );
 
+program
+  .command("doctor")
+  .description(
+    "diagnose the local environment: node/docker/uv/DOKKAI_HOME, Weaviate, " +
+      "Ollama, and the dokkai API",
+  )
+  .action(() => runDoctor(program.opts()));
+
+program.parseAsync(process.argv).catch((error: unknown) => {
+  console.error(
+    chalk.red(error instanceof Error ? error.message : String(error)),
+  );
+  process.exit(1);
+});
