@@ -14,6 +14,7 @@ Everything runs **100% locally** — Weaviate for vectors, Ollama for both embed
 
 - [Why](#why)
 - [MCP server](#mcp-server)
+- [CLI](#cli)
 - [How it works](#how-it-works)
 - [Descriptions (Tier 2)](#descriptions-tier-2)
 - [Features](#features)
@@ -131,6 +132,66 @@ Remove: `codex mcp remove dokkai`
 
 ---
 
+## CLI
+
+The dokkai CLI (`dokkai`, package [`cli/`](cli/)) is a Node/TypeScript command-line front end for the API and the MCP server above: ingest a repo with live progress, export the graph, or launch a coding agent with dokkai retrieval wired in.
+
+**Install:**
+
+```bash
+cd cli
+npm install
+npm run build
+npm link       # `dokkai` is now on PATH
+```
+
+> Will be available as `npm install -g dokkai` once published to npm — for now, `npm link` from `cli/`.
+
+### Commands
+
+| Command | Description |
+| --- | --- |
+| `dokkai up` | `docker compose up -d` for Weaviate, wait for it to become ready, probe Ollama and the configured embed/descriptor models (warnings only, non-fatal), report whether the API is reachable. Exits 1 only on a `docker compose`/Weaviate failure (or when the dokkai repo root cannot be resolved). |
+| `dokkai status` | Read-only health check (API, Weaviate, Ollama + model presence) plus a list of ingested projects. Always exits 0. |
+| `dokkai ingest <repo-path> [--recreate] [--no-describe] [--yes]` | Validates the path, confirms `--recreate` interactively (or via `--yes`), calls `POST /instances/pipeline`, and streams live stage progress (SSE with a polling fallback) to a result summary. |
+| `dokkai graph <repo-path\|project> [--out <file>]` | Graph-only run: a **directory** argument enqueues `POST /instances/graph` (cgr only, no LLM/Weaviate) and prints the canonical graph JSON path (with `--out`, also exports the normalized graph); a **project name** argument fetches and prints/writes its normalized structural graph (`GET /graph/{project}?include=structural`) — stdout output pipes cleanly when `--out` is omitted. |
+| `dokkai srcs --model <claude\|codex\|ollama:<name>> [--project <name>]` | `claude`/`codex`: idempotently (re-)registers the dokkai MCP server, then launches the tool interactively. `ollama:<name>`: sets the API's global chat model (`POST /config/llm`) and starts a terminal REPL over `/chat`'s SSE stream, with conversation continuity across turns. |
+
+Global flag: `--api <url>` — dokkai API URL (default `http://localhost:8000`).
+
+`ingest`-only flags:
+
+- `--recreate` — drop and rebuild the **entire** Weaviate collection (all projects) before inserting; prompts `This wipes ALL ingested projects from Weaviate. Continue? [y/N]` unless `--yes` is also passed. In a non-interactive shell without `--yes`, the command exits 1 instead of proceeding.
+- `--no-describe` — sets `describe: false` on the pipeline request: skips the descriptor pre-flight (no fail-loud `400` if `DESC_MODEL` is missing/unpulled) and ingests without per-entity LLM descriptions — the `summary` named vector stays empty for this project, so conceptual/summary search over it is weaker (literal/code-vector search still works). CLI prints `descriptions: disabled (descriptions disabled for this ingestion)` in the result summary.
+- `--yes` — skip the `--recreate` confirmation prompt.
+
+`graph`-only flag: `--out <file>` — write the graph JSON to a file instead of stdout.
+
+`srcs`-only flag: `--project <name>` — with `ollama:<name>`, the project to chat about; auto-detected when exactly one project is ingested (errors listing the options if zero or multiple are ingested and `--project` is omitted).
+
+### Environment (CLI-side)
+
+`DOKKAI_API_URL` and `DOKKAI_HOME` (see [Configuration](#configuration) below) are resolved by the CLI itself, not the API — set them in your shell, or rely on the dokkai repo's `.env` as a fallback. Precedence: `--api` flag > `DOKKAI_API_URL` env var > repo `.env` > default.
+
+### SRCS recipes
+
+```bash
+# Claude Code, with the dokkai MCP server (re-)registered
+dokkai srcs --model claude
+
+# Codex, same registration
+dokkai srcs --model codex
+
+# Local Ollama model, terminal chat loop over dokkai retrieval
+dokkai srcs --model ollama:qwen2.5-coder:latest --project your-repo
+```
+
+### Graph-only runs
+
+`dokkai graph` (and `POST /instances/graph`) run **only** `cgr` — no chunking, no descriptions, no embedding, no Weaviate. Stages go straight `cgr → done`, and the job's result carries just `ingest.output_json`. Useful to inspect or export a repo's dependency graph without paying for (or requiring) Ollama/Weaviate at all.
+
+---
+
 ## How it works
 
 ```
@@ -188,7 +249,7 @@ Every describable entity (not a test, has source, not a one‑liner) gets a one�
 - **Fail‑loud policy** — `POST /instances/pipeline` always ingests with descriptions on. The descriptor is checked *before* the job is created: if it's missing or unavailable, the request fails immediately with **HTTP 400** and **no job is created** (nothing is ingested):
   - No model configured: `no descriptor model specified — set DESC_MODEL (e.g. qwen2.5-coder:3b) or configure a remote provider via DESC_PROVIDER`
   - Model not pulled: `descriptor model '<m>' is not available in Ollama at <base_url> — pull it with 'ollama pull <m>'`
-  - Ingesting without descriptions exists internally (`process_and_store(..., describe=False)`) but isn't exposed through the public API yet — that UX lands with the CLI (roadmap feature 04).
+  - Set `describe: false` in the `POST /instances/pipeline` body (or `dokkai ingest --no-describe`) to opt out explicitly — this skips the descriptor pre-flight and ingests without descriptions.
 
 ### Ingestion cost (measured)
 
@@ -216,6 +277,8 @@ Full pipeline run on `saffira_back-end` (medium TS/Python backend), local Ollama
 - ✅ Pluggable providers — LLM: Ollama / OpenAI / Anthropic · embeddings: Ollama / OpenAI / Cohere
 - ✅ Auto‑configure + warm the chat model on startup (no cold starts)
 - ✅ **MCP server** — 7 tools (search, literal grep, graph navigation, entity/file lookup) for Claude Code, Codex and any stdio MCP client, with a small-model instructions profile and a session usage watchdog (see [MCP server](#mcp-server))
+- ✅ **npm CLI** (`dokkai`) — `up`/`status`/`ingest`/`graph`/`srcs` commands with live job progress and one-command SRCS sessions (Claude Code, Codex, or a local Ollama REPL) (see [CLI](#cli))
+- ✅ **Graph-only ingestion** (`POST /instances/graph`, `dokkai graph`) — run just `cgr` with no LLM/Weaviate involved
 
 ---
 
@@ -229,6 +292,7 @@ Full pipeline run on `saffira_back-end` (medium TS/Python backend), local Ollama
 | Embeddings | Ollama · `nomic-embed-text` |
 | Generation | Ollama · `qwen2.5-coder` (any Ollama chat model) |
 | MCP server | Official Python `mcp` SDK (`FastMCP`), stdio transport |
+| CLI | Node.js (≥22.12) / TypeScript, `commander` + `chalk` + `ora` |
 | Frontend (WIP) | Next.js 16 · React 19 · Tailwind v4 |
 
 ---
@@ -370,6 +434,8 @@ All configuration is via environment variables (loaded from `.env` at startup).
 | `DOKKAI_RECREATE_COLLECTION` | _(unset)_ | If truthy: recreate the Weaviate collection instead of failing on schema mismatch |
 | `DOKKAI_MCP_PROFILE` | _(unset)_ | MCP server only. `small-model` swaps the server's instructions for a more directive, anti-loop variant tuned for small local models — see [Instructions profile](#instructions-profile) |
 | `MEMGRAPH_IMAGE` | `memgraph/memgraph:latest` | Image used by `cgr` for graph extraction |
+| `DOKKAI_API_URL` | `http://localhost:8000` | **CLI-side only** (not read by the API). dokkai API URL for the `dokkai` CLI; overridden by `--api`, falls back to this repo's `.env` — see [CLI](#cli) |
+| `DOKKAI_HOME` | _(auto-detected)_ | **CLI-side only.** Path to this repo, used by `dokkai up`/`dokkai status` to run `docker compose` and read `.env`. Auto-detected by walking up from the cwd for `docker-compose.yml` + `src/mcp_server.py` — see [CLI](#cli) |
 
 > **Two Ollama endpoints, on purpose:** `OLLAMA_EMBED_ENDPOINT` is called by the Weaviate **container** (so it needs `host.docker.internal`), while `OLLAMA_BASE_URL` is called by the **API process** on the host (so it's `localhost`).
 
@@ -381,7 +447,8 @@ All configuration is via environment variables (loaded from `.env` at startup).
 
 | Method | Endpoint | Description |
 | --- | --- | --- |
-| `POST` | `/instances/pipeline` | Run the full ingestion pipeline for a `repo_path` (409 if a job is already running for that project) |
+| `POST` | `/instances/pipeline` | Run the full ingestion pipeline for a `repo_path`, `describe: true` by default (409 if a job is already running for that project; `describe: false` skips the descriptor pre-flight and ingests without descriptions) |
+| `POST` | `/instances/graph` | Graph-only run for a `repo_path` — `cgr` only, no LLM, no vectorization, no Weaviate (stages `cgr → done`, `kind: "graph"`; 409 if a job is already running for that project) |
 | `POST` | `/instances/{project}/describe` | Refresh descriptions for an already-ingested project (background job; optional `{"force": true}`; 409 if a job is already running for that project) — see [Refreshing descriptions](#refreshing-descriptions) |
 | `GET` | `/instances/jobs` | List ingestion/refresh jobs |
 | `GET` | `/instances/jobs/{id}` | Get a job's status, `stage`/`stage_progress` and result |
@@ -400,9 +467,9 @@ All configuration is via environment variables (loaded from `.env` at startup).
 | `GET` | `/config/llm/health` | Check connectivity — probes the configured model |
 | `GET` | `/` | Health check |
 
-Jobs report `stage` through the unified vocabulary `cgr → chunk → describe → upsert → done` (refresh jobs use `chunk → describe → update → done`), plus a `stage_progress` object `{"stage", "done", "total"}` mirroring the current stage's `done`/`total` counters, and a `kind` (`"pipeline"` | `"refresh"`).
+Jobs report `stage` through the unified vocabulary `cgr → chunk → describe → upsert → done` (refresh jobs use `chunk → describe → update → done`; graph-only jobs use just `cgr → done`), plus a `stage_progress` object `{"stage", "done", "total"}` mirroring the current stage's `done`/`total` counters, and a `kind` (`"pipeline"` | `"refresh"` | `"graph"`).
 
-**Per‑project job lock** — only one pipeline/refresh job may run at a time for a given project; submitting a second one (either endpoint) returns HTTP 409 `another job is running for project '<project>'` and creates no job.
+**Per‑project job lock** — only one job (pipeline, refresh, or graph-only) may run at a time for a given project; submitting a second one (any of `/instances/pipeline`, `/instances/{project}/describe`, `/instances/graph`) returns HTTP 409 `another job is running for project '<project>'` and creates no job.
 
 **Job progress over SSE** — instead of polling `GET /instances/jobs/{id}`, `GET /instances/jobs/{id}/events` streams the same job payload over Server‑Sent Events (same framing as `/chat`): it emits `event: job` on every `updated_at` change and a terminal `event: done` with the final payload, then closes the stream. An unknown job id is a plain 404, not a stream.
 
@@ -439,6 +506,7 @@ dokkai/
 │   │   └── chat_store.py        # conversation history (in-memory)
 │   └── models/dtos/             # pydantic request/response models
 ├── shell/run_cgr.sh             # code-graph-rag runner (ephemeral Memgraph)
+├── cli/                         # npm CLI package (`dokkai`) — see CLI section
 ├── frontend/                    # Next.js app (WIP)
 ├── docker-compose.yml           # Weaviate (text2vec-ollama)
 ├── dev.sh                       # dev server launcher
@@ -471,7 +539,7 @@ These are known and tracked in the [Roadmap](#roadmap):
 | 01 | Describe v2 (lighter descriptions, template descriptions, provider selection, fail‑loud policy) + absolute file paths | ✅ done |
 | 02 | Graph query API | ✅ done |
 | 03 | MCP server (core) | ✅ done (pending merge) |
-| 04 | npm CLI (`dokkai`) + SRCS mode | planned |
+| 04 | npm CLI (`dokkai`) + SRCS mode | ✅ done (pending merge) |
 | 05 | Postgres conversation history | planned |
 | 06 | Basic auth (root user via env) | planned |
 | 07 | Frontend UI (chat + graph + config) | planned |

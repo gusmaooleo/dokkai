@@ -4,9 +4,15 @@ import json
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
-from models.dtos.receive import DescribeRefreshRequest, IngestRequest
+from models.dtos.receive import DescribeRefreshRequest, GraphOnlyRequest, IngestRequest
 from services.describe import DescriptorError, ensure_descriptor_available
-from services.jobs import ProjectJobConflict, get_job_store, submit_describe_refresh, submit_pipeline
+from services.jobs import (
+    ProjectJobConflict,
+    get_job_store,
+    submit_describe_refresh,
+    submit_graph_only,
+    submit_pipeline,
+)
 from services.vectorize import find_latest_graph_json, no_graph_json_message
 from services.weaviate_client import get_client, project_has_chunks
 
@@ -20,17 +26,37 @@ async def runPipeline(data: IngestRequest):
     background job and return its id immediately. Poll ``/instances/jobs/{id}``
     for progress and the final result.
 
-    Descriptions are always on via this endpoint (the no-describe mode is an
-    internal-only opt-in until feature 04's CLI/API UX), so the descriptor
-    model is checked *before* creating the job: a missing/unavailable
-    descriptor fails the request immediately with no job created.
+    Descriptions are on by default; the descriptor model is checked *before*
+    creating the job, so a missing/unavailable descriptor fails the request
+    immediately with no job created. Set ``describe: false`` to opt out and
+    skip that pre-flight — the pipeline then runs without descriptions.
+    """
+    if data.describe:
+        try:
+            await ensure_descriptor_available()
+        except DescriptorError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    try:
+        job = submit_pipeline(data.repo_path, recreate=data.recreate, describe=data.describe)
+    except ProjectJobConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"job_id": job.id, "status": job.status}
+
+
+@router.post("/graph")
+async def runGraphOnly(data: GraphOnlyRequest):
+    """
+    Enqueue a graph-ONLY run (decision 1b-graph) as a background job and
+    return its id immediately. Poll ``/instances/jobs/{id}`` for progress
+    and the final result.
+
+    Runs code-graph-rag and nothing else — no LLM, no vectorization, no
+    Weaviate — so there is no descriptor pre-flight. The canonical JSON
+    promotion (timestamped output → ``ingested/<project>.json``) already
+    happens inside ``ingestByLocalRepository``.
     """
     try:
-        await ensure_descriptor_available()
-    except DescriptorError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    try:
-        job = submit_pipeline(data.repo_path, recreate=data.recreate)
+        job = submit_graph_only(data.repo_path)
     except ProjectJobConflict as e:
         raise HTTPException(status_code=409, detail=str(e))
     return {"job_id": job.id, "status": job.status}

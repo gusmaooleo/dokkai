@@ -1,0 +1,44 @@
+{
+  "name": "dokkai",
+  "version": "0.1.0",
+  "description": "CLI for dokkai: feed the retrieval database and launch SRCS (Semantic Retrieval Codebase System) sessions.",
+  "keywords": [
+    "dokkai",
+    "cli",
+    "rag",
+    "code-retrieval",
+    "mcp"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "dokkai": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gusmaooleo/dokkai.git"
+  },
+  "bugs": {
+    "url": "https://github.com/gusmaooleo/dokkai/issues"
+  },
+  "homepage": "https://github.com/gusmaooleo/dokkai#readme",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "chalk": "^5.6.2",
+    "commander": "^15.0.0",
+    "ora": "^9.4.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "typescript": "^5"
+  }
+}
