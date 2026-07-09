@@ -47,15 +47,31 @@ export function resolveDokkaiHome(): string {
   );
 }
 
-function readRepoEnv(): Record<string, string> {
+let cachedRepoEnv: Record<string, string> | null = null;
+
+/**
+ * Read the repo's `.env` file (KEY=VALUE pairs), relative to
+ * `resolveDokkaiHome()`. Returns `{}` if the repo root can't be found or
+ * has no `.env`. Cached after the first read.
+ */
+export function readRepoEnv(): Record<string, string> {
+  if (cachedRepoEnv) return cachedRepoEnv;
   try {
     const home = resolveDokkaiHome();
     const envPath = join(home, ".env");
-    if (!existsSync(envPath)) return {};
-    return parseEnvFile(envPath);
+    cachedRepoEnv = existsSync(envPath) ? parseEnvFile(envPath) : {};
   } catch {
-    return {};
+    cachedRepoEnv = {};
   }
+  return cachedRepoEnv;
+}
+
+/**
+ * Resolve a config value, in precedence order: process env var > repo
+ * `.env` > `fallback`.
+ */
+export function envVar(name: string, fallback: string): string {
+  return process.env[name] ?? readRepoEnv()[name] ?? fallback;
 }
 
 /**
@@ -64,10 +80,5 @@ function readRepoEnv(): Record<string, string> {
  */
 export function resolveApiUrl(flags: { api?: string }): string {
   if (flags.api) return flags.api;
-  if (process.env.DOKKAI_API_URL) return process.env.DOKKAI_API_URL;
-
-  const repoEnv = readRepoEnv();
-  if (repoEnv.DOKKAI_API_URL) return repoEnv.DOKKAI_API_URL;
-
-  return DEFAULT_API_URL;
+  return envVar("DOKKAI_API_URL", DEFAULT_API_URL);
 }

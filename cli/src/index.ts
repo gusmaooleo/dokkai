@@ -3,6 +3,8 @@
 import { createRequire } from "node:module";
 import { Command } from "commander";
 import chalk from "chalk";
+import { runUp } from "./commands/up.js";
+import { runStatus } from "./commands/status.js";
 
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json") as { version: string };
@@ -29,12 +31,12 @@ program
     "check/start local dependencies via docker compose and verify Ollama " +
       "models are present",
   )
-  .action(() => notImplemented("up"));
+  .action(() => runUp(program.opts()));
 
 program
   .command("status")
   .description("show API/Weaviate/Ollama health and ingested projects")
-  .action(() => notImplemented("status"));
+  .action(() => runStatus(program.opts()));
 
 program
   .command("ingest <repo-path>")
