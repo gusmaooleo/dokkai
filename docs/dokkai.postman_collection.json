@@ -57,14 +57,14 @@
             "header": [{ "key": "Content-Type", "value": "application/json" }],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"repo_path\": \"{{repoPath}}\",\n  \"recreate\": false\n}"
+              "raw": "{\n  \"repo_path\": \"{{repoPath}}\",\n  \"recreate\": false,\n  \"describe\": true\n}"
             },
             "url": {
               "raw": "{{baseUrl}}/instances/pipeline",
               "host": ["{{baseUrl}}"],
               "path": ["instances", "pipeline"]
             },
-            "description": "Enqueue the ingestion pipeline. Returns { job_id, status } immediately and runs in the background.\n\nSet recreate:true only once, to migrate the schema (it drops the whole collection). The test script saves job_id into {{jobId}}.\n\nFail-loud descriptor policy: the configured DESC_MODEL/DESC_PROVIDER is checked before the job is created. Missing or unavailable descriptor -> 400, no job created (see the '400 - no descriptor model' saved example).\n\nPer-project job lock: a second pipeline/refresh job for a project that already has one queued/running -> 409, no job created (see the '409 - job already running' saved example)."
+            "description": "Enqueue the ingestion pipeline. Returns { job_id, status } immediately and runs in the background.\n\nSet recreate:true only once, to migrate the schema (it drops the whole collection). The test script saves job_id into {{jobId}}.\n\ndescribe defaults to true. Set describe:false to opt out of per-entity LLM descriptions for this run -- this also skips the descriptor pre-flight below, and the summary named vector stays empty for this run's chunks.\n\nFail-loud descriptor policy (describe:true only): the configured DESC_MODEL/DESC_PROVIDER is checked before the job is created. Missing or unavailable descriptor -> 400, no job created (see the '400 - no descriptor model' saved example).\n\nPer-project job lock: a second pipeline/refresh/graph-only job for a project that already has one queued/running -> 409, no job created (see the '409 - job already running' saved example)."
           },
           "response": [
             {
@@ -132,6 +132,83 @@
           "response": []
         },
         {
+          "name": "Start pipeline (no descriptions)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"repo_path\": \"{{repoPath}}\",\n  \"recreate\": false,\n  \"describe\": false\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/instances/pipeline",
+              "host": ["{{baseUrl}}"],
+              "path": ["instances", "pipeline"]
+            },
+            "description": "describe:false opts out of per-entity LLM descriptions for this run. Skips the descriptor pre-flight (no 400 even if DESC_MODEL is unset/unpulled) and ingests without descriptions -- the summary named vector stays empty for this project's chunks (equivalent to `dokkai ingest --no-describe`)."
+          },
+          "response": []
+        },
+        {
+          "name": "Start graph-only run",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const res = pm.response.json();",
+                  "if (res.job_id) {",
+                  "  pm.collectionVariables.set('jobId', res.job_id);",
+                  "  console.log('Saved jobId =', res.job_id);",
+                  "}",
+                  "pm.test('job queued', function () {",
+                  "  pm.expect(res).to.have.property('job_id');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"repo_path\": \"{{repoPath}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/instances/graph",
+              "host": ["{{baseUrl}}"],
+              "path": ["instances", "graph"]
+            },
+            "description": "Enqueue a graph-ONLY run (cgr only -- no chunking, no LLM descriptions, no embedding, no Weaviate). Returns { job_id, status } immediately; runs in the background with stages cgr -> done and kind: \"graph\". result.ingest.output_json is the same canonical graph JSON path (ingested/<project>.json) the full pipeline produces, readable by the Graph API as soon as the job succeeds. Shares the same per-project job lock as Start pipeline / Refresh descriptions. The test script saves job_id into {{jobId}}."
+          },
+          "response": [
+            {
+              "name": "409 - job already running",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"repo_path\": \"{{repoPath}}\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/instances/graph",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["instances", "graph"]
+                }
+              },
+              "status": "Conflict",
+              "code": 409,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"another job is running for project 'your-repo'\"\n}"
+            }
+          ]
+        },
+        {
           "name": "List jobs",
           "request": {
             "method": "GET",
@@ -155,7 +232,7 @@
               "host": ["{{baseUrl}}"],
               "path": ["instances", "jobs", "{{jobId}}"]
             },
-            "description": "Poll a job's progress. Watch stage (cgr -> chunk -> describe -> upsert -> done for pipeline jobs, chunk -> describe -> update -> done for refresh jobs), stage_progress {stage,done,total}, and result.vectorize.descriptions (pipeline) or result.descriptions (refresh)."
+            "description": "Poll a job's progress. Watch stage (cgr -> chunk -> describe -> upsert -> done for pipeline jobs, chunk -> describe -> update -> done for refresh jobs, cgr -> done for graph-only jobs), stage_progress {stage,done,total}, kind (pipeline|refresh|graph), and result.vectorize.descriptions (pipeline) or result.descriptions (refresh) -- graph-only jobs' result has only ingest.output_json."
           },
           "response": []
         },

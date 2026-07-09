@@ -75,12 +75,14 @@ paths:
         ingestion should use `recreate: false`, which upserts entities in place
         by deterministic UUID and only removes this project's stale entities.
 
-        **Fail-loud descriptor policy**: this endpoint always ingests with
-        descriptions on. The configured descriptor (`DESC_MODEL` /
+        **Fail-loud descriptor policy**: `describe` defaults to `true`, and
+        while it's true the configured descriptor (`DESC_MODEL` /
         `DESC_PROVIDER`) is checked *before* the job is created — if it's
         missing or unavailable, the request fails immediately with `400` and
-        **no job is created** (nothing is ingested). There is no request
-        parameter to skip descriptions.
+        **no job is created** (nothing is ingested). Set `describe: false` to
+        opt out explicitly: the pre-flight is skipped and the pipeline runs
+        without descriptions (the `summary` named vector stays empty for
+        this run's chunks).
       operationId: runPipeline
       requestBody:
         required: true
@@ -99,6 +101,12 @@ paths:
                 value:
                   repo_path: /absolute/path/to/your/repo
                   recreate: true
+              no_describe:
+                summary: Opt out of LLM descriptions (skips the descriptor pre-flight)
+                value:
+                  repo_path: /absolute/path/to/your/repo
+                  recreate: false
+                  describe: false
       responses:
         "200":
           description: Job accepted and queued.
@@ -130,6 +138,64 @@ paths:
                     detail: "descriptor model 'qwen2.5-coder:3b' is not available in Ollama at http://localhost:11434 — pull it with 'ollama pull qwen2.5-coder:3b'"
         "409":
           description: A pipeline or refresh job is already queued/running for this project (derived from `repo_path`'s folder name).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "another job is running for project 'your-repo'"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /instances/graph:
+    post:
+      tags: [Instances]
+      summary: Start a graph-only run
+      description: |
+        Enqueue a graph-**only** run (`cgr`, nothing else) as a **background
+        job** and return immediately with a `job_id`. Poll
+        `GET /instances/jobs/{job_id}` for progress and the final result.
+
+        Runs code-graph-rag and nothing else — no chunking, no LLM
+        descriptions, no embedding, no Weaviate — so there is no descriptor
+        pre-flight and this can be used without Ollama/Weaviate running at
+        all. Stages go straight `cgr → done`; `result.ingest.output_json` is
+        the same canonical graph JSON path (`ingested/<project>.json`) the
+        full pipeline produces, and the Graph API (`GET /graph/...`) can read
+        it immediately after the job succeeds.
+
+        Shares the same per-project job lock as `/instances/pipeline` and
+        `/instances/{project}/describe` — a graph-only run can't race a
+        pipeline/refresh run (or another graph-only run) for the same
+        project.
+      operationId: runGraphOnly
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GraphOnlyRequest"
+            examples:
+              default:
+                summary: Graph-only run
+                value:
+                  repo_path: /absolute/path/to/your/repo
+      responses:
+        "200":
+          description: Job accepted and queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    example: queued
+        "409":
+          description: A pipeline, refresh, or graph-only job is already queued/running for this project (derived from `repo_path`'s folder name).
           content:
             application/json:
               schema:
@@ -816,6 +882,24 @@ components:
           type: boolean
           default: false
           description: Drop & rebuild the whole collection (all projects) before inserting.
+        describe:
+          type: boolean
+          default: true
+          description: >-
+            On by default. Set to `false` to opt out of per-entity LLM
+            descriptions for this run — this also skips the descriptor
+            pre-flight (so the request never fails with `400` for a
+            missing/unavailable descriptor), and the `summary` named vector
+            stays empty for every chunk in this run.
+
+    GraphOnlyRequest:
+      type: object
+      required: [repo_path]
+      properties:
+        repo_path:
+          type: string
+          description: Absolute path to the repository to graph.
+          example: /Users/you/projects/your-repo
 
     DescribeRefreshRequest:
       type: object
@@ -879,11 +963,11 @@ components:
         kind:
           type: string
           description: Which background job this is.
-          enum: [pipeline, refresh]
+          enum: [pipeline, refresh, graph]
           default: pipeline
         project:
           type: string
-          description: Refresh jobs only — the project being re-described.
+          description: The project the job operates on (basename of repo_path for pipeline/graph runs; the given project for refresh jobs).
         force:
           type: boolean
           description: Refresh jobs only — whether the description cache was bypassed.
@@ -895,7 +979,8 @@ components:
           description: |
             Current stage, in the unified vocabulary. Pipeline jobs progress
             `cgr → chunk → describe → upsert → done`; refresh jobs progress
-            `chunk → describe → update → done`.
+            `chunk → describe → update → done`; graph-only jobs progress
+            `cgr → done`.
           enum: ["", cgr, chunk, describe, upsert, update, done]
         done: { type: integer, description: Units completed in the current stage. }
         total: { type: integer, description: Units total in the current stage. }
@@ -909,7 +994,10 @@ components:
             total: { type: integer }
         result:
           nullable: true
-          description: Shape depends on kind. Pipeline jobs nest ingest/vectorize; refresh jobs return a RefreshResult directly.
+          description: >-
+            Shape depends on kind. Pipeline jobs nest ingest/vectorize;
+            graph-only jobs nest only ingest (no vectorize key); refresh jobs
+            return a RefreshResult directly.
           oneOf:
             - type: object
               title: PipelineResult
