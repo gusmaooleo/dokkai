@@ -2,8 +2,12 @@
   "info": {
     "name": "Dokkai API",
     "_postman_id": "d0kka1-0000-4000-8000-000000000001",
-    "description": "HTTP API for Dokkai — a graph-aware vector database over a codebase.\n\nUsage order:\n1. Config → Set LLM provider (or set OLLAMA_CHAT_MODEL on the server).\n2. Instances → Start pipeline (captures {{jobId}} automatically).\n3. Instances → Get job (poll until status = succeeded), or Job events (SSE) to stream progress.\n4. Chat → Chat (SSE): note Postman shows the raw event stream.\n5. Graph → List graphs / Get project graph / Get entity neighborhood / Get file dependency view, once a project is ingested.\n\nNote: only one pipeline/refresh job may run per project at a time — a second one returns 409 (see the '409 - job already running' saved examples).\n\nCollection variables let you avoid editing every request: set {{baseUrl}}, {{repoPath}}, {{projectName}} once.",
+    "description": "HTTP API for Dokkai — a graph-aware vector database over a codebase.\n\nEvery route except Health, Auth → Login and Auth → Status requires a bearer token (see the Auth folder). Auth cannot be disabled.\n\nUsage order:\n1. Auth → Login (default admin/admin on first boot; captures {{authToken}} automatically and applies it to every other request via the collection's bearer auth).\n2. Config → Set LLM provider (or set OLLAMA_CHAT_MODEL on the server). Requires the admin role.\n3. Instances → Start pipeline (captures {{jobId}} automatically).\n4. Instances → Get job (poll until status = succeeded), or Job events (SSE) to stream progress.\n5. Chat → Chat (SSE): note Postman shows the raw event stream. Requires the admin or user role.\n6. Graph → List graphs / Get project graph / Get entity neighborhood / Get file dependency view, once a project is ingested.\n\nRoles: admin (everything, incl. user management and POST /config/llm), user (chat, ingestion, deletes, all reads), viewer (read-only GETs only). A role that can't perform an action gets 403 \"role '<role>' cannot perform this action\".\n\nNote: only one pipeline/refresh job may run per project at a time — a second one returns 409 (see the '409 - job already running' saved examples).\n\nCollection variables let you avoid editing every request: set {{baseUrl}}, {{repoPath}}, {{projectName}} once.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [{ "key": "token", "value": "{{authToken}}", "type": "string" }]
   },
   "variable": [
     { "key": "baseUrl", "value": "http://localhost:8000", "type": "string" },
@@ -11,7 +15,11 @@
     { "key": "projectName", "value": "your-repo", "type": "string" },
     { "key": "jobId", "value": "", "type": "string" },
     { "key": "conversationId", "value": "", "type": "string" },
-    { "key": "entityQualifiedName", "value": "src.alarms.AlarmValidationUseCase", "type": "string" }
+    { "key": "entityQualifiedName", "value": "src.alarms.AlarmValidationUseCase", "type": "string" },
+    { "key": "authToken", "value": "", "type": "string" },
+    { "key": "rootUsername", "value": "admin", "type": "string" },
+    { "key": "rootPassword", "value": "admin", "type": "string" },
+    { "key": "userId", "value": "", "type": "string" }
   ],
   "item": [
     {
@@ -20,10 +28,224 @@
         {
           "name": "Root (health check)",
           "request": {
+            "auth": { "type": "noauth" },
             "method": "GET",
             "header": [],
             "url": { "raw": "{{baseUrl}}/", "host": ["{{baseUrl}}"], "path": [""] },
-            "description": "Returns {\"status\":\"online\"} when the API is up."
+            "description": "Returns {\"status\":\"online\"} when the API is up. Public — no auth required."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Login",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const res = pm.response.json();",
+                  "if (res.token) {",
+                  "  pm.collectionVariables.set('authToken', res.token);",
+                  "  console.log('Saved authToken');",
+                  "}",
+                  "pm.test('login succeeded', function () {",
+                  "  pm.expect(res).to.have.property('token');",
+                  "});",
+                  "if (res.default_admin_active) {",
+                  "  console.warn('warning: the default admin/admin credentials are still active');",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{rootUsername}}\",\n  \"password\": \"{{rootPassword}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/login",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "login"]
+            },
+            "description": "Public. Authenticate and receive a 30-day bearer token. The test script saves the token into {{authToken}}, which the collection's bearer auth applies to every other request. default_admin_active is true while the seeded admin/admin credentials are unchanged."
+          },
+          "response": [
+            {
+              "name": "401 - invalid credentials",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"username\": \"admin\",\n  \"password\": \"wrong\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/auth/login",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["auth", "login"]
+                }
+              },
+              "status": "Unauthorized",
+              "code": 401,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"invalid username or password\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Status",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/auth/status",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "status"]
+            },
+            "description": "Public. { enabled: true, default_admin_active } -- whether the seeded admin/admin credentials are still active."
+          },
+          "response": []
+        },
+        {
+          "name": "Me",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/auth/me",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "me"]
+            },
+            "description": "Requires any authenticated role. Current user's username, role, session expiry, default_admin_active."
+          },
+          "response": []
+        },
+        {
+          "name": "List users",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/auth/users",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "users"]
+            },
+            "description": "Requires the admin role. Never includes password hashes."
+          },
+          "response": []
+        },
+        {
+          "name": "Create user",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const res = pm.response.json();",
+                  "if (res.id) {",
+                  "  pm.collectionVariables.set('userId', res.id);",
+                  "  console.log('Saved userId =', res.id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"alice\",\n  \"password\": \"correct horse battery staple\",\n  \"role\": \"user\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/users",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "users"]
+            },
+            "description": "Requires the admin role. role is one of admin|user|viewer. The test script saves the new user's id into {{userId}}."
+          },
+          "response": [
+            {
+              "name": "403 - insufficient role",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"username\": \"alice\",\n  \"password\": \"correct horse battery staple\",\n  \"role\": \"user\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/auth/users",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["auth", "users"]
+                }
+              },
+              "status": "Forbidden",
+              "code": 403,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"role 'viewer' cannot perform this action\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Delete user",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/auth/users/{{userId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "users", "{{userId}}"]
+            },
+            "description": "Requires the admin role. 400 if you try to delete your own user or the last remaining admin."
+          },
+          "response": []
+        },
+        {
+          "name": "Change own password",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"current_password\": \"{{rootPassword}}\",\n  \"new_password\": \"a new strong password\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/users/me/password",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "users", "me", "password"]
+            },
+            "description": "Requires any authenticated role. 401 if current_password doesn't match. Revokes every OTHER session for this user; the session making this request stays valid."
+          },
+          "response": []
+        },
+        {
+          "name": "Logout",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/auth/logout",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "logout"]
+            },
+            "description": "Requires any authenticated role. Invalidates the session (bearer token) used for this request."
           },
           "response": []
         }
@@ -64,9 +286,56 @@
               "host": ["{{baseUrl}}"],
               "path": ["instances", "pipeline"]
             },
-            "description": "Enqueue the ingestion pipeline. Returns { job_id, status } immediately and runs in the background.\n\nSet recreate:true only once, to migrate the schema (it drops the whole collection). The test script saves job_id into {{jobId}}.\n\ndescribe defaults to true. Set describe:false to opt out of per-entity LLM descriptions for this run -- this also skips the descriptor pre-flight below, and the summary named vector stays empty for this run's chunks.\n\nFail-loud descriptor policy (describe:true only): the configured DESC_MODEL/DESC_PROVIDER is checked before the job is created. Missing or unavailable descriptor -> 400, no job created (see the '400 - no descriptor model' saved example).\n\nPer-project job lock: a second pipeline/refresh/graph-only job for a project that already has one queued/running -> 409, no job created (see the '409 - job already running' saved example)."
+            "description": "Requires the admin or user role. Enqueue the ingestion pipeline. Returns { job_id, status } immediately and runs in the background.\n\nSet recreate:true only once, to migrate the schema (it drops the whole collection). The test script saves job_id into {{jobId}}.\n\ndescribe defaults to true. Set describe:false to opt out of per-entity LLM descriptions for this run -- this also skips the descriptor pre-flight below, and the summary named vector stays empty for this run's chunks.\n\nFail-loud descriptor policy (describe:true only): the configured DESC_MODEL/DESC_PROVIDER is checked before the job is created. Missing or unavailable descriptor -> 400, no job created (see the '400 - no descriptor model' saved example).\n\nPer-project job lock: a second pipeline/refresh/graph-only job for a project that already has one queued/running -> 409, no job created (see the '409 - job already running' saved example)."
           },
           "response": [
+            {
+              "name": "401 - missing or invalid token",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"repo_path\": \"{{repoPath}}\",\n  \"recreate\": false\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/instances/pipeline",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["instances", "pipeline"]
+                }
+              },
+              "status": "Unauthorized",
+              "code": 401,
+              "_postman_previewlanguage": "json",
+              "header": [
+                { "key": "Content-Type", "value": "application/json" },
+                { "key": "WWW-Authenticate", "value": "Bearer" }
+              ],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"missing bearer token\"\n}"
+            },
+            {
+              "name": "403 - insufficient role (viewer)",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"repo_path\": \"{{repoPath}}\",\n  \"recreate\": false\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/instances/pipeline",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["instances", "pipeline"]
+                }
+              },
+              "status": "Forbidden",
+              "code": 403,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"role 'viewer' cannot perform this action\"\n}"
+            },
             {
               "name": "400 - no descriptor model",
               "originalRequest": {
@@ -181,7 +450,7 @@
               "host": ["{{baseUrl}}"],
               "path": ["instances", "graph"]
             },
-            "description": "Enqueue a graph-ONLY run (cgr only -- no chunking, no LLM descriptions, no embedding, no Weaviate). Returns { job_id, status } immediately; runs in the background with stages cgr -> done and kind: \"graph\". result.ingest.output_json is the same canonical graph JSON path (ingested/<project>.json) the full pipeline produces, readable by the Graph API as soon as the job succeeds. Shares the same per-project job lock as Start pipeline / Refresh descriptions. The test script saves job_id into {{jobId}}."
+            "description": "Requires the admin or user role. Enqueue a graph-ONLY run (cgr only -- no chunking, no LLM descriptions, no embedding, no Weaviate). Returns { job_id, status } immediately; runs in the background with stages cgr -> done and kind: \"graph\". result.ingest.output_json is the same canonical graph JSON path (ingested/<project>.json) the full pipeline produces, readable by the Graph API as soon as the job succeeds. Shares the same per-project job lock as Start pipeline / Refresh descriptions. The test script saves job_id into {{jobId}}."
           },
           "response": [
             {
@@ -282,7 +551,7 @@
               "host": ["{{baseUrl}}"],
               "path": ["instances", "{{projectName}}", "describe"]
             },
-            "description": "Re-run only the describe pass over an already-ingested project (background job; no cgr, no re-embedding of unchanged text). Cache is honored (default force:false) -- unchanged entities cost nothing. Same fail-loud descriptor pre-flight as the pipeline, plus 404 if the project has no chunks and 409 if its graph JSON is missing from ingested/. The test script saves job_id into {{jobId}}."
+            "description": "Requires the admin or user role. Re-run only the describe pass over an already-ingested project (background job; no cgr, no re-embedding of unchanged text). Cache is honored (default force:false) -- unchanged entities cost nothing. Same fail-loud descriptor pre-flight as the pipeline, plus 404 if the project has no chunks and 409 if its graph JSON is missing from ingested/. The test script saves job_id into {{jobId}}."
           },
           "response": [
             {
@@ -402,7 +671,7 @@
               "host": ["{{baseUrl}}"],
               "path": ["chat"]
             },
-            "description": "Streams a Server-Sent Events response: sources → token* → done (or error). project_name must match an ingested repo. audience ∈ developer|manager|customer.\n\nEach entry in the 'sources' event's data array includes both file_path (relative) and absolute_path (full path on disk, as persisted at ingest time).\n\nNote: Postman buffers the stream and shows it after completion; use curl -N for live tokens."
+            "description": "Requires the admin or user role. Streams a Server-Sent Events response: sources → token* → done (or error). project_name must match an ingested repo. audience ∈ developer|manager|customer.\n\nEach entry in the 'sources' event's data array includes both file_path (relative) and absolute_path (full path on disk, as persisted at ingest time).\n\nNote: Postman buffers the stream and shows it after completion; use curl -N for live tokens."
           },
           "response": []
         },
@@ -465,7 +734,7 @@
               "host": ["{{baseUrl}}"],
               "path": ["chat", "conversations", "{{conversationId}}"]
             },
-            "description": "Delete a conversation and its history."
+            "description": "Requires the admin or user role. Delete a conversation and its history."
           },
           "response": []
         }
@@ -574,7 +843,7 @@
               "host": ["{{baseUrl}}"],
               "path": ["config", "llm"]
             },
-            "description": "Configure a local Ollama chat model. Validates that the model is installed."
+            "description": "Requires the admin role. Configure a local Ollama chat model. Validates that the model is installed."
           },
           "response": []
         },
@@ -592,7 +861,7 @@
               "host": ["{{baseUrl}}"],
               "path": ["config", "llm"]
             },
-            "description": "Configure a remote provider (openai|anthropic). Requires provider_data.key. The exact model is probed at save time (models.retrieve) -- an invalid/retired model is rejected with 400 and nothing is saved."
+            "description": "Requires the admin role. Configure a remote provider (openai|anthropic). Requires provider_data.key. The exact model is probed at save time (models.retrieve) -- an invalid/retired model is rejected with 400 and nothing is saved."
           },
           "response": []
         },

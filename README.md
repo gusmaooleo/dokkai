@@ -22,6 +22,7 @@ Everything runs **100% locally** — Weaviate for vectors, Ollama for both embed
 - [Prerequisites](#prerequisites)
 - [Quickstart](#quickstart)
 - [Configuration](#configuration)
+- [Authentication](#authentication)
 - [API reference](#api-reference)
 - [Project structure](#project-structure)
 - [Current limitations](#current-limitations)
@@ -300,6 +301,7 @@ Full pipeline run on `saffira_back-end` (medium TS/Python backend), local Ollama
 - ✅ **MCP server** — 7 tools (search, literal grep, graph navigation, entity/file lookup) for Claude Code, Codex and any stdio MCP client, with a small-model instructions profile and a session usage watchdog (see [MCP server](#mcp-server))
 - ✅ **npm CLI** (`dokkai`) — `up`/`status`/`ingest`/`graph`/`srcs`/`watch`/`doctor` commands: live job progress, one-command SRCS sessions (Claude Code, Codex, a local Ollama REPL, or an agentic local-model MCP loop), debounced incremental re-ingestion on save, and environment diagnostics (see [CLI](#cli))
 - ✅ **Graph-only ingestion** (`POST /instances/graph`, `dokkai graph`) — run just `cgr` with no LLM/Weaviate involved
+- ✅ **Authentication** — always-on, Grafana-style bearer-token auth with 3 roles (admin/user/viewer), a default `admin`/`admin` seed overridable via env, and CLI auto-login (see [Authentication](#authentication))
 
 ---
 
@@ -394,10 +396,27 @@ PORT=9000 ./dev.sh  # custom port
 
 `dev.sh` wraps `uv run uvicorn main:app --reload --app-dir src` (the app uses absolute imports rooted at `src/`).
 
+> ⚠️ **First boot seeds an `admin`/`admin` user** (auth is always on — see [Authentication](#authentication)). Log in and change that password (or set `DOKKAI_ROOT_USER`/`DOKKAI_ROOT_PASSWORD` before first boot) before exposing the API beyond your own machine:
+> ```bash
+> TOKEN=$(curl -s -X POST localhost:8000/auth/login -H 'Content-Type: application/json' \
+>   -d '{"username":"admin","password":"admin"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+> curl -X PATCH localhost:8000/auth/users/me/password -H "Authorization: Bearer $TOKEN" \
+>   -H 'Content-Type: application/json' -d '{"current_password":"admin","new_password":"<a strong password>"}'
+> ```
+> The `dokkai` CLI does this login for you automatically on every command (see [Authentication](#authentication)) and prints a warning while the default credentials are still active.
+
 ### 5. Ingest a repository
+
+Every route below `/` is authenticated (see [Authentication](#authentication)) — grab a bearer token first:
+
+```bash
+TOKEN=$(curl -s -X POST localhost:8000/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"admin"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+```
 
 ```bash
 curl -X POST localhost:8000/instances/pipeline \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"repo_path":"/absolute/path/to/your/repo"}'
 ```
@@ -406,10 +425,11 @@ This runs the full pipeline: graph extraction (`cgr`) → chunking (with source)
 
 ### 6. Chat with the codebase
 
-If you set `OLLAMA_CHAT_MODEL`, the model is already configured and warm. Otherwise configure it once:
+If you set `OLLAMA_CHAT_MODEL`, the model is already configured and warm. Otherwise configure it once (requires the `admin` role):
 
 ```bash
 curl -X POST localhost:8000/config/llm \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"is_local":true,"provider_data":{"provider_name":"ollama","model":"qwen2.5-coder:latest"}}'
 ```
@@ -418,6 +438,7 @@ Then ask away (SSE stream — note `-N` and that `project_name` must match the i
 
 ```bash
 curl -N -X POST localhost:8000/chat \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"message":"how does the alarm flow work?","project_name":"your-repo","audience":"developer"}'
 ```
@@ -441,6 +462,8 @@ All configuration is via environment variables (loaded from `.env` at startup).
 | Variable | Default | Description |
 | --- | --- | --- |
 | `DATABASE_URL` | `postgresql://dokkai:dokkai@localhost:5432/dokkai` | Postgres connection string for conversation and job history (`docker compose up -d` starts a matching Postgres service). Boot-time SQL migrations run automatically. If Postgres is unreachable at startup, the API still serves — see [Current limitations](#current-limitations) |
+| `DOKKAI_ROOT_USER` | _(unset — `admin` seeded)_ | Optional override for the admin username, applied on boot (and re-applied if changed) — see [Authentication](#authentication) |
+| `DOKKAI_ROOT_PASSWORD` | _(unset — `admin` seeded)_ | Optional override for the admin password, applied on boot; changing it invalidates that user's existing sessions — see [Authentication](#authentication) |
 | `WEAVIATE_HOST` | `localhost` | Weaviate host (client side) |
 | `WEAVIATE_HTTP_PORT` | `8080` | Weaviate HTTP port |
 | `WEAVIATE_GRPC_PORT` | `50051` | Weaviate gRPC port |
@@ -469,31 +492,78 @@ All configuration is via environment variables (loaded from `.env` at startup).
 
 ---
 
+## Authentication
+
+Auth is **always on** — Grafana-style: there's no way to disable it, and there's nothing to configure before first boot.
+
+- **First boot seeds `admin`/`admin`** (only when the `users` table is empty). Setting `DOKKAI_ROOT_USER`/`DOKKAI_ROOT_PASSWORD` before that first boot seeds those credentials instead. If you set/change either var on a **later** boot, the API re-applies it onto user id 1 (the seeded admin), overwriting its username/password and invalidating all of its existing sessions — this is the supported way to reset a lost admin password.
+- **⚠️ Change the default password.** `GET /auth/status` (public) and `GET /auth/me` both return `default_admin_active: true` for as long as any user named `admin` still verifies against the password `admin` — the CLI prints a one-time warning when it sees this flag; the planned UI (feature 07) will show it on every screen. Change it with `PATCH /auth/users/me/password`, or set `DOKKAI_ROOT_PASSWORD` and restart.
+- **Tokens** are opaque, random 30-day bearer tokens (`Authorization: Bearer <token>`), stored SHA-256-hashed in Postgres — the plaintext token is only ever returned once, at login. `POST /auth/logout` revokes the session used for that request; changing your own password (`PATCH /auth/users/me/password`) revokes every *other* session for your user but keeps the one making the request. Passwords are hashed with stdlib `hashlib.scrypt` (no new dependency).
+- **Roles** (assigned per-user, checked per-route):
+
+  | Role | Can | Cannot |
+  | --- | --- | --- |
+  | `admin` | Everything below, plus user management (`GET`/`POST /auth/users`, `DELETE /auth/users/{id}`) and `POST /config/llm` | — |
+  | `user` | Chat (`POST /chat`), ingestion (`POST /instances/...`), deletes (`DELETE /chat/conversations/{id}`), all reads | User management, `POST /config/llm` |
+  | `viewer` | Read-only `GET` routes (graph, jobs, conversations, config) | `POST /chat`, ingestion, any delete, user management |
+
+  A role that can't perform an action gets `403` with the exact body `role '<role>' cannot perform this action`. Every authenticated user (any role) can call `GET /auth/me` and `PATCH /auth/users/me/password` for themselves.
+- **Public routes** (no token required): `GET /`, `GET /docs`, `GET /redoc`, `GET /openapi.json`, `POST /auth/login`, `GET /auth/status`. Every other route requires a valid bearer token; a missing/invalid/expired one is `401` with a `WWW-Authenticate: Bearer` header.
+- **Postgres down** → protected routes return `503` (auth itself lives in Postgres, so it can't be checked); `POST /auth/login` and `GET /auth/status` also `503` in that case since they need to read the `users` table.
+- **CLI behavior**: every `dokkai` command logs in automatically, using `DOKKAI_ROOT_USER`/`DOKKAI_ROOT_PASSWORD` from its environment (falling back to `admin`/`admin`), caches the token for the process, and self-heals a `401` by re-logging in — no separate `dokkai login` command. It prints the same one-time default-admin warning as the API. The MCP server (stdio) is untouched by any of this — it has no HTTP auth.
+
+### Managing users
+
+```bash
+# Create a user (admin only)
+curl -X POST localhost:8000/auth/users -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"alice","password":"...","role":"user"}'
+
+# List users (admin only)
+curl localhost:8000/auth/users -H "Authorization: Bearer $TOKEN"
+
+# Delete a user (admin only; you cannot delete yourself or the last admin)
+curl -X DELETE localhost:8000/auth/users/2 -H "Authorization: Bearer $TOKEN"
+```
+
+---
+
 ## API reference
 
 > These are the HTTP endpoints exposed by the FastAPI app (`./dev.sh`). The **MCP server is separate and stdio-only** — it adds no HTTP endpoints; see [MCP server](#mcp-server).
 
-| Method | Endpoint | Description |
-| --- | --- | --- |
-| `POST` | `/instances/pipeline` | Run the full ingestion pipeline for a `repo_path`, `describe: true` by default (409 if a job is already running for that project; `describe: false` skips the descriptor pre-flight and ingests without descriptions) |
-| `POST` | `/instances/graph` | Graph-only run for a `repo_path` — `cgr` only, no LLM, no vectorization, no Weaviate (stages `cgr → done`, `kind: "graph"`; 409 if a job is already running for that project) |
-| `POST` | `/instances/{project}/describe` | Refresh descriptions for an already-ingested project (background job; optional `{"force": true}`; 409 if a job is already running for that project) — see [Refreshing descriptions](#refreshing-descriptions) |
-| `GET` | `/instances/jobs` | List ingestion/refresh jobs — merges live (in-memory) jobs with history persisted in Postgres, so results survive a restart |
-| `GET` | `/instances/jobs/{id}` | Get a job's status, `stage`/`stage_progress` and result |
-| `GET` | `/instances/jobs/{id}/events` | Stream a job's progress as Server‑Sent Events (`event: job` on each update, `event: done` when it finishes) |
-| `GET` | `/graph` | List projects with an ingested graph |
-| `GET` | `/graph/{project}` | Full project graph (code entities by default, `?include=structural` for everything), `?limit=N` |
-| `GET` | `/graph/{project}/neighborhood` | BFS neighborhood of an entity — `?entity=<qualified_name>&depth=&direction=&limit=` |
-| `GET` | `/graph/{project}/files` | File‑to‑file dependency view (internal files only) |
-| `POST` | `/chat` | Chat over the codebase (SSE: `sources` → `token` → `done`) |
-| `GET` | `/chat/conversations` | List conversations (persisted in Postgres; 503 if Postgres is unreachable) |
-| `GET` | `/chat/conversations/{id}` | Get a conversation's history (503 if Postgres is unreachable) |
-| `DELETE` | `/chat/conversations/{id}` | Delete a conversation (503 if Postgres is unreachable) |
-| `POST` | `/config/llm` | Set the active LLM provider/model (rejects an invalid/retired remote model) |
-| `GET` | `/config/llm` | Get the current LLM config |
-| `GET` | `/config/llm/models` | List available models for the provider (live catalog, static fallback on failure) |
-| `GET` | `/config/llm/health` | Check connectivity — probes the configured model |
-| `GET` | `/` | Health check |
+> **Auth column key** (see [Authentication](#authentication) for the full model): `public` = no token needed · `any` = any authenticated role · `admin, user` = those two roles only · `admin` = admin only. Everything not `public` returns `401` without a valid bearer token, and `403 role '<role>' cannot perform this action` for a role not listed.
+
+| Method | Endpoint | Auth | Description |
+| --- | --- | --- | --- |
+| `POST` | `/auth/login` | public | Authenticate with `username`/`password`, get a bearer token, role, and `default_admin_active` |
+| `GET` | `/auth/status` | public | Whether auth is enabled (always `true`) and whether the default `admin`/`admin` credentials are still active |
+| `POST` | `/auth/logout` | any | Invalidate the session used for this request |
+| `GET` | `/auth/me` | any | Current user's username, role, token expiry, `default_admin_active` |
+| `GET` | `/auth/users` | admin | List all users |
+| `POST` | `/auth/users` | admin | Create a user with a role (`admin` \| `user` \| `viewer`) |
+| `DELETE` | `/auth/users/{id}` | admin | Delete a user (400 on self-delete or deleting the last admin) |
+| `PATCH` | `/auth/users/me/password` | any | Change your own password (401 if `current_password` is wrong); keeps the current session, revokes all others |
+| `POST` | `/instances/pipeline` | admin, user | Run the full ingestion pipeline for a `repo_path`, `describe: true` by default (409 if a job is already running for that project; `describe: false` skips the descriptor pre-flight and ingests without descriptions) |
+| `POST` | `/instances/graph` | admin, user | Graph-only run for a `repo_path` — `cgr` only, no LLM, no vectorization, no Weaviate (stages `cgr → done`, `kind: "graph"`; 409 if a job is already running for that project) |
+| `POST` | `/instances/{project}/describe` | admin, user | Refresh descriptions for an already-ingested project (background job; optional `{"force": true}`; 409 if a job is already running for that project) — see [Refreshing descriptions](#refreshing-descriptions) |
+| `GET` | `/instances/jobs` | any | List ingestion/refresh jobs — merges live (in-memory) jobs with history persisted in Postgres, so results survive a restart |
+| `GET` | `/instances/jobs/{id}` | any | Get a job's status, `stage`/`stage_progress` and result |
+| `GET` | `/instances/jobs/{id}/events` | any | Stream a job's progress as Server‑Sent Events (`event: job` on each update, `event: done` when it finishes) |
+| `GET` | `/graph` | any | List projects with an ingested graph |
+| `GET` | `/graph/{project}` | any | Full project graph (code entities by default, `?include=structural` for everything), `?limit=N` |
+| `GET` | `/graph/{project}/neighborhood` | any | BFS neighborhood of an entity — `?entity=<qualified_name>&depth=&direction=&limit=` |
+| `GET` | `/graph/{project}/files` | any | File‑to‑file dependency view (internal files only) |
+| `POST` | `/chat` | admin, user | Chat over the codebase (SSE: `sources` → `token` → `done`) |
+| `GET` | `/chat/conversations` | any | List conversations (persisted in Postgres; 503 if Postgres is unreachable) |
+| `GET` | `/chat/conversations/{id}` | any | Get a conversation's history (503 if Postgres is unreachable) |
+| `DELETE` | `/chat/conversations/{id}` | admin, user | Delete a conversation (503 if Postgres is unreachable) |
+| `POST` | `/config/llm` | admin | Set the active LLM provider/model (rejects an invalid/retired remote model) |
+| `GET` | `/config/llm` | any | Get the current LLM config |
+| `GET` | `/config/llm/models` | any | List available models for the provider (live catalog, static fallback on failure) |
+| `GET` | `/config/llm/health` | any | Check connectivity — probes the configured model |
+| `GET` | `/` | public | Health check |
 
 Jobs report `stage` through the unified vocabulary `cgr → chunk → describe → upsert → done` (refresh jobs use `chunk → describe → update → done`; graph-only jobs use just `cgr → done`), plus a `stage_progress` object `{"stage", "done", "total"}` mirroring the current stage's `done`/`total` counters, and a `kind` (`"pipeline"` | `"refresh"` | `"graph"`).
 
@@ -501,7 +571,7 @@ Jobs report `stage` through the unified vocabulary `cgr → chunk → describe �
 
 **Job progress over SSE** — instead of polling `GET /instances/jobs/{id}`, `GET /instances/jobs/{id}/events` streams the same job payload over Server‑Sent Events (same framing as `/chat`): it emits `event: job` on every `updated_at` change and a terminal `event: done` with the final payload, then closes the stream. An unknown job id is a plain 404, not a stream.
 
-**Job history across restarts** — jobs live in memory while running (the source of truth for live progress) and are write‑through persisted to Postgres on lifecycle transitions (queued/running/terminal), so results survive a server restart. On boot, any job still `queued`/`running` from a previous run is swept and marked `failed` (`"interrupted by server restart"`), since its worker thread no longer exists. If Postgres is unreachable, job history is silently unavailable and only in-memory (live) jobs are returned — never a 503.
+**Job history across restarts** — jobs live in memory while running (the source of truth for live progress) and are write‑through persisted to Postgres on lifecycle transitions (queued/running/terminal), so results survive a server restart. On boot, any job still `queued`/`running` from a previous run is swept and marked `failed` (`"interrupted by server restart"`), since its worker thread no longer exists. If Postgres is unreachable, job history is silently unavailable and only in-memory (live) jobs are returned — this graceful-degradation path only applies while Postgres is reachable enough to authenticate the request; since every route (including this one) now requires resolving a bearer token against Postgres (see [Authentication](#authentication)), a fully unreachable Postgres 503s at the auth layer before this endpoint's own handler runs.
 
 ### Graph API
 
@@ -553,7 +623,7 @@ dokkai/
 
 These are known and tracked in the [Roadmap](#roadmap):
 
-- **In‑memory LLM config** — the active LLM provider/model resets on restart (re‑seedable via `OLLAMA_CHAT_MODEL`). Chat history is persisted in Postgres (see [Configuration](#configuration)); if Postgres is unreachable, the conversation endpoints and `/chat` degrade gracefully (503 / SSE `error` event) instead of crashing the API.
+- **In‑memory LLM config** — the active LLM provider/model resets on restart (re‑seedable via `OLLAMA_CHAT_MODEL`). Chat history is persisted in Postgres (see [Configuration](#configuration)); if Postgres is unreachable, the conversation endpoints and `/chat` degrade gracefully (503 / SSE `error` event) instead of crashing the API — though in practice, since [auth](#authentication) also requires Postgres to resolve a session, a fully unreachable Postgres now 503s every protected route at the auth layer regardless.
 - **Single repository at a time** per collection.
 - **Retrieval bias toward tests** — for "how does X work?" queries, test files often out‑rank the real implementation (test descriptions read like specs). End‑to‑end tests are also decoupled from implementation by the HTTP boundary, so graph expansion can't bridge them.
 - **The API is not yet containerized** — only Weaviate runs in `docker compose`; the API runs via `dev.sh`.
@@ -573,7 +643,7 @@ These are known and tracked in the [Roadmap](#roadmap):
 | 03 | MCP server (core) | ✅ done (pending merge) |
 | 04 | npm CLI (`dokkai`) + SRCS mode | ✅ done (pending merge) |
 | 05 | Postgres conversation history | ✅ done (pending merge) |
-| 06 | Basic auth (root user via env) | planned |
+| 06 | Basic auth (root user via env) | ✅ done (pending merge) |
 | 07 | Frontend UI (chat + graph + config) | planned |
 | 08 | PDF ingestion — local NotebookLM | planned |
 | 09 | Code review & bug‑hunt routines | planned |

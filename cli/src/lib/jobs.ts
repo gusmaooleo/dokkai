@@ -3,6 +3,7 @@
  * with a polling fallback. Mirrors `src/services/jobs.py`'s `Job.to_dict()`.
  */
 
+import { authHeaders } from "./auth.js";
 import { getJson } from "./http.js";
 import { SseNotFoundError, streamSse } from "./sse.js";
 
@@ -93,9 +94,11 @@ async function* followViaSse(
 
   try {
     armWatchdog();
+    const headers = await authHeaders(apiUrl);
     const frames = streamSse(`${apiUrl}/instances/jobs/${jobId}/events`, {
       signal: controller.signal,
       onChunk: armWatchdog,
+      headers,
     });
     for await (const frame of frames) {
       if (frame.event !== "job" && frame.event !== "done") continue;
