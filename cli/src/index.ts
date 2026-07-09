@@ -7,14 +7,10 @@ import { runUp } from "./commands/up.js";
 import { runStatus } from "./commands/status.js";
 import { runIngest } from "./commands/ingest.js";
 import { runGraph } from "./commands/graph.js";
+import { runSrcs } from "./commands/srcs.js";
 
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json") as { version: string };
-
-function notImplemented(command: string): never {
-  console.error(chalk.yellow(`'${command}' is not implemented yet.`));
-  process.exit(1);
-}
 
 const program = new Command();
 
@@ -79,7 +75,7 @@ program
     "--model <target>",
     "claude | codex | ollama:<name>",
   )
-  .action(() => notImplemented("srcs"));
+  .action((options: { model: string }) => runSrcs(options));
 
 program.parseAsync(process.argv).catch((error: unknown) => {
   console.error(
