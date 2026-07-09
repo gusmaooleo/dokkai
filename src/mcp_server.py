@@ -132,6 +132,34 @@ def search(query: str, project: str | None = None, k: int = 8) -> str:
 
 
 @mcp.tool()
+def grep_project(pattern: str, project: str | None = None, k: int = 10) -> str:
+    """Literal keyword search (BM25 over code text, NOT regex) for a known
+    identifier. Returns ranked hits with qname, location and BM25 score."""
+    if k < 1:
+        raise ValueError("k must be >= 1")
+    resolved = _resolve_project(project)
+    if not pattern.strip():
+        return f"no matches for '{pattern}' in project '{resolved}'"
+    client = get_client()
+    try:
+        chunks = Retriever(client).search_bm25(pattern, project_name=resolved, top_k=k)
+    finally:
+        client.close()
+
+    if not chunks:
+        return f"no matches for '{pattern}' in project '{resolved}'"
+
+    lines = []
+    for i, c in enumerate(chunks, 1):
+        loc = c.absolute_path or c.file_path
+        if c.start_line is not None and c.end_line is not None:
+            loc += f":{c.start_line}-{c.end_line}"
+        score = f"{c.score:.2f}" if c.score is not None else "n/a"
+        lines.append(f"{i}. [{c.entity_type}] {c.qualified_name} — {loc} (score {score})")
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def get_entity(qualified_name: str, project: str | None = None) -> str:
     """Fetch a single code entity by exact qualified_name: relations, summary
     and source. Call search() first to find the qualified_name."""

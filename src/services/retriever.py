@@ -194,6 +194,32 @@ class Retriever:
         )
         return self._merge_seeds(summary_seeds, code_seeds, top_k)
 
+    def search_bm25(
+        self,
+        query: str,
+        *,
+        project_name: str | None = None,
+        top_k: int = 10,
+    ) -> list[RetrievedChunk]:
+        """
+        Literal/keyword search over ``chunk_text`` via Weaviate's BM25 ranking
+        (tokenized, NOT full regex) — cheaper and more precise than hybrid
+        search when the caller already knows the exact identifier.
+
+        Returns
+        -------
+        list[RetrievedChunk]
+        """
+        filters = self._build_filters(project_name, None)
+        response = self.collection.query.bm25(
+            query=query,
+            query_properties=["chunk_text"],
+            filters=filters,
+            limit=top_k,
+            return_metadata=MetadataQuery(score=True),
+        )
+        return [self._to_chunk(obj) for obj in response.objects]
+
     def get_by_qualified_name(
         self, qualified_name: str, project_name: str
     ) -> RetrievedChunk | None:
