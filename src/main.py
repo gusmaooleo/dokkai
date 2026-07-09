@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from controllers import instances, chat, config, graph
+from controllers import auth, instances, chat, config, graph
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -37,6 +37,23 @@ async def lifespan(app: FastAPI):
             await sweep_interrupted_jobs()
         except Exception as e:
             logger.warning("job history: failed to sweep interrupted jobs on boot: %s", e)
+
+        # Seed the admin user (or apply DOKKAI_ROOT_* overrides) now that
+        # Postgres is confirmed reachable. Best-effort like the rest of this
+        # block — a failure here still leaves the API serving, and login's
+        # own lazy ensure_seeded() call will retry.
+        from services.auth import ensure_seeded, is_default_admin_active
+
+        try:
+            await ensure_seeded()
+            if await is_default_admin_active():
+                logger.warning(
+                    "default admin credentials (admin/admin) are still active — "
+                    "log in and change the password, or set DOKKAI_ROOT_USER/"
+                    "DOKKAI_ROOT_PASSWORD"
+                )
+        except Exception as e:
+            logger.warning("auth: failed to seed admin user on boot: %s", e)
 
     # If OLLAMA_CHAT_MODEL is set, preconfigure the local LLM and warm it on
     # boot — so the first /chat isn't a cold start and the model stays resident
@@ -75,6 +92,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth.router)
 app.include_router(instances.router)
 app.include_router(chat.router)
 app.include_router(config.router)

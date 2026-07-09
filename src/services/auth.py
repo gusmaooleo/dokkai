@@ -13,8 +13,8 @@ self-describing stored format: ``scrypt$n$r$p$<salt-b64>$<hash-b64>``. Session
 tokens are opaque (``secrets.token_urlsafe``), stored SHA-256-hashed, 30-day
 TTL (decisions 6a/6g).
 
-Endpoints/wiring land in a later step; this module only provides the service
-functions and dependencies.
+Endpoints live in ``controllers/auth.py``; this module only provides the
+service functions and dependencies they and the rest of the API build on.
 """
 
 from __future__ import annotations
@@ -242,15 +242,29 @@ async def get_user_by_username(username: str) -> dict | None:
     return dict(row) if row else None
 
 
-async def update_password(user_id: int, new_password: str) -> None:
-    """Set a new password for *user_id* and drop their other sessions."""
+async def update_password(user_id: int, new_password: str, keep_token: str | None = None) -> None:
+    """
+    Set a new password for *user_id*.
+
+    Drops all of the user's sessions except the one identified by
+    *keep_token* (if given) — used when a user changes their own password:
+    every OTHER session dies, but the session making the request stays
+    valid (decision 6d).
+    """
     pool = await get_pool()
     await pool.execute(
         "UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2",
         hash_password(new_password),
         user_id,
     )
-    await delete_user_sessions(user_id)
+    if keep_token is None:
+        await delete_user_sessions(user_id)
+    else:
+        await pool.execute(
+            "DELETE FROM sessions WHERE user_id = $1 AND token_hash != $2",
+            user_id,
+            _hash_token(keep_token),
+        )
 
 
 # -----------------------------------------------------------------------
@@ -282,6 +296,7 @@ async def require_auth(
             status_code=401, detail="invalid or expired session", headers={"WWW-Authenticate": "Bearer"}
         )
     request.state.user = user
+    request.state.token = credentials.credentials
     return user
 
 
