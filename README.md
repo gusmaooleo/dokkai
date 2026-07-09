@@ -13,6 +13,7 @@ Everything runs **100% locally** — Weaviate for vectors, Ollama for both embed
 ## Table of contents
 
 - [Why](#why)
+- [MCP server](#mcp-server)
 - [How it works](#how-it-works)
 - [Descriptions (Tier 2)](#descriptions-tier-2)
 - [Features](#features)
@@ -34,6 +35,87 @@ Everything runs **100% locally** — Weaviate for vectors, Ollama for both embed
 - **Automatic documentation.** Generate complete, audience‑specific docs (developer / manager / customer) for systems that were never documented.
 - **Semantic search for agents.** Ask "how does the alarm flow work?" and get the relevant subsystem — not keyword hits.
 - **Local & private.** Your code never leaves your machine.
+
+---
+
+## MCP server
+
+Dokkai's core deliverable is a **stdio MCP server** (`dokkai`, `src/mcp_server.py`) that exposes the same graph-aware retrieval used by `/chat` as tools any MCP-capable agent — Claude Code, Codex, or any other MCP client — can call directly. Instead of an agent grepping and reading whole files to understand a codebase, it asks dokkai for exact, connected, token-lean context.
+
+- **Transport: stdio only.** There is no HTTP/SSE MCP transport, and no new HTTP endpoints ship with it — see [API reference](#api-reference) for the separate, unrelated FastAPI routes.
+- **Requires only Weaviate up and a project ingested** (`docker compose up -d` + `POST /instances/pipeline`). The FastAPI app (`./dev.sh`) is **not** needed to use the MCP server.
+- **Launch command:** `uv run --directory <repo root> python src/mcp_server.py`
+- Responses are compact plain text (not JSON), with English-only errors (unknown project, entity not found, out-of-range line, etc.). `project` auto-resolves when exactly one project is ingested; pass it explicitly otherwise.
+
+### Tools
+
+| Tool | Parameters | Returns | Typical size |
+| --- | --- | --- | --- |
+| `list_projects` | – | Ingested projects with chunk counts, node/edge counts, `generated_at` | ~105 chars |
+| `search` | `query`, `project?`, `k=8` | Ranked hits — qualified_name, entity type, absolute `path:lines`, score, truncated description | ~2.7k chars (~680 tok) at `k=8` |
+| `get_entity` | `qualified_name`, `project?` | One entity's relations (calls/called_by/inherits/implements/overrides/methods), summary and full source | ~0.5–1.6k chars |
+| `neighbors` | `qualified_name`, `project?`, `direction=both`, `depth=1`, `limit=30` | Graph neighborhood (calls/inherits/implements/overrides/defines) as a node list + edge list, BFS up to `depth` hops | ~0.6k chars |
+| `context` | `query`, `project?`, `k=8` | One-shot seed + graph-expanded context bundle, ready to use as LLM context, capped at 10,000 chars | ≤10k chars (~2.5k tok) |
+| `get_file` | `path`, `project?`, `start_line?`, `end_line?` | Raw file content, optionally a 1-indexed inclusive line range; capped at 2,000 lines / 100 KB per call (with a truncation note) | file-dependent |
+
+### Measured token budget
+
+`scripts/mcp_harness.py` spawns the MCP server as a subprocess, drives a local Ollama model through the tool-calling loop for a fixed question, and reports the total tool-response payload (chars/4 token approximation) against a budget:
+
+```bash
+uv run python scripts/mcp_harness.py \
+  [--question "how does the alarm flow work?"] \
+  [--project saffira_back-end] \
+  [--model qwen2.5-coder:3b] \
+  [--budget 5000]
+```
+
+Measured on `saffira_back-end` with the local `qwen2.5-coder:3b` model:
+
+| Question | Tool calls used | Payload | Budget | Result |
+| --- | --- | --- | --- | --- |
+| Canonical: "how does the alarm flow work?" | one `context` call | ≈2,478 tokens | 5,000 | PASS |
+| A generalization question (different topic) | one `search` call | ≈639 tokens | 5,000 | PASS |
+
+### Registration
+
+**Claude Code:**
+
+```bash
+claude mcp add dokkai -- uv run --directory /absolute/path/to/dokkai python src/mcp_server.py
+claude mcp list      # verify: dokkai ... ✔ Connected
+```
+
+Remove: `claude mcp remove dokkai`
+
+> Verified live: `claude mcp list` reports `dokkai ... ✔ Connected`, and a real call to `list_projects` (via `claude -p "Using only dokkai MCP tools, call list_projects and report the raw output" --allowedTools "mcp__dokkai__*"`) returned:
+> ```
+> saffira_back-end — chunks: 2770, nodes: 4760, edges: 8959, generated_at: 2026-07-08T22:43:50.164048+00:00
+> ```
+
+**Codex:**
+
+```bash
+codex mcp add dokkai -- uv run --directory /absolute/path/to/dokkai python src/mcp_server.py
+codex mcp list       # verify: dokkai ... enabled
+```
+
+Remove: `codex mcp remove dokkai`
+
+> Verified live: `codex mcp add`/`codex mcp list` register the server and report it `enabled` (Codex connects to it and lists its tools correctly). A real tool call via `codex exec "call the dokkai list_projects MCP tool and report its raw output"` could **not** be completed non-interactively: every attempt (default `approval: never`, and again under `-s workspace-write`) failed with `user cancelled MCP tool call` — non-interactive `codex exec` appears to auto-decline the approval prompt it needs for a newly-registered MCP server's first tool call rather than auto-approve it under a `never` policy. This is a Codex CLI non-interactive-mode limitation, not a dokkai server defect. Approve the first call once from an interactive `codex` session to unblock subsequent non-interactive use.
+
+**Generic stdio MCP client** (e.g. an `mcpServers` config block):
+
+```json
+{
+  "mcpServers": {
+    "dokkai": {
+      "command": "uv",
+      "args": ["run", "--directory", "/absolute/path/to/dokkai", "python", "src/mcp_server.py"]
+    }
+  }
+}
+```
 
 ---
 
@@ -121,6 +203,7 @@ Full pipeline run on `saffira_back-end` (medium TS/Python backend), local Ollama
 - ✅ 100% local: Weaviate + Ollama (embeddings **and** generation)
 - ✅ Pluggable providers — LLM: Ollama / OpenAI / Anthropic · embeddings: Ollama / OpenAI / Cohere
 - ✅ Auto‑configure + warm the chat model on startup (no cold starts)
+- ✅ **MCP server** — 6 tools (search, graph navigation, entity/file lookup) for Claude Code, Codex and any stdio MCP client (see [MCP server](#mcp-server))
 
 ---
 
@@ -133,6 +216,7 @@ Full pipeline run on `saffira_back-end` (medium TS/Python backend), local Ollama
 | Graph extraction | code-graph-rag (`cgr`) + ephemeral Memgraph |
 | Embeddings | Ollama · `nomic-embed-text` |
 | Generation | Ollama · `qwen2.5-coder` (any Ollama chat model) |
+| MCP server | Official Python `mcp` SDK (`FastMCP`), stdio transport |
 | Frontend (WIP) | Next.js 16 · React 19 · Tailwind v4 |
 
 ---
@@ -280,6 +364,8 @@ All configuration is via environment variables (loaded from `.env` at startup).
 
 ## API reference
 
+> These are the HTTP endpoints exposed by the FastAPI app (`./dev.sh`). The **MCP server is separate and stdio-only** — it adds no HTTP endpoints; see [MCP server](#mcp-server).
+
 | Method | Endpoint | Description |
 | --- | --- | --- |
 | `POST` | `/instances/pipeline` | Run the full ingestion pipeline for a `repo_path` (409 if a job is already running for that project) |
@@ -370,8 +456,8 @@ These are known and tracked in the [Roadmap](#roadmap):
 | # | Feature | Status |
 | --- | --- | --- |
 | 01 | Describe v2 (lighter descriptions, template descriptions, provider selection, fail‑loud policy) + absolute file paths | ✅ done |
-| 02 | Graph query API | ✅ done (pending merge) |
-| 03 | MCP server (core) | planned |
+| 02 | Graph query API | ✅ done |
+| 03 | MCP server (core) | ✅ done (pending merge) |
 | 04 | npm CLI (`dokkai`) + SRCS mode | planned |
 | 05 | Postgres conversation history | planned |
 | 06 | Basic auth (root user via env) | planned |
@@ -379,7 +465,7 @@ These are known and tracked in the [Roadmap](#roadmap):
 | 08 | PDF ingestion — local NotebookLM | planned |
 | 09 | Code review & bug‑hunt routines | planned |
 | 10 | Documentation site (en/pt/zh/es) | planned |
-| 11 | Post‑01 polish (live provider model catalogs, stage‑level job progress, describe refresh endpoint) | ✅ done (pending merge) |
+| 11 | Post‑01 polish (live provider model catalogs, stage‑level job progress, describe refresh endpoint) | ✅ done |
 
 ### Retrieval quality
 
