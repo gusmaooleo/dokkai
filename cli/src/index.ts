@@ -80,8 +80,13 @@ program
     "project to chat about with ollama:<name> (default: auto-detect if " +
       "exactly one project is ingested)",
   )
+  .option(
+    "--agent",
+    "agentic MCP loop for ollama:<name> instead of the /chat REPL " +
+      "(no FastAPI required — only Weaviate + Ollama)",
+  )
   .action(
-    (options: { model: string; project?: string }) =>
+    (options: { model: string; project?: string; agent?: boolean }) =>
       runSrcs({ ...program.opts(), ...options }),
   );
 

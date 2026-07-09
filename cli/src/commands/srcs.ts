@@ -2,11 +2,13 @@ import { spawn } from "node:child_process";
 import chalk from "chalk";
 import { resolveDokkaiHome } from "../lib/config.js";
 import { runOllamaChat } from "../lib/chat.js";
+import { runOllamaAgent } from "../lib/agent.js";
 
 export interface SrcsFlags {
   model?: string;
   api?: string;
   project?: string;
+  agent?: boolean;
 }
 
 const SUPPORTED_TOOLS = ["claude", "codex"] as const;
@@ -103,6 +105,12 @@ export async function runSrcs(flags: SrcsFlags): Promise<void> {
   const model = flags.model ?? "";
 
   if ((SUPPORTED_TOOLS as readonly string[]).includes(model)) {
+    if (flags.agent) {
+      console.error(
+        chalk.red("--agent is only supported with --model ollama:<name>"),
+      );
+      process.exit(1);
+    }
     await runSupportedTool(model as SupportedTool);
     return;
   }
@@ -115,7 +123,11 @@ export async function runSrcs(flags: SrcsFlags): Promise<void> {
       );
       process.exit(1);
     }
-    await runOllamaChat(ollamaModel, flags);
+    if (flags.agent) {
+      await runOllamaAgent(ollamaModel, flags);
+    } else {
+      await runOllamaChat(ollamaModel, flags);
+    }
     return;
   }
 
