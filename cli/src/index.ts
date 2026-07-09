@@ -8,6 +8,7 @@ import { runStatus } from "./commands/status.js";
 import { runIngest } from "./commands/ingest.js";
 import { runGraph } from "./commands/graph.js";
 import { runSrcs } from "./commands/srcs.js";
+import { runWatch } from "./commands/watch.js";
 
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json") as { version: string };
@@ -90,9 +91,23 @@ program
       runSrcs({ ...program.opts(), ...options }),
   );
 
-program.parseAsync(process.argv).catch((error: unknown) => {
-  console.error(
-    chalk.red(error instanceof Error ? error.message : String(error)),
+program
+  .command("watch <repo-path>")
+  .description(
+    "watch a repo and incrementally re-ingest it via the API on file changes",
+  )
+  .option(
+    "--debounce <seconds>",
+    "seconds to wait after the last change before re-ingesting",
+    "3",
+  )
+  .option(
+    "--no-describe",
+    "ingest without LLM descriptions on each cycle — the summary vector " +
+      "stays empty; search quality is reduced",
+  )
+  .action(
+    (repoPath: string, options: { debounce?: string; describe: boolean }) =>
+      runWatch(repoPath, { ...program.opts(), ...options }),
   );
-  process.exit(1);
-});
+
