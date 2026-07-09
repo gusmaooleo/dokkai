@@ -11,7 +11,10 @@ stderr via the module logger below.
 
 from __future__ import annotations
 
+import atexit
+import functools
 import logging
+import os
 import sys
 
 from dotenv import load_dotenv
@@ -31,14 +34,75 @@ from services.graph_store import resolve_file
 from services.retriever import Retriever
 from services.weaviate_client import count_chunks_by_project, get_client
 
+# DOKKAI_MCP_PROFILE unset (default) keeps the original instructions; "small-model"
+# swaps in a more directive, anti-loop variant for small local models (observed
+# to loop/re-call tools without it — see scripts/mcp_harness.py's SYSTEM_PROMPT
+# for the same phrasing pattern proven there).
+_INSTRUCTIONS_DEFAULT = (
+    "Explore an ingested codebase: start with search(query) to find seed entities, "
+    "then use neighbors()/get_entity() to explore call graph and read code, and "
+    "get_file() for raw file ranges. Use context() for a one-shot answer bundle."
+)
+_INSTRUCTIONS_SMALL_MODEL = (
+    "Explore an ingested codebase. Call ONE tool, then check if its result already "
+    "answers the question. Start with search(query) or context(query) for seed "
+    "entities, grep_project(pattern) for a known identifier, neighbors()/get_entity() "
+    "for call graph and code, get_file() for raw ranges. Never call the same tool "
+    "with the same arguments twice. As soon as you have enough information, STOP "
+    "calling tools and answer as plain text."
+)
+_MCP_PROFILE = os.getenv("DOKKAI_MCP_PROFILE")
+
 mcp = FastMCP(
     "dokkai",
     instructions=(
-        "Explore an ingested codebase: start with search(query) to find seed entities, "
-        "then use neighbors()/get_entity() to explore call graph and read code, and "
-        "get_file() for raw file ranges. Use context() for a one-shot answer bundle."
+        _INSTRUCTIONS_SMALL_MODEL if _MCP_PROFILE == "small-model" else _INSTRUCTIONS_DEFAULT
     ),
 )
+
+
+# ---------------------------------------------------------------------------
+# Session watchdog — always-on, stderr-only per-tool usage summary
+# ---------------------------------------------------------------------------
+
+_watchdog_stats: dict[str, dict[str, int]] = {}
+
+
+def _watchdog(fn):
+    """Wrap a tool function to accumulate its call count and response chars
+    into ``_watchdog_stats``, centrally instead of by hand in every tool."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        stats = _watchdog_stats.setdefault(fn.__name__, {"calls": 0, "chars": 0})
+        stats["calls"] += 1
+        result = fn(*args, **kwargs)
+        if isinstance(result, str):
+            stats["chars"] += len(result)
+        return result
+
+    return wrapper
+
+
+def _print_watchdog_summary() -> None:
+    """Print the per-session tool usage summary to stderr at shutdown."""
+    if not _watchdog_stats:
+        return
+    lines = ["", "=" * 60, "dokkai MCP session summary", "=" * 60]
+    total_calls = total_chars = 0
+    for name in sorted(_watchdog_stats):
+        s = _watchdog_stats[name]
+        tokens = s["chars"] // 4
+        lines.append(f"{name:<14} calls={s['calls']:<4} chars={s['chars']:<8} ~tokens={tokens}")
+        total_calls += s["calls"]
+        total_chars += s["chars"]
+    lines.append("-" * 60)
+    lines.append(f"{'TOTAL':<14} calls={total_calls:<4} chars={total_chars:<8} ~tokens={total_chars // 4}")
+    lines.append("=" * 60)
+    logger.info("\n".join(lines))
+
+
+atexit.register(_print_watchdog_summary)
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +138,7 @@ def _resolve_project(project: str | None) -> str:
 
 
 @mcp.tool()
+@_watchdog
 def list_projects() -> str:
     """List ingested projects with chunk counts and graph size.
     Use this first when the project name is unknown."""
@@ -103,6 +168,7 @@ def list_projects() -> str:
 
 
 @mcp.tool()
+@_watchdog
 def search(query: str, project: str | None = None, k: int = 8) -> str:
     """Hybrid (semantic + keyword) search for code entities matching a query.
     Returns ranked hits with qname, location and score."""
@@ -132,6 +198,36 @@ def search(query: str, project: str | None = None, k: int = 8) -> str:
 
 
 @mcp.tool()
+@_watchdog
+def grep_project(pattern: str, project: str | None = None, k: int = 10) -> str:
+    """Literal keyword search (BM25 over code text, NOT regex) for a known
+    identifier. Returns ranked hits with qname, location and BM25 score."""
+    if k < 1:
+        raise ValueError("k must be >= 1")
+    resolved = _resolve_project(project)
+    if not pattern.strip():
+        return f"no matches for '{pattern}' in project '{resolved}'"
+    client = get_client()
+    try:
+        chunks = Retriever(client).search_bm25(pattern, project_name=resolved, top_k=k)
+    finally:
+        client.close()
+
+    if not chunks:
+        return f"no matches for '{pattern}' in project '{resolved}'"
+
+    lines = []
+    for i, c in enumerate(chunks, 1):
+        loc = c.absolute_path or c.file_path
+        if c.start_line is not None and c.end_line is not None:
+            loc += f":{c.start_line}-{c.end_line}"
+        score = f"{c.score:.2f}" if c.score is not None else "n/a"
+        lines.append(f"{i}. [{c.entity_type}] {c.qualified_name} — {loc} (score {score})")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+@_watchdog
 def get_entity(qualified_name: str, project: str | None = None) -> str:
     """Fetch a single code entity by exact qualified_name: relations, summary
     and source. Call search() first to find the qualified_name."""
@@ -176,6 +272,7 @@ def get_entity(qualified_name: str, project: str | None = None) -> str:
 
 
 @mcp.tool()
+@_watchdog
 def neighbors(
     qualified_name: str,
     project: str | None = None,
@@ -219,6 +316,7 @@ def neighbors(
 
 
 @mcp.tool()
+@_watchdog
 def context(query: str, project: str | None = None, k: int = 8) -> str:
     """One-shot graph-expanded context for a query: seeds plus their call-graph
     neighbors, formatted for direct use as LLM context."""
@@ -239,6 +337,7 @@ _MAX_FILE_BYTES = 100_000
 
 
 @mcp.tool()
+@_watchdog
 def get_file(
     path: str,
     project: str | None = None,

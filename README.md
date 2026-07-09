@@ -53,10 +53,22 @@ Dokkai's core deliverable is a **stdio MCP server** (`dokkai`, `src/mcp_server.p
 | --- | --- | --- | --- |
 | `list_projects` | – | Ingested projects with chunk counts, node/edge counts, `generated_at` | ~105 chars |
 | `search` | `query`, `project?`, `k=8` | Ranked hits — qualified_name, entity type, absolute `path:lines`, score, truncated description | ~2.7k chars (~680 tok) at `k=8` |
+| `grep_project` | `pattern`, `project?`, `k=10` | Literal keyword search — BM25 over stored code text (tokenized, **not regex**) for a known identifier; ranked hits with qualified_name, entity type, absolute `path:lines`, BM25 score; clean "no matches" string on a blank pattern or no hits | ~800 chars (~200 tok) at `k=10` |
 | `get_entity` | `qualified_name`, `project?` | One entity's relations (calls/called_by/inherits/implements/overrides/methods), summary and full source | ~0.5–1.6k chars |
 | `neighbors` | `qualified_name`, `project?`, `direction=both`, `depth=1`, `limit=30` | Graph neighborhood (calls/inherits/implements/overrides/defines) as a node list + edge list, BFS up to `depth` hops | ~0.6k chars |
 | `context` | `query`, `project?`, `k=8` | One-shot seed + graph-expanded context bundle, ready to use as LLM context, capped at 10,000 chars | ≤10k chars (~2.5k tok) |
 | `get_file` | `path`, `project?`, `start_line?`, `end_line?` | Raw file content, optionally a 1-indexed inclusive line range; capped at 2,000 lines / 100 KB per call (with a truncation note) | file-dependent |
+
+### Instructions profile
+
+The server's `instructions` string (sent to the MCP client, shaping how the model uses the tools) has two variants, selected by the `DOKKAI_MCP_PROFILE` env var — the tool contracts (names, parameters, return shapes) are **identical** in both:
+
+- **Unset (default)** — the original, concise instructions.
+- **`small-model`** — a more directive, anti-loop variant aimed at 3B‑class local models, which the harness (`scripts/mcp_harness.py`) showed can otherwise loop or re-call tools with the same arguments; it explicitly points at `grep_project` for known identifiers and tells the model to stop calling tools once it has enough information. Set this when wiring a small local model through the harness or a future SRCS integration (roadmap feature 04).
+
+### Session watchdog
+
+The server always tracks per-tool call counts and response sizes for the running session and prints a summary (per-tool calls/chars/~tokens plus totals) to stderr on shutdown — no configuration needed. Useful to measure real tool usage against a token budget without instrumenting a client.
 
 ### Measured token budget
 
@@ -203,7 +215,7 @@ Full pipeline run on `saffira_back-end` (medium TS/Python backend), local Ollama
 - ✅ 100% local: Weaviate + Ollama (embeddings **and** generation)
 - ✅ Pluggable providers — LLM: Ollama / OpenAI / Anthropic · embeddings: Ollama / OpenAI / Cohere
 - ✅ Auto‑configure + warm the chat model on startup (no cold starts)
-- ✅ **MCP server** — 6 tools (search, graph navigation, entity/file lookup) for Claude Code, Codex and any stdio MCP client (see [MCP server](#mcp-server))
+- ✅ **MCP server** — 7 tools (search, literal grep, graph navigation, entity/file lookup) for Claude Code, Codex and any stdio MCP client, with a small-model instructions profile and a session usage watchdog (see [MCP server](#mcp-server))
 
 ---
 
@@ -356,6 +368,7 @@ All configuration is via environment variables (loaded from `.env` at startup).
 | `DESC_CONCURRENCY` | `4` | Max concurrent description requests |
 | `RETRIEVAL_TEST_PENALTY` | `0.35` | Score multiplier applied to test-file results during retrieval |
 | `DOKKAI_RECREATE_COLLECTION` | _(unset)_ | If truthy: recreate the Weaviate collection instead of failing on schema mismatch |
+| `DOKKAI_MCP_PROFILE` | _(unset)_ | MCP server only. `small-model` swaps the server's instructions for a more directive, anti-loop variant tuned for small local models — see [Instructions profile](#instructions-profile) |
 | `MEMGRAPH_IMAGE` | `memgraph/memgraph:latest` | Image used by `cgr` for graph extraction |
 
 > **Two Ollama endpoints, on purpose:** `OLLAMA_EMBED_ENDPOINT` is called by the Weaviate **container** (so it needs `host.docker.internal`), while `OLLAMA_BASE_URL` is called by the **API process** on the host (so it's `localhost`).
@@ -466,6 +479,7 @@ These are known and tracked in the [Roadmap](#roadmap):
 | 09 | Code review & bug‑hunt routines | planned |
 | 10 | Documentation site (en/pt/zh/es) | planned |
 | 11 | Post‑01 polish (live provider model catalogs, stage‑level job progress, describe refresh endpoint) | ✅ done |
+| 12 | MCP polish (`grep_project` tool, small-model instructions profile, session watchdog) | ✅ done (pending merge) |
 
 ### Retrieval quality
 
