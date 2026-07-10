@@ -2,7 +2,7 @@
   "info": {
     "name": "Dokkai API",
     "_postman_id": "d0kka1-0000-4000-8000-000000000001",
-    "description": "HTTP API for Dokkai — a graph-aware vector database over a codebase.\n\nEvery route except Health, Auth → Login and Auth → Status requires a bearer token (see the Auth folder). Auth cannot be disabled.\n\nUsage order:\n1. Auth → Login (default admin/admin on first boot; captures {{authToken}} automatically and applies it to every other request via the collection's bearer auth).\n2. Config → Set LLM provider (or set OLLAMA_CHAT_MODEL on the server). Requires the admin role.\n3. Instances → Start pipeline (captures {{jobId}} automatically).\n4. Instances → Get job (poll until status = succeeded), or Job events (SSE) to stream progress.\n5. Chat → Chat (SSE): note Postman shows the raw event stream. Requires the admin or user role.\n6. Graph → List graphs / Get project graph / Get entity neighborhood / Get file dependency view, once a project is ingested.\n7. Routines → Launch review run (captures {{runId}}/{{jobId}} automatically), then Get routine run to poll for findings/summary once status is done. kind: bughunt currently 400s -- arrives in a later release.\n\nRoles: admin (everything, incl. user management and POST /config/llm), user (chat, ingestion, deletes, review-run launch/delete, all reads), viewer (read-only GETs only). A role that can't perform an action gets 403 \"role '<role>' cannot perform this action\".\n\nNote: only one pipeline/refresh/graph/review job may run per project at a time — a second one returns 409 (see the '409 - job already running' saved examples).\n\nCollection variables let you avoid editing every request: set {{baseUrl}}, {{repoPath}}, {{projectName}} once.",
+    "description": "HTTP API for Dokkai — a graph-aware vector database over a codebase.\n\nEvery route except Health, Auth → Login and Auth → Status requires a bearer token (see the Auth folder). Auth cannot be disabled.\n\nUsage order:\n1. Auth → Login (default admin/admin on first boot; captures {{authToken}} automatically and applies it to every other request via the collection's bearer auth).\n2. Config → Set LLM provider (or set OLLAMA_CHAT_MODEL on the server). Requires the admin role.\n3. Instances → Start pipeline (captures {{jobId}} automatically).\n4. Instances → Get job (poll until status = succeeded), or Job events (SSE) to stream progress.\n5. Chat → Chat (SSE): note Postman shows the raw event stream. Requires the admin or user role.\n6. Graph → List graphs / Get project graph / Get entity neighborhood / Get file dependency view, once a project is ingested.\n7. Routines → Launch review run or Launch bug hunt run (captures {{runId}}/{{jobId}} automatically), then Get routine run to poll for findings/summary once status is done. Bug hunt requires an Ollama-resolved provider in this release (see its saved 400 example). Routines → Playbooks / Routines → Skills manage the reusable documents a run can attach: playbooks are pushed by name (at most 4); skills are pulled by the model itself from the full catalog every run (at most 3), never named at launch.\n\nRoles: admin (everything, incl. user management and POST /config/llm), user (chat, ingestion, deletes, routine-run launch/delete, playbook/skill writes, all reads), viewer (read-only GETs only). A role that can't perform an action gets 403 \"role '<role>' cannot perform this action\".\n\nNote: only one pipeline/refresh/graph/routine job may run per project at a time — a second one returns 409 (see the '409 - job already running' saved examples).\n\nCollection variables let you avoid editing every request: set {{baseUrl}}, {{repoPath}}, {{projectName}} once.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -22,7 +22,9 @@
     { "key": "userId", "value": "", "type": "string" },
     { "key": "targetRef", "value": "feature/my-branch", "type": "string" },
     { "key": "baseRef", "value": "", "type": "string" },
-    { "key": "runId", "value": "", "type": "string" }
+    { "key": "runId", "value": "", "type": "string" },
+    { "key": "playbookName", "value": "security-basics", "type": "string" },
+    { "key": "skillName", "value": "sql-injection-review", "type": "string" }
   ],
   "item": [
     {
@@ -884,7 +886,7 @@
               "host": ["{{baseUrl}}"],
               "path": ["routines", "runs"]
             },
-            "description": "Requires the admin or user role. Launches a code review run as a background job (kind: bughunt 400s -- arrives in a later release). Returns 202 { run_id, job_id } immediately.\n\nbase_ref defaults to the project's default base branch (origin/HEAD, else local main/master) when omitted. model/provider (both optional) override the active LLM config for this run only.\n\nModel resolution -- no hardcoded default: model/provider in the body, else the active POST /config/llm config; if neither resolves to a usable provider+model, 400 with the 'no LLM configured' message (see the saved example).\n\nPre-flights (in order, before any job is created): project must have an ingested graph (404), repo_path must be a git repo (400), base_ref/target_ref must resolve (400), the resolved LLM must be healthy (400).\n\nShares the same per-project job lock as /instances/pipeline, /instances/graph and /instances/{project}/describe -- 409 if a job is already running for this project (see the '409 - job already running' saved example). The test script saves run_id into {{runId}} and job_id into {{jobId}}."
+            "description": "Requires the admin or user role. Launches a code review run as a background job. Returns 202 { run_id, job_id } immediately. See also 'Launch bug hunt run' for kind: bughunt.\n\nbase_ref defaults to the project's default base branch (origin/HEAD, else local main/master) when omitted. model/provider (both optional) override the active LLM config for this run only. playbooks (optional, at most 4) pushes named playbooks into the prompt -- see the Playbooks folder.\n\nModel resolution -- no hardcoded default: model/provider in the body, else the active POST /config/llm config; if neither resolves to a usable provider+model, 400 with the 'no LLM configured' message (see the saved example).\n\nPre-flights (in order, before any job is created): project must have an ingested graph (404), repo_path must be a git repo (400), base_ref/target_ref must resolve (400), every named playbook must exist and apply to kind: review (400), the resolved LLM must be healthy (400).\n\nShares the same per-project job lock as /instances/pipeline, /instances/graph and /instances/{project}/describe -- 409 if a job is already running for this project (see the '409 - job already running' saved example). The test script saves run_id into {{runId}} and job_id into {{jobId}}."
           },
           "response": [
             {
@@ -910,13 +912,13 @@
               "body": "{\n  \"detail\": \"No LLM provider configured for this review. POST to /config/llm to set one up, or pass model/provider in the launch payload.\"\n}"
             },
             {
-              "name": "400 - bughunt not yet implemented",
+              "name": "400 - playbook not found",
               "originalRequest": {
                 "method": "POST",
                 "header": [{ "key": "Content-Type", "value": "application/json" }],
                 "body": {
                   "mode": "raw",
-                  "raw": "{\n  \"kind\": \"bughunt\",\n  \"project\": \"{{projectName}}\"\n}"
+                  "raw": "{\n  \"kind\": \"review\",\n  \"project\": \"{{projectName}}\",\n  \"target_ref\": \"{{targetRef}}\",\n  \"playbooks\": [\"{{playbookName}}\"]\n}"
                 },
                 "url": {
                   "raw": "{{baseUrl}}/routines/runs",
@@ -929,7 +931,7 @@
               "_postman_previewlanguage": "json",
               "header": [{ "key": "Content-Type", "value": "application/json" }],
               "cookie": [],
-              "body": "{\n  \"detail\": \"bug hunt routines arrive in a later release\"\n}"
+              "body": "{\n  \"detail\": \"playbook '{{playbookName}}' not found\"\n}"
             },
             {
               "name": "404 - project not ingested",
@@ -992,6 +994,128 @@
               "path": ["routines", "runs"]
             },
             "description": "Same as Launch review run, but with an explicit base_ref and a per-run model/provider override -- these bypass the active POST /config/llm config for just this run. qwen2.5-coder:14b is the recommended local model for review (measured: 3b-class models are not reliable for review judgment)."
+          },
+          "response": []
+        },
+        {
+          "name": "Launch review run (with playbooks)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"kind\": \"review\",\n  \"project\": \"{{projectName}}\",\n  \"target_ref\": \"{{targetRef}}\",\n  \"playbooks\": [\"{{playbookName}}\"]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/routines/runs",
+              "host": ["{{baseUrl}}"],
+              "path": ["routines", "runs"]
+            },
+            "description": "Same as Launch review run, but pushes up to 4 named playbooks into the run's prompt (selection order = priority order). Each name must already exist and must apply to kind: review (a playbook's own routines field) -- validated synchronously at launch, see the 'Launch review run' -> '400 - playbook not found' saved example."
+          },
+          "response": []
+        },
+        {
+          "name": "Launch bug hunt run",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const res = pm.response.json();",
+                  "if (res.run_id) {",
+                  "  pm.collectionVariables.set('runId', res.run_id);",
+                  "  console.log('Saved runId =', res.run_id);",
+                  "}",
+                  "if (res.job_id) {",
+                  "  pm.collectionVariables.set('jobId', res.job_id);",
+                  "  console.log('Saved jobId =', res.job_id);",
+                  "}",
+                  "pm.test('run launched', function () {",
+                  "  pm.expect(res).to.have.property('run_id');",
+                  "  pm.expect(res).to.have.property('job_id');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"kind\": \"bughunt\",\n  \"project\": \"{{projectName}}\",\n  \"scope\": \"look for unhandled errors and resource leaks in the ingestion pipeline\",\n  \"path_prefix\": \"src/services\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/routines/runs",
+              "host": ["{{baseUrl}}"],
+              "path": ["routines", "runs"]
+            },
+            "description": "Requires the admin or user role. Launches a bug-hunt run -- a free-text scope investigated by a bounded (<=12-round) agentic tool loop over the WHOLE project (not a diff) -- as a background job. Returns 202 { run_id, job_id } immediately, same polling shape as a review run.\n\nscope is required (422 if omitted, see the saved example). path_prefix is optional and restricts REPORTED findings to files under that repo-relative prefix; the agent may still read files elsewhere for context.\n\nOllama-native only in this release: if the resolved provider (launch payload or active config) isn't ollama, this 400s synchronously (see the '400 - non-Ollama provider' saved example) -- the exact same check the agent loop itself would raise.\n\nHonest quality note: with qwen2.5-coder:14b, roughly half of read-verified findings can still misread the code they cite (e.g. calling an explicit try/catch 'no exception handling'). Verify findings against the evidence trail (tool calls made, cited entities, line anchors) before acting on them -- see the README's Bug hunt section. The test script saves run_id into {{runId}} and job_id into {{jobId}}."
+          },
+          "response": [
+            {
+              "name": "422 - scope missing",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"kind\": \"bughunt\",\n  \"project\": \"{{projectName}}\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/routines/runs",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["routines", "runs"]
+                }
+              },
+              "status": "Unprocessable Entity",
+              "code": 422,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": [\n    {\n      \"loc\": [\"body\"],\n      \"msg\": \"Value error, scope is required for bug hunt routines\",\n      \"type\": \"value_error\"\n    }\n  ]\n}"
+            },
+            {
+              "name": "400 - non-Ollama provider",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"kind\": \"bughunt\",\n  \"project\": \"{{projectName}}\",\n  \"scope\": \"audit the auth module for privilege-escalation bugs\",\n  \"provider\": \"openai\",\n  \"model\": \"gpt-4o-mini\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/routines/runs",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["routines", "runs"]
+                }
+              },
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"bug hunt requires Ollama-native tool calling in this release — provider 'openai' is not supported yet\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Launch bug hunt run (with playbooks + model override)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"kind\": \"bughunt\",\n  \"project\": \"{{projectName}}\",\n  \"scope\": \"audit the auth module for privilege-escalation bugs\",\n  \"playbooks\": [\"{{playbookName}}\"],\n  \"model\": \"qwen2.5-coder:14b\",\n  \"provider\": \"ollama\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/routines/runs",
+              "host": ["{{baseUrl}}"],
+              "path": ["routines", "runs"]
+            },
+            "description": "Same as Launch bug hunt run, but pushes up to 4 named playbooks (each must apply to kind: bughunt) and overrides the model/provider for just this run -- must still resolve to ollama, see 'Launch bug hunt run' -> '400 - non-Ollama provider'."
           },
           "response": []
         },
@@ -1071,6 +1195,458 @@
             "description": "Requires any authenticated role. Local branches of the project's repository (current branch and most-recently-committed first) plus the resolved default_base. 404 if the project has no ingested graph; 400 if repo_path isn't a git repo or no default base branch could be determined."
           },
           "response": []
+        }
+      ]
+    },
+    {
+      "name": "Playbooks",
+      "item": [
+        {
+          "name": "List playbooks",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/routines/playbooks",
+              "host": ["{{baseUrl}}"],
+              "path": ["routines", "playbooks"]
+            },
+            "description": "Requires any authenticated role. Lists playbooks -- omits content in favor of content_bytes; use Get playbook for the full content."
+          },
+          "response": []
+        },
+        {
+          "name": "Create playbook",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "  pm.test('playbook created', function () {",
+                  "    pm.expect(pm.response.json()).to.have.property('name');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"{{playbookName}}\",\n  \"content\": \"# Security basics\\n\\n- Never log secrets.\\n- Validate all external input.\",\n  \"routines\": [\"review\", \"bughunt\"]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/routines/playbooks",
+              "host": ["{{baseUrl}}"],
+              "path": ["routines", "playbooks"]
+            },
+            "description": "Requires the admin or user role. routines defaults to [\"review\", \"bughunt\"] (both) when omitted. content is markdown, up to 16KB, optional leading YAML frontmatter (stored/returned verbatim, not parsed). name must be non-empty, <=128 chars, no leading/trailing whitespace, and no '/', '\\\\', or control characters (it's a REST path segment)."
+          },
+          "response": [
+            {
+              "name": "409 - name already exists",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"name\": \"{{playbookName}}\",\n  \"content\": \"# Security basics\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/routines/playbooks",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["routines", "playbooks"]
+                }
+              },
+              "status": "Conflict",
+              "code": 409,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"playbook '{{playbookName}}' already exists\"\n}"
+            },
+            {
+              "name": "400 - name has a slash",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"name\": \"security/basics\",\n  \"content\": \"# Security basics\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/routines/playbooks",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["routines", "playbooks"]
+                }
+              },
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"name must not contain slashes or control characters\"\n}"
+            },
+            {
+              "name": "400 - content exceeds 16KB",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"name\": \"huge-playbook\",\n  \"content\": \"<17000+ bytes>\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/routines/playbooks",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["routines", "playbooks"]
+                }
+              },
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"playbook content exceeds the 16KB limit (17000 bytes)\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Get playbook",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/routines/playbooks/{{playbookName}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["routines", "playbooks", "{{playbookName}}"]
+            },
+            "description": "Requires any authenticated role. A playbook's full detail, content included."
+          },
+          "response": [
+            {
+              "name": "404 - playbook not found",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/routines/playbooks/{{playbookName}}",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["routines", "playbooks", "{{playbookName}}"]
+                }
+              },
+              "status": "Not Found",
+              "code": 404,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"playbook '{{playbookName}}' not found\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Update playbook",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"routines\": [\"bughunt\"]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/routines/playbooks/{{playbookName}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["routines", "playbooks", "{{playbookName}}"]
+            },
+            "description": "Requires the admin or user role. Updates content and/or routines -- fields left unset are left unchanged."
+          },
+          "response": [
+            {
+              "name": "404 - playbook not found",
+              "originalRequest": {
+                "method": "PATCH",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"routines\": [\"bughunt\"]\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/routines/playbooks/{{playbookName}}",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["routines", "playbooks", "{{playbookName}}"]
+                }
+              },
+              "status": "Not Found",
+              "code": 404,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"playbook '{{playbookName}}' not found\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Delete playbook",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/routines/playbooks/{{playbookName}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["routines", "playbooks", "{{playbookName}}"]
+            },
+            "description": "Requires the admin or user role."
+          },
+          "response": [
+            {
+              "name": "404 - playbook not found",
+              "originalRequest": {
+                "method": "DELETE",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/routines/playbooks/{{playbookName}}",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["routines", "playbooks", "{{playbookName}}"]
+                }
+              },
+              "status": "Not Found",
+              "code": 404,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"playbook '{{playbookName}}' not found\"\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Skills",
+      "item": [
+        {
+          "name": "List skills",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/routines/skills",
+              "host": ["{{baseUrl}}"],
+              "path": ["routines", "skills"]
+            },
+            "description": "Requires any authenticated role. Lists skills -- omits content in favor of content_bytes; use Get skill for the full content."
+          },
+          "response": []
+        },
+        {
+          "name": "Create skill",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "  pm.test('skill created', function () {",
+                  "    pm.expect(pm.response.json()).to.have.property('name');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"{{skillName}}\",\n  \"description\": \"How to spot SQL injection in raw-query code paths.\",\n  \"content\": \"# SQL injection review\\n\\nLook for string-concatenated queries...\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/routines/skills",
+              "host": ["{{baseUrl}}"],
+              "path": ["routines", "skills"]
+            },
+            "description": "Requires the admin or user role. description is what a run's own model sees in the skills catalog when deciding whether to load this skill (keep it short and relevance-scoped) -- there is no launch-time field for skills, they are model-PULLED every run (contrast with playbooks, which are pushed by name). content is markdown, up to 16KB, optional leading YAML frontmatter."
+          },
+          "response": [
+            {
+              "name": "409 - name already exists",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"name\": \"{{skillName}}\",\n  \"description\": \"...\",\n  \"content\": \"...\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/routines/skills",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["routines", "skills"]
+                }
+              },
+              "status": "Conflict",
+              "code": 409,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"skill '{{skillName}}' already exists\"\n}"
+            },
+            {
+              "name": "400 - empty description",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"name\": \"empty-desc-skill\",\n  \"description\": \"   \",\n  \"content\": \"...\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/routines/skills",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["routines", "skills"]
+                }
+              },
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"description must not be empty\"\n}"
+            },
+            {
+              "name": "400 - content exceeds 16KB",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"name\": \"huge-skill\",\n  \"description\": \"...\",\n  \"content\": \"<17000+ bytes>\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/routines/skills",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["routines", "skills"]
+                }
+              },
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"skill content exceeds the 16KB limit (17000 bytes)\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Get skill",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/routines/skills/{{skillName}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["routines", "skills", "{{skillName}}"]
+            },
+            "description": "Requires any authenticated role. A skill's full detail, content included."
+          },
+          "response": [
+            {
+              "name": "404 - skill not found",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/routines/skills/{{skillName}}",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["routines", "skills", "{{skillName}}"]
+                }
+              },
+              "status": "Not Found",
+              "code": 404,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"skill '{{skillName}}' not found\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Update skill",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"description\": \"How to spot SQL injection and command injection in raw-query code paths.\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/routines/skills/{{skillName}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["routines", "skills", "{{skillName}}"]
+            },
+            "description": "Requires the admin or user role. Updates description and/or content -- fields left unset are left unchanged."
+          },
+          "response": [
+            {
+              "name": "404 - skill not found",
+              "originalRequest": {
+                "method": "PATCH",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"description\": \"...\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/routines/skills/{{skillName}}",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["routines", "skills", "{{skillName}}"]
+                }
+              },
+              "status": "Not Found",
+              "code": 404,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"skill '{{skillName}}' not found\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Delete skill",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/routines/skills/{{skillName}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["routines", "skills", "{{skillName}}"]
+            },
+            "description": "Requires the admin or user role."
+          },
+          "response": [
+            {
+              "name": "404 - skill not found",
+              "originalRequest": {
+                "method": "DELETE",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/routines/skills/{{skillName}}",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["routines", "skills", "{{skillName}}"]
+                }
+              },
+              "status": "Not Found",
+              "code": 404,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"skill '{{skillName}}' not found\"\n}"
+            }
+          ]
         }
       ]
     },

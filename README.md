@@ -17,6 +17,8 @@ Everything runs **100% locally** — Weaviate for vectors, Ollama for both embed
 - [CLI](#cli)
 - [Frontend UI](#frontend-ui)
 - [Code review routines](#code-review-routines)
+  - [Bug hunt](#bug-hunt)
+  - [Playbooks & skills](#playbooks--skills)
 - [How it works](#how-it-works)
 - [Descriptions (Tier 2)](#descriptions-tier-2)
 - [Features](#features)
@@ -289,11 +291,11 @@ configured LLM for per-file findings (severity, category, an anchored line
 range when the model's `start_line` falls inside a changed range, and an
 optional fix suggestion), then writes a markdown summary of the whole run.
 
-This is **sub-part A** of the feature — the review routine itself. Bug hunt
-(`kind: "bughunt"`), project-specific review playbooks/skills, and a
-dedicated UI screen are specced but not yet implemented; they arrive in the
-next parts of this feature (`kind: "bughunt"` currently 400s with
-`"bug hunt routines arrive in a later release"`).
+This is **sub-part B** of the feature (of 3): sub-part A shipped the review
+routine backend; this part adds the bug-hunt routine
+([Bug hunt](#bug-hunt)) and project-specific playbooks/skills
+([Playbooks & skills](#playbooks--skills)). A dedicated UI screen for all of
+this is sub-part C, still to come.
 
 **Run it** (review runs as a background job on the same shared job system as
 ingestion — see [API reference](#api-reference)):
@@ -372,6 +374,132 @@ that project returns `409 another job is running for project '<project>'`.
 (`DELETE /routines/runs/{id}`) require `admin` or `user`; all `GET` routes
 (list, detail, branches) are open to any authenticated role, including
 `viewer`.
+
+### Bug hunt
+
+`kind: "bughunt"` runs a free-text investigation over the **whole** ingested
+project (not a diff): a bounded in-process agentic tool loop (≤12 rounds)
+gives the model `search`, `grep_project`, `get_entity`, `neighbors`,
+`get_file` and `load_skill` tools over the project graph/Weaviate corpus, and
+the model decides for itself what to look at, based on the `scope` you give
+it. It never scores or ranks anything by graph metrics (centrality, fan-in,
+etc.) — every finding must trace back to a tool call the model actually made.
+
+```bash
+curl -X POST localhost:8000/routines/runs \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{
+    "kind": "bughunt",
+    "project": "your-repo",
+    "scope": "look for unhandled errors and resource leaks in the ingestion pipeline",
+    "path_prefix": "src/services",
+    "playbooks": ["security-basics"]
+  }'
+# -> 202 {"run_id":"...", "job_id":"..."}
+```
+
+`scope` is required (422 if omitted) — a free-text description of what to
+investigate. `path_prefix` is optional: it restricts *reported* findings to
+files under that repo-relative prefix, but the agent may still read files
+outside it for context. `playbooks`/`model`/`provider` work the same as for
+`kind: "review"` (see [Playbooks & skills](#playbooks--skills) and the
+model-resolution note above).
+
+**Ollama-native only in this release.** The agentic tool-calling loop uses
+Ollama's native `tools=`/`tool_calls` mechanism — there is no bug-hunt
+equivalent of review's provider-agnostic single-shot analyze call yet. If
+the resolved provider (from the launch payload or the active config) isn't
+`ollama`, the launch fails synchronously with **HTTP 400**:
+
+```
+bug hunt requires Ollama-native tool calling in this release — provider '<name>' is not supported yet
+```
+
+**Evidence and anchoring.** Every raw finding from the model's JSON verdict
+is validated against the project graph/repo before it's stored: a
+`file_path` that matches neither a graph node nor a file on disk is dropped
+as a hallucination (including absolute paths and `../` traversal attempts,
+which are rejected outright); `anchored: true` only when the cited
+`start_line` falls inside a real code-entity's line span in the graph —
+otherwise the finding is kept with `anchored: false` (never dropped just for
+that). A mechanical **read-before-report** guard runs after the model's
+first verdict: if it reported findings without ever calling `get_entity` or
+`get_file`, the run pushes back once ("you have not read the actual code —
+go verify") before accepting the corrected answer; `stats.pushback_used`
+records whether that happened. If the model's final answer still isn't
+parseable JSON after one reformat retry, the run doesn't fail — it
+*degrades* to `status: "done"` with zero findings and the raw agent answer
+preserved verbatim in `summary` (prefixed `"agent answer (unparsed): "`) and
+`stats.parse_failures: 1`.
+
+**Honest quality limitation.** Bug-hunt finding quality is bounded by the
+local model's own code-reading comprehension, not just by the tools it's
+given. Measured with `qwen2.5-coder:14b`, roughly **half** of
+read-verified findings (i.e. findings backed by an actual `get_entity`/
+`get_file` call) can still misinterpret the code they cite — for example,
+calling an explicit `try`/`catch` block "no exception handling". The
+read-before-report guard trades recall for fewer unverified claims, but it
+does not fix misreadings of code the model *did* read. The evidence trail
+(tool calls made, cited entities, line anchors) exists precisely so you can
+verify a finding against the real code before acting on it — treat bug-hunt
+output as a lead, not a verdict. A larger local model, or a remote provider
+via the per-run `model`/`provider` override (once a non-Ollama loop ships),
+raises this ceiling; for now:
+
+```bash
+ollama pull qwen2.5-coder:14b   # same recommendation as review — see above
+```
+
+### Playbooks & skills
+
+Two kinds of reusable, markdown document that a routine run can pull in,
+stored via `POST/GET/PATCH/DELETE /routines/playbooks` and
+`/routines/skills` (16KB content limit each, optional leading YAML
+frontmatter stored/returned verbatim but not parsed by the API):
+
+- **Playbooks are PUSHED.** You name them explicitly in a run's `playbooks`
+  launch field (selection order = priority order); at most 4 per run. Each
+  playbook has a `routines` field (`["review"]`, `["bughunt"]`, or both —
+  defaults to both) and is rejected at launch (`400`) if it doesn't apply to
+  the kind you're launching, or doesn't exist.
+- **Skills are PULLED.** There is no launch field for them — every run sees
+  the full `{name, description}` catalog and the model itself picks at most
+  3 relevant ones by name (review: one small selection call up front, over a
+  diffstat; bug hunt: a `load_skill(name)` tool it can call mid-investigation).
+  Injected content is budgeted so neither crowds out the other: playbooks
+  get 12k chars in both routines; skills get 8k in review's analyze prompt,
+  while bug-hunt skill loads count against the agent's overall 20k tool
+  payload budget.
+
+```bash
+# Create a playbook (applies to both routine kinds by default)
+curl -X POST localhost:8000/routines/playbooks \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"security-basics","content":"# Security basics\n\n- ...","routines":["review","bughunt"]}'
+
+# Create a skill (description is what the model sees when deciding whether to load it)
+curl -X POST localhost:8000/routines/skills \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"sql-injection-review","description":"How to spot SQL injection in raw-query code paths.","content":"..."}'
+```
+
+| Method | Endpoint | Auth | Description |
+| --- | --- | --- | --- |
+| `GET` | `/routines/playbooks` | any | List playbooks — omits `content`, adds `content_bytes` |
+| `GET` | `/routines/playbooks/{name}` | any | A playbook's full detail, `content` included |
+| `POST` | `/routines/playbooks` | admin, user | Create a playbook (`name`, `content`, optional `routines`) |
+| `PATCH` | `/routines/playbooks/{name}` | admin, user | Update `content`/`routines` — fields left unset are unchanged |
+| `DELETE` | `/routines/playbooks/{name}` | admin, user | Delete a playbook |
+| `GET` | `/routines/skills` | any | List skills — omits `content`, adds `content_bytes` |
+| `GET` | `/routines/skills/{name}` | any | A skill's full detail, `content` included |
+| `POST` | `/routines/skills` | admin, user | Create a skill (`name`, `description`, `content`) |
+| `PATCH` | `/routines/skills/{name}` | admin, user | Update `description`/`content` — fields left unset are unchanged |
+| `DELETE` | `/routines/skills/{name}` | admin, user | Delete a skill |
+
+`name` must be non-empty, ≤128 chars, no leading/trailing whitespace, and
+must not contain `/`, `\`, or control characters (it's a REST path segment).
+A duplicate `name` on create returns `409`; an unknown `name` on get/patch/
+delete returns `404`.
 
 ---
 
@@ -464,7 +592,7 @@ Full pipeline run on `saffira_back-end` (medium TS/Python backend), local Ollama
 - ✅ **Graph-only ingestion** (`POST /instances/graph`, `dokkai graph`) — run just `cgr` with no LLM/Weaviate involved
 - ✅ **Authentication** — always-on, Grafana-style bearer-token auth with 3 roles (admin/user/viewer), a default `admin`/`admin` seed overridable via env, and CLI auto-login (see [Authentication](#authentication))
 - ✅ **Frontend UI** — Next.js web app: streaming chat with sources, interactive dependency graph, conversation history, ingestion/job monitoring, LLM config and user administration, role-gated (see [Frontend UI](#frontend-ui))
-- 🚧 **Code review routines** — branch-vs-base review with graph-aware context, anchored findings and a markdown summary, run as a background job over the shared job system (sub-part A; bug hunt/playbooks/UI to come — see [Code review routines](#code-review-routines))
+- 🚧 **Code review & bug-hunt routines** — branch-vs-base review and free-text bug-hunt investigations (agentic tool loop, Ollama-native), both with graph-anchored findings, pushable playbooks and model-pulled skills, run as background jobs over the shared job system (sub-parts A+B; dedicated UI still to come — see [Code review routines](#code-review-routines))
 
 ---
 
@@ -721,11 +849,21 @@ curl -X DELETE localhost:8000/auth/users/2 -H "Authorization: Bearer $TOKEN"
 | `GET` | `/graph/{project}` | any | Full project graph (code entities by default, `?include=structural` for everything), `?limit=N` |
 | `GET` | `/graph/{project}/neighborhood` | any | BFS neighborhood of an entity — `?entity=<qualified_name>&depth=&direction=&limit=` |
 | `GET` | `/graph/{project}/files` | any | File‑to‑file dependency view (internal files only) |
-| `POST` | `/routines/runs` | admin, user | Launch a code review run (`kind: "review"`) as a background job on the shared job system; `kind: "bughunt"` 400s — arrives in a later sub-part. See [Code review routines](#code-review-routines) |
-| `GET` | `/routines/runs` | any | List review runs, most recent first, each with `severity_counts` |
+| `POST` | `/routines/runs` | admin, user | Launch a code review (`kind: "review"`) or bug-hunt (`kind: "bughunt"`) run as a background job on the shared job system; bug hunt requires an Ollama-resolved LLM (400 otherwise). See [Code review routines](#code-review-routines) |
+| `GET` | `/routines/runs` | any | List routine runs, most recent first, each with `severity_counts` (optional `?project=&kind=`) |
 | `GET` | `/routines/runs/{id}` | any | A run's full detail, including its findings |
 | `DELETE` | `/routines/runs/{id}` | admin, user | Delete a run (cascades to its findings) |
 | `GET` | `/routines/git/branches` | any | A project's local git branches plus its resolved default base branch |
+| `GET` | `/routines/playbooks` | any | List playbooks (summary — `content_bytes`, no `content`) |
+| `GET` | `/routines/playbooks/{name}` | any | A playbook's full detail, `content` included |
+| `POST` | `/routines/playbooks` | admin, user | Create a playbook |
+| `PATCH` | `/routines/playbooks/{name}` | admin, user | Update a playbook's `content`/`routines` |
+| `DELETE` | `/routines/playbooks/{name}` | admin, user | Delete a playbook |
+| `GET` | `/routines/skills` | any | List skills (summary — `content_bytes`, no `content`) |
+| `GET` | `/routines/skills/{name}` | any | A skill's full detail, `content` included |
+| `POST` | `/routines/skills` | admin, user | Create a skill |
+| `PATCH` | `/routines/skills/{name}` | admin, user | Update a skill's `description`/`content` |
+| `DELETE` | `/routines/skills/{name}` | admin, user | Delete a skill |
 | `POST` | `/chat` | admin, user | Chat over the codebase (SSE: `sources` → `token` → `done`) |
 | `GET` | `/chat/conversations` | any | List conversations (persisted in Postgres; 503 if Postgres is unreachable) |
 | `GET` | `/chat/conversations/{id}` | any | Get a conversation's history (503 if Postgres is unreachable) |
@@ -818,7 +956,7 @@ These are known and tracked in the [Roadmap](#roadmap):
 | 06 | Basic auth (root user via env) | ✅ done (pending merge) |
 | 07 | Frontend UI (chat + graph + config) | ✅ done (pending merge) |
 | 08 | PDF ingestion — local NotebookLM | planned |
-| 09 | Code review & bug‑hunt routines | 🚧 in progress (sub-part A of 3 merged — review routine backend; bug hunt, playbooks and UI still to come) |
+| 09 | Code review & bug‑hunt routines | 🚧 in progress (sub-parts A+B of 3 merged — review + bug-hunt routine backends, playbooks & skills; UI still to come, sub-part C) |
 | 10 | Documentation site (en/pt/zh/es) | planned |
 | 11 | Post‑01 polish (live provider model catalogs, stage‑level job progress, describe refresh endpoint) | ✅ done |
 | 12 | MCP polish (`grep_project` tool, small-model instructions profile, session watchdog) | ✅ done (pending merge) |
