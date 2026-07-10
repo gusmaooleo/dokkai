@@ -2,7 +2,7 @@
   "info": {
     "name": "Dokkai API",
     "_postman_id": "d0kka1-0000-4000-8000-000000000001",
-    "description": "HTTP API for Dokkai — a graph-aware vector database over a codebase.\n\nEvery route except Health, Auth → Login and Auth → Status requires a bearer token (see the Auth folder). Auth cannot be disabled.\n\nUsage order:\n1. Auth → Login (default admin/admin on first boot; captures {{authToken}} automatically and applies it to every other request via the collection's bearer auth).\n2. Config → Set LLM provider (or set OLLAMA_CHAT_MODEL on the server). Requires the admin role.\n3. Instances → Start pipeline (captures {{jobId}} automatically).\n4. Instances → Get job (poll until status = succeeded), or Job events (SSE) to stream progress.\n5. Chat → Chat (SSE): note Postman shows the raw event stream. Requires the admin or user role.\n6. Graph → List graphs / Get project graph / Get entity neighborhood / Get file dependency view, once a project is ingested.\n\nRoles: admin (everything, incl. user management and POST /config/llm), user (chat, ingestion, deletes, all reads), viewer (read-only GETs only). A role that can't perform an action gets 403 \"role '<role>' cannot perform this action\".\n\nNote: only one pipeline/refresh job may run per project at a time — a second one returns 409 (see the '409 - job already running' saved examples).\n\nCollection variables let you avoid editing every request: set {{baseUrl}}, {{repoPath}}, {{projectName}} once.",
+    "description": "HTTP API for Dokkai — a graph-aware vector database over a codebase.\n\nEvery route except Health, Auth → Login and Auth → Status requires a bearer token (see the Auth folder). Auth cannot be disabled.\n\nUsage order:\n1. Auth → Login (default admin/admin on first boot; captures {{authToken}} automatically and applies it to every other request via the collection's bearer auth).\n2. Config → Set LLM provider (or set OLLAMA_CHAT_MODEL on the server). Requires the admin role.\n3. Instances → Start pipeline (captures {{jobId}} automatically).\n4. Instances → Get job (poll until status = succeeded), or Job events (SSE) to stream progress.\n5. Chat → Chat (SSE): note Postman shows the raw event stream. Requires the admin or user role.\n6. Graph → List graphs / Get project graph / Get entity neighborhood / Get file dependency view, once a project is ingested.\n7. Routines → Launch review run (captures {{runId}}/{{jobId}} automatically), then Get routine run to poll for findings/summary once status is done. kind: bughunt currently 400s -- arrives in a later release.\n\nRoles: admin (everything, incl. user management and POST /config/llm), user (chat, ingestion, deletes, review-run launch/delete, all reads), viewer (read-only GETs only). A role that can't perform an action gets 403 \"role '<role>' cannot perform this action\".\n\nNote: only one pipeline/refresh/graph/review job may run per project at a time — a second one returns 409 (see the '409 - job already running' saved examples).\n\nCollection variables let you avoid editing every request: set {{baseUrl}}, {{repoPath}}, {{projectName}} once.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -19,7 +19,10 @@
     { "key": "authToken", "value": "", "type": "string" },
     { "key": "rootUsername", "value": "admin", "type": "string" },
     { "key": "rootPassword", "value": "admin", "type": "string" },
-    { "key": "userId", "value": "", "type": "string" }
+    { "key": "userId", "value": "", "type": "string" },
+    { "key": "targetRef", "value": "feature/my-branch", "type": "string" },
+    { "key": "baseRef", "value": "", "type": "string" },
+    { "key": "runId", "value": "", "type": "string" }
   ],
   "item": [
     {
@@ -836,6 +839,236 @@
               "path": ["graph", "{{projectName}}", "files"]
             },
             "description": "Directed file-to-file dependency aggregation, internal files only (external packages/modules excluded, self-loops skipped). Each edge has a total weight and a per relationship-type types breakdown."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Routines",
+      "item": [
+        {
+          "name": "Launch review run",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const res = pm.response.json();",
+                  "if (res.run_id) {",
+                  "  pm.collectionVariables.set('runId', res.run_id);",
+                  "  console.log('Saved runId =', res.run_id);",
+                  "}",
+                  "if (res.job_id) {",
+                  "  pm.collectionVariables.set('jobId', res.job_id);",
+                  "  console.log('Saved jobId =', res.job_id);",
+                  "}",
+                  "pm.test('run launched', function () {",
+                  "  pm.expect(res).to.have.property('run_id');",
+                  "  pm.expect(res).to.have.property('job_id');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"kind\": \"review\",\n  \"project\": \"{{projectName}}\",\n  \"target_ref\": \"{{targetRef}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/routines/runs",
+              "host": ["{{baseUrl}}"],
+              "path": ["routines", "runs"]
+            },
+            "description": "Requires the admin or user role. Launches a code review run as a background job (kind: bughunt 400s -- arrives in a later release). Returns 202 { run_id, job_id } immediately.\n\nbase_ref defaults to the project's default base branch (origin/HEAD, else local main/master) when omitted. model/provider (both optional) override the active LLM config for this run only.\n\nModel resolution -- no hardcoded default: model/provider in the body, else the active POST /config/llm config; if neither resolves to a usable provider+model, 400 with the 'no LLM configured' message (see the saved example).\n\nPre-flights (in order, before any job is created): project must have an ingested graph (404), repo_path must be a git repo (400), base_ref/target_ref must resolve (400), the resolved LLM must be healthy (400).\n\nShares the same per-project job lock as /instances/pipeline, /instances/graph and /instances/{project}/describe -- 409 if a job is already running for this project (see the '409 - job already running' saved example). The test script saves run_id into {{runId}} and job_id into {{jobId}}."
+          },
+          "response": [
+            {
+              "name": "400 - no LLM configured",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"kind\": \"review\",\n  \"project\": \"{{projectName}}\",\n  \"target_ref\": \"{{targetRef}}\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/routines/runs",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["routines", "runs"]
+                }
+              },
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"No LLM provider configured for this review. POST to /config/llm to set one up, or pass model/provider in the launch payload.\"\n}"
+            },
+            {
+              "name": "400 - bughunt not yet implemented",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"kind\": \"bughunt\",\n  \"project\": \"{{projectName}}\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/routines/runs",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["routines", "runs"]
+                }
+              },
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"bug hunt routines arrive in a later release\"\n}"
+            },
+            {
+              "name": "404 - project not ingested",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"kind\": \"review\",\n  \"project\": \"{{projectName}}\",\n  \"target_ref\": \"{{targetRef}}\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/routines/runs",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["routines", "runs"]
+                }
+              },
+              "status": "Not Found",
+              "code": 404,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"no graph found for project 'your-repo' — run POST /instances/pipeline to ingest it\"\n}"
+            },
+            {
+              "name": "409 - job already running",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"kind\": \"review\",\n  \"project\": \"{{projectName}}\",\n  \"target_ref\": \"{{targetRef}}\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/routines/runs",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["routines", "runs"]
+                }
+              },
+              "status": "Conflict",
+              "code": 409,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"another job is running for project 'your-repo'\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Launch review run (explicit base_ref + model override)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"kind\": \"review\",\n  \"project\": \"{{projectName}}\",\n  \"target_ref\": \"{{targetRef}}\",\n  \"base_ref\": \"{{baseRef}}\",\n  \"model\": \"qwen2.5-coder:14b\",\n  \"provider\": \"ollama\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/routines/runs",
+              "host": ["{{baseUrl}}"],
+              "path": ["routines", "runs"]
+            },
+            "description": "Same as Launch review run, but with an explicit base_ref and a per-run model/provider override -- these bypass the active POST /config/llm config for just this run. qwen2.5-coder:14b is the recommended local model for review (measured: 3b-class models are not reliable for review judgment)."
+          },
+          "response": []
+        },
+        {
+          "name": "List routine runs",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/routines/runs?project={{projectName}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["routines", "runs"],
+              "query": [{ "key": "project", "value": "{{projectName}}" }]
+            },
+            "description": "Requires any authenticated role. Most recent first, optionally filtered by project and/or kind (query params, both optional; limit defaults to 50, max 200). Each entry carries severity_counts (severity -> count over that run's findings)."
+          },
+          "response": []
+        },
+        {
+          "name": "Get routine run",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/routines/runs/{{runId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["routines", "runs", "{{runId}}"]
+            },
+            "description": "Requires any authenticated role. The run's full detail, findings included. Poll this (or stream GET /instances/jobs/{{jobId}}/events) until status is done or failed; summary/stats/findings fill in once terminal."
+          },
+          "response": [
+            {
+              "name": "404 - run not found",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/routines/runs/{{runId}}",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["routines", "runs", "{{runId}}"]
+                }
+              },
+              "status": "Not Found",
+              "code": 404,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"detail\": \"routine run '<run_id>' not found\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Delete routine run",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/routines/runs/{{runId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["routines", "runs", "{{runId}}"]
+            },
+            "description": "Requires the admin or user role. Deletes the run, cascading to its findings (404 if the run doesn't exist)."
+          },
+          "response": []
+        },
+        {
+          "name": "List git branches",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/routines/git/branches?project={{projectName}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["routines", "git", "branches"],
+              "query": [{ "key": "project", "value": "{{projectName}}" }]
+            },
+            "description": "Requires any authenticated role. Local branches of the project's repository (current branch and most-recently-committed first) plus the resolved default_base. 404 if the project has no ingested graph; 400 if repo_path isn't a git repo or no default base branch could be determined."
           },
           "response": []
         }

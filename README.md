@@ -16,6 +16,7 @@ Everything runs **100% locally** — Weaviate for vectors, Ollama for both embed
 - [MCP server](#mcp-server)
 - [CLI](#cli)
 - [Frontend UI](#frontend-ui)
+- [Code review routines](#code-review-routines)
 - [How it works](#how-it-works)
 - [Descriptions (Tier 2)](#descriptions-tier-2)
 - [Features](#features)
@@ -263,6 +264,101 @@ See [`frontend/README.md`](frontend/README.md) for the stack, folder layout and 
 
 ---
 
+## Code review routines
+
+Dokkai can review a git branch against a base branch using the same graph-aware
+context as chat: it diffs the two refs, pulls in the graph entities and
+1-hop call-graph neighbors touched by each changed file, and asks the
+configured LLM for per-file findings (severity, category, an anchored line
+range when the model's `start_line` falls inside a changed range, and an
+optional fix suggestion), then writes a markdown summary of the whole run.
+
+This is **sub-part A** of the feature — the review routine itself. Bug hunt
+(`kind: "bughunt"`), project-specific review playbooks/skills, and a
+dedicated UI screen are specced but not yet implemented; they arrive in the
+next parts of this feature (`kind: "bughunt"` currently 400s with
+`"bug hunt routines arrive in a later release"`).
+
+**Run it** (review runs as a background job on the same shared job system as
+ingestion — see [API reference](#api-reference)):
+
+```bash
+TOKEN=$(curl -s -X POST localhost:8000/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"admin"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+# Launch a review of target_ref against the default base branch (origin/HEAD, or main/master)
+curl -X POST localhost:8000/routines/runs \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"kind":"review","project":"your-repo","target_ref":"feature/my-branch"}'
+# -> 202 {"run_id":"...", "job_id":"..."}
+
+# Poll the run detail until status is "done" or "failed"
+curl localhost:8000/routines/runs/<run_id> -H "Authorization: Bearer $TOKEN"
+# -> {"status":"done", "summary":"<markdown>", "findings":[...], "stats":{...}, ...}
+```
+
+Pass `base_ref` to review against something other than the default base
+branch, and `model`/`provider` to override the LLM for just this run (see
+below). List branches with `GET /routines/git/branches?project=your-repo`
+(also returns the resolved `default_base`). Live per-stage progress (`diff`
+→ `context` → `analyze` → `summarize`) streams over the **existing**
+`GET /instances/jobs/{job_id}/events` SSE endpoint — no separate routines
+SSE route.
+
+**Model resolution — no hardcoded default.** A review run resolves its
+model in this order: the launch payload's `model`/`provider` fields, then
+the active LLM config (set via `POST /config/llm`). If neither supplies a
+usable provider+model, the launch fails synchronously with **HTTP 400**:
+
+```
+No LLM provider configured for this review. POST to /config/llm to set one up, or pass model/provider in the launch payload.
+```
+
+**Model recommendation.** Review is a harder judgment task than chat.
+Measured against real diffs (including a committed merge conflict),
+3B-class local models are **not reliable** for review — they reported zero
+findings. Recommended local model for review runs:
+
+```bash
+ollama pull qwen2.5-coder:14b   # ~9GB
+```
+
+Fully-local (Ollama) remains the primary, documented path; a remote
+provider (OpenAI/Anthropic) works as an explicit per-run opt-in via the
+`model`/`provider` launch overrides.
+
+**Budgets/limits:** at most 60 changed files per run (a larger diff fails
+the launch with an actionable message — narrow the range or split the
+change); target-file excerpts are capped at ~6,000 characters per file
+(shrunk proportionally around the changed ranges when the diff touches a
+lot of a file).
+
+**Findings without a reliable line anchor are kept, not dropped** — each
+finding carries an `anchored` boolean; `anchored: false` means the model's
+`start_line` didn't fall within (±2 lines of) a changed range, so treat its
+line numbers as approximate.
+
+**Known limitation — retrieval staleness.** The graph entities and their
+Weaviate descriptions used as context reflect the **ingested index** (i.e.
+the base branch as of the last `POST /instances/pipeline`), while the diff
+itself and the findings' line anchors come straight from `git show` against
+the actual `target_ref` (always accurate). If the target branch has drifted
+far from what's indexed, the descriptive context may be stale even though
+the diff and anchors are not.
+
+**Locking:** review and ingestion of the **same project** are mutually
+exclusive — they share the same per-project job lock as
+`/instances/pipeline`/`/instances/graph`/`/instances/{project}/describe`.
+Launching a review while an ingestion (or another review) is in flight for
+that project returns `409 another job is running for project '<project>'`.
+
+**Roles:** launching (`POST /routines/runs`) and deleting
+(`DELETE /routines/runs/{id}`) require `admin` or `user`; all `GET` routes
+(list, detail, branches) are open to any authenticated role, including
+`viewer`.
+
+---
+
 ## How it works
 
 ```
@@ -352,6 +448,7 @@ Full pipeline run on `saffira_back-end` (medium TS/Python backend), local Ollama
 - ✅ **Graph-only ingestion** (`POST /instances/graph`, `dokkai graph`) — run just `cgr` with no LLM/Weaviate involved
 - ✅ **Authentication** — always-on, Grafana-style bearer-token auth with 3 roles (admin/user/viewer), a default `admin`/`admin` seed overridable via env, and CLI auto-login (see [Authentication](#authentication))
 - ✅ **Frontend UI** — Next.js web app: streaming chat with sources, interactive dependency graph, conversation history, ingestion/job monitoring, LLM config and user administration, role-gated (see [Frontend UI](#frontend-ui))
+- 🚧 **Code review routines** — branch-vs-base review with graph-aware context, anchored findings and a markdown summary, run as a background job over the shared job system (sub-part A; bug hunt/playbooks/UI to come — see [Code review routines](#code-review-routines))
 
 ---
 
@@ -608,6 +705,11 @@ curl -X DELETE localhost:8000/auth/users/2 -H "Authorization: Bearer $TOKEN"
 | `GET` | `/graph/{project}` | any | Full project graph (code entities by default, `?include=structural` for everything), `?limit=N` |
 | `GET` | `/graph/{project}/neighborhood` | any | BFS neighborhood of an entity — `?entity=<qualified_name>&depth=&direction=&limit=` |
 | `GET` | `/graph/{project}/files` | any | File‑to‑file dependency view (internal files only) |
+| `POST` | `/routines/runs` | admin, user | Launch a code review run (`kind: "review"`) as a background job on the shared job system; `kind: "bughunt"` 400s — arrives in a later sub-part. See [Code review routines](#code-review-routines) |
+| `GET` | `/routines/runs` | any | List review runs, most recent first, each with `severity_counts` |
+| `GET` | `/routines/runs/{id}` | any | A run's full detail, including its findings |
+| `DELETE` | `/routines/runs/{id}` | admin, user | Delete a run (cascades to its findings) |
+| `GET` | `/routines/git/branches` | any | A project's local git branches plus its resolved default base branch |
 | `POST` | `/chat` | admin, user | Chat over the codebase (SSE: `sources` → `token` → `done`) |
 | `GET` | `/chat/conversations` | any | List conversations (persisted in Postgres; 503 if Postgres is unreachable) |
 | `GET` | `/chat/conversations/{id}` | any | Get a conversation's history (503 if Postgres is unreachable) |
@@ -620,7 +722,7 @@ curl -X DELETE localhost:8000/auth/users/2 -H "Authorization: Bearer $TOKEN"
 
 Jobs report `stage` through the unified vocabulary `cgr → chunk → describe → upsert → done` (refresh jobs use `chunk → describe → update → done`; graph-only jobs use just `cgr → done`), plus a `stage_progress` object `{"stage", "done", "total"}` mirroring the current stage's `done`/`total` counters, and a `kind` (`"pipeline"` | `"refresh"` | `"graph"`).
 
-**Per‑project job lock** — only one job (pipeline, refresh, or graph-only) may run at a time for a given project; submitting a second one (any of `/instances/pipeline`, `/instances/{project}/describe`, `/instances/graph`) returns HTTP 409 `another job is running for project '<project>'` and creates no job.
+**Per‑project job lock** — only one job (pipeline, refresh, graph-only, or a review routine) may run at a time for a given project; submitting a second one (any of `/instances/pipeline`, `/instances/{project}/describe`, `/instances/graph`, `POST /routines/runs`) returns HTTP 409 `another job is running for project '<project>'` and creates no job.
 
 **Job progress over SSE** — instead of polling `GET /instances/jobs/{id}`, `GET /instances/jobs/{id}/events` streams the same job payload over Server‑Sent Events (same framing as `/chat`): it emits `event: job` on every `updated_at` change and a terminal `event: done` with the final payload, then closes the stream. An unknown job id is a plain 404, not a stream.
 
@@ -700,7 +802,7 @@ These are known and tracked in the [Roadmap](#roadmap):
 | 06 | Basic auth (root user via env) | ✅ done (pending merge) |
 | 07 | Frontend UI (chat + graph + config) | ✅ done (pending merge) |
 | 08 | PDF ingestion — local NotebookLM | planned |
-| 09 | Code review & bug‑hunt routines | planned |
+| 09 | Code review & bug‑hunt routines | 🚧 in progress (sub-part A of 3 merged — review routine backend; bug hunt, playbooks and UI still to come) |
 | 10 | Documentation site (en/pt/zh/es) | planned |
 | 11 | Post‑01 polish (live provider model catalogs, stage‑level job progress, describe refresh endpoint) | ✅ done |
 | 12 | MCP polish (`grep_project` tool, small-model instructions profile, session watchdog) | ✅ done (pending merge) |
