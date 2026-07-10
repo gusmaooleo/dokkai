@@ -37,6 +37,25 @@ services:
       timeout: 3s
       retries: 10
 
+  memgraph:
+    image: ${MEMGRAPH_IMAGE:-memgraph/memgraph:latest}
+    restart: on-failure:0
+    ports:
+      - "7687:7687"
+    healthcheck:
+      # CMD-SHELL runs under /bin/sh, which doesn't support /dev/tcp on this
+      # image (it's a bashism) — invoke bash explicitly.
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/7687'"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # Graph extraction (shell/run_cgr.sh via cgr). Not gated behind a
+    # profile: a resident instance is part of the default infra set so both
+    # `docker compose up -d` and host-run ingests (MEMGRAPH_HOST=localhost)
+    # can use it instead of spinning up an ephemeral container per run.
+    # `cgr --clean` wipes the graph at the start of each run, which is what
+    # isolates back-to-back runs on this shared instance.
+
   ui:
     profiles: ["ui"]
     build:
