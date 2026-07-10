@@ -98,11 +98,12 @@ async def launchRoutine(data: LaunchRoutineRequest) -> LaunchRoutineResponse:
     actionable message rather than only surfacing inside the job's result:
     the project must have an ingested graph (404), its repo_path must be a
     git repository (400), ``base_ref``/``target_ref`` must resolve (400),
-    and the LLM (from the launch payload or the active config, 12h) must be
-    resolvable and healthy (400) — the same resolution
-    ``services.routines.review.run_review`` itself does, run here too so its
-    failure message reaches the caller synchronously instead of only inside
-    a failed job/run.
+    every named playbook (decision 9d) must exist and apply to 'review' with
+    at most 4 selected (400), and the LLM (from the launch payload or the
+    active config, 12h) must be resolvable and healthy (400) — the same
+    resolution ``services.routines.review.run_review`` itself does, run here
+    too so its failure message reaches the caller synchronously instead of
+    only inside a failed job/run.
     """
     if data.kind == "bughunt":
         raise HTTPException(status_code=400, detail="bug hunt routines arrive in a later release")
@@ -118,12 +119,28 @@ async def launchRoutine(data: LaunchRoutineRequest) -> LaunchRoutineResponse:
     except GitError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    playbook_names = data.playbooks or []
+    if len(playbook_names) > 4:
+        raise HTTPException(status_code=400, detail="a run can use at most 4 playbooks")
+    try:
+        for name in playbook_names:
+            playbook = await documents.get_playbook(name)
+            if playbook is None:
+                raise HTTPException(status_code=400, detail=f"playbook '{name}' not found")
+            if "review" not in playbook["routines"]:
+                raise HTTPException(
+                    status_code=400, detail=f"playbook '{name}' does not apply to review routines"
+                )
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
     params = {
         "repo_path": repo_path,
         "target_ref": data.target_ref,
         "base_ref": data.base_ref,
         "model": data.model,
         "provider": data.provider,
+        "playbooks": data.playbooks,
     }
     try:
         await _resolve_llm(params)

@@ -2,7 +2,7 @@
 Review routine — the ``run_review`` :class:`~services.routines.engine.RoutineCallable`
 plugged into ``services.routines.engine.submit_routine`` for ``kind="review"``.
 
-This module owns the whole review pipeline, in four stages:
+This module owns the whole review pipeline, in five stages:
 
   1. **diff** — resolve base/target refs, compute the unified diff, parse it,
      and classify each file as reviewable or skipped (binary/deleted/
@@ -12,11 +12,17 @@ This module owns the whole review pipeline, in four stages:
      content around the changed ranges, the graph entities whose line span
      overlaps those ranges, and — for a capped subset of those entities —
      their Weaviate description plus cheap 1-hop call-graph neighbors.
-  3. **analyze** — one chat call per reviewable file: a strict JSON-array
+  3. **playbooks** — only when ``params['playbooks']`` names are given
+     (decision 9d, sub-part B): fetch them (priority = selection order) and
+     inject their bodies into the analyze system prompt (frontmatter
+     stripped), capped at :data:`PLAYBOOK_INJECTION_MAX_CHARS`. A no-op
+     stage otherwise — the prompt is byte-identical to sub-part A.
+  4. **analyze** — one chat call per reviewable file: a strict JSON-array
      findings contract, parsed with a one-shot retry on invalid JSON, then
      validated/anchored against the file's changed-line ranges (9a/9h).
-  4. **summarize** — one chat call turning the diffstat + validated findings
-     into the run's markdown summary.
+  5. **summarize** — one chat call turning the diffstat + validated findings
+     into the run's markdown summary. Playbooks are NOT injected here — this
+     stage judges findings, not code, so it stays lean.
 
 ``_stage_diff``/``_stage_context`` return plain data (not Job/DB-coupled
 state) so they're reusable outside ``run_review`` (see
@@ -32,6 +38,7 @@ coroutine for exactly that reason.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -56,6 +63,7 @@ from services.jobs import Job
 from services.llm_config import get_config_store
 from services.llm_provider import LLMMessage, LLMProvider, get_provider
 from services.retriever import Retriever
+from services.routines.documents import fetch_playbooks_sync, split_frontmatter
 from services.weaviate_client import get_client
 
 # Budgets (9h) — module constants so A5/the gate step can tune them without
@@ -66,6 +74,12 @@ MAX_RETRIEVED_PER_FILE = 5        # cap on Weaviate lookups per file
 _EXCERPT_PAD_LINES = 10           # lines of context padded around each changed range
 
 MAX_USER_PROMPT_CHARS = 24_000    # final guard on the analyze per-file user prompt (num_ctx 8192 budget)
+PLAYBOOK_INJECTION_MAX_CHARS = 12_000  # cap on total playbook body chars injected into the analyze
+                                        # system prompt (9h/9d) — 4 playbooks x 16KB raw (64KB) would
+                                        # swamp an 8192-token num_ctx; the system prompt already
+                                        # competes with a 24k-char user prompt, so 12k here leaves
+                                        # headroom. Lowest-priority (last-selected) playbooks are
+                                        # truncated first when the combined bodies exceed this.
 ANALYZE_TEMPERATURE = 0.15        # low temperature — consistency over creativity for findings
 SUMMARIZE_TEMPERATURE = 0.2
 MAX_TOKENS_ANALYZE = 4096         # provider default; a file's findings array rarely needs more
@@ -494,7 +508,77 @@ async def _resolve_llm(params: dict) -> tuple[LLMProvider, str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Stage 3: analyze
+# Stage 3: playbooks (decision 9d, sub-part B) — PUSHED project rules
+# ---------------------------------------------------------------------------
+
+_PLAYBOOK_MARKER = (
+    "<!-- PLAYBOOK INJECTION POINT (sub-part B): project-specific review "
+    "playbooks/rules land here. Empty in sub-part A. -->"
+)
+
+
+async def _stage_playbooks(names: list[str], emit: Callable[[str, str], None]) -> list[dict]:
+    """
+    Run the 'playbooks' stage: fetch *names* (selection order = priority,
+    decision 9d) via ``documents.fetch_playbooks_sync``, emitting
+    ``'loaded playbook <name>'`` per fetched doc (mirrors the future 'loaded
+    skill' observability). A no-op returning ``[]`` when *names* is empty —
+    the stage simply doesn't run.
+
+    Uses ``asyncio.to_thread`` rather than calling ``fetch_playbooks_sync``
+    directly: that helper does its own internal ``asyncio.run()``, and
+    ``run_review`` is itself already executing inside an event loop (the
+    worker thread's own ``asyncio.run(core(...))`` in
+    ``services.routines.engine``) — nesting ``asyncio.run()`` in the same
+    thread raises. Running it in a fresh thread sidesteps that.
+    """
+    if not names:
+        return []
+    playbooks = await asyncio.to_thread(fetch_playbooks_sync, names)
+    for pb in playbooks:
+        emit("playbooks", f"loaded playbook {pb['name']}")
+    return playbooks
+
+
+def _build_analyze_system_prompt(playbooks: list[dict]) -> tuple[str, bool]:
+    """
+    Inject *playbooks* (in priority order) into :data:`_ANALYZE_SYSTEM_PROMPT`
+    at :data:`_PLAYBOOK_MARKER`, under a '## House rules and focus areas
+    (user-provided)' section, each playbook as '### <name>' followed by its
+    BODY (frontmatter stripped via :func:`services.routines.documents.split_frontmatter`).
+
+    Total injected chars are capped at :data:`PLAYBOOK_INJECTION_MAX_CHARS`
+    — playbooks are included greedily in priority order, and the LAST
+    (lowest-priority) ones are truncated/dropped first once the budget is
+    spent. Returns ``(system_prompt, truncated)``; with no playbooks, returns
+    the prompt UNCHANGED (byte-identical to sub-part A).
+    """
+    if not playbooks:
+        return _ANALYZE_SYSTEM_PROMPT, False
+
+    included: list[str] = []
+    used = 0
+    truncated = False
+    for pb in playbooks:
+        _frontmatter, body = split_frontmatter(pb["content"])
+        body = body.strip()
+        remaining = PLAYBOOK_INJECTION_MAX_CHARS - used
+        if remaining <= 0:
+            truncated = True
+            continue
+        if len(body) > remaining:
+            body = body[:remaining]
+            truncated = True
+        included.append(f"### {pb['name']}\n{body}")
+        used += len(body)
+
+    section = "## House rules and focus areas (user-provided)\n\n" + "\n\n".join(included)
+    prompt = _ANALYZE_SYSTEM_PROMPT.replace(_PLAYBOOK_MARKER, section)
+    return prompt, truncated
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: analyze
 # ---------------------------------------------------------------------------
 
 _ANALYZE_SYSTEM_PROMPT = """You are a senior software engineer performing a focused code review of one changed file.
@@ -521,6 +605,14 @@ Focus ONLY on the changed lines shown in the diff hunks below — that is what i
 
 <!-- PLAYBOOK INJECTION POINT (sub-part B): project-specific review playbooks/rules land here. Empty in sub-part A. -->
 """
+
+# Import-time guard: if this marker ever drifts out of _ANALYZE_SYSTEM_PROMPT
+# (e.g. a future edit to the prompt text above), _build_analyze_system_prompt's
+# str.replace becomes a silent no-op — playbooks would vanish from the prompt
+# while stats.playbooks_used still lists them. Fail loudly at import instead.
+assert _PLAYBOOK_MARKER in _ANALYZE_SYSTEM_PROMPT, (
+    "_PLAYBOOK_MARKER not found in _ANALYZE_SYSTEM_PROMPT — playbook injection would silently no-op"
+)
 
 _ANALYZE_RETRY_MESSAGE = (
     "Your previous output was invalid JSON. Reply again with ONLY the JSON array described "
@@ -650,10 +742,15 @@ async def _analyze_file(
     model: str,
     fd: FileDiff,
     ctx: ReviewFileContext,
+    system_prompt: str,
     emit: Callable[[str, str], None],
 ) -> tuple[list, int, int, bool]:
     """
     One (plus a possible retry) chat call analyzing *fd*.
+
+    *system_prompt* is :data:`_ANALYZE_SYSTEM_PROMPT`, or that prompt with
+    playbooks injected (see :func:`_build_analyze_system_prompt`) — built
+    once per run, not per file.
 
     Returns ``(raw_findings, prompt_chars, llm_calls, parse_failed)`` —
     ``raw_findings`` is unvalidated model output (``[]`` when parsing failed
@@ -666,7 +763,7 @@ async def _analyze_file(
         emit("analyze", f"analyze: {fd.path}: prompt truncated to {MAX_USER_PROMPT_CHARS} chars")
 
     messages = [
-        LLMMessage(role="system", content=_ANALYZE_SYSTEM_PROMPT),
+        LLMMessage(role="system", content=system_prompt),
         LLMMessage(role="user", content=user_prompt),
     ]
     raw = await provider.chat(
@@ -801,10 +898,12 @@ async def _stage_analyze(
     provider_name: str,
     reviewable: list[FileDiff],
     contexts: list[ReviewFileContext],
+    system_prompt: str,
     emit: Callable[[str, str], None],
 ) -> tuple[list[dict], dict]:
     """Run the 'analyze' stage over every reviewable file (*contexts* in the
-    same order, from :func:`_stage_context`). Returns ``(findings, stats)``."""
+    same order, from :func:`_stage_context`). *system_prompt* — see
+    :func:`_analyze_file`. Returns ``(findings, stats)``."""
     n = len(reviewable)
     findings: list[dict] = []
     llm_calls = 0
@@ -814,7 +913,9 @@ async def _stage_analyze(
 
     for i, (fd, ctx) in enumerate(zip(reviewable, contexts), 1):
         emit("analyze", f"analyzing {fd.path} ({i}/{n})")
-        raw_findings, prompt_chars, calls, failed = await _analyze_file(provider, model, fd, ctx, emit)
+        raw_findings, prompt_chars, calls, failed = await _analyze_file(
+            provider, model, fd, ctx, system_prompt, emit
+        )
         llm_calls += calls
         prompt_chars_total += prompt_chars
         if failed:
@@ -839,7 +940,7 @@ async def _stage_analyze(
 
 
 # ---------------------------------------------------------------------------
-# Stage 4: summarize
+# Stage 5: summarize
 # ---------------------------------------------------------------------------
 
 _SUMMARIZE_SYSTEM_PROMPT = (
@@ -907,18 +1008,23 @@ async def run_review(job: Job, run_id: str, params: dict, emit: Callable[[str, s
     """
     The review routine's :class:`~services.routines.engine.RoutineCallable`.
 
-    params: ``{repo_path, base_ref?, target_ref, model?, provider?}`` —
-    ``model``/``provider`` override the active LLM config (12h) for the
-    analyze/summarize stages; see :func:`_resolve_llm`.
+    params: ``{repo_path, base_ref?, target_ref, model?, provider?, playbooks?}``
+    — ``model``/``provider`` override the active LLM config (12h) for the
+    analyze/summarize stages (see :func:`_resolve_llm`); ``playbooks`` is a
+    list of playbook names (selection order = priority, decision 9d)
+    injected into the analyze system prompt only (see
+    :func:`_stage_playbooks` / :func:`_build_analyze_system_prompt`) — the
+    summarize stage never sees them.
 
     Resolves + health-checks the LLM FIRST, before any diff/context work —
     a missing/broken model config fails the run immediately rather than
     after the (potentially expensive) diff+context stages have already run.
 
-    Runs all four stages (resolve, diff, context, analyze, summarize) and
-    returns ``{"summary", "findings", "stats"}`` — ``findings`` are
-    validated/anchored dicts shaped for ``store.insert_findings``; ``stats``
-    merges every stage's counters plus the resolved ``model``/``provider``.
+    Runs all five stages (resolve, diff, context, playbooks, analyze,
+    summarize) and returns ``{"summary", "findings", "stats"}`` —
+    ``findings`` are validated/anchored dicts shaped for
+    ``store.insert_findings``; ``stats`` merges every stage's counters plus
+    the resolved ``model``/``provider`` and ``playbooks_used``.
     """
     repo_path = params["repo_path"]
     target_ref = params["target_ref"]
@@ -931,7 +1037,14 @@ async def run_review(job: Job, run_id: str, params: dict, emit: Callable[[str, s
         repo_path, target, reviewable, job.project, emit
     )
 
-    findings, analyze_stats = await _stage_analyze(provider, model, provider_name, reviewable, contexts, emit)
+    playbooks = await _stage_playbooks(params.get("playbooks") or [], emit)
+    system_prompt, playbooks_truncated = _build_analyze_system_prompt(playbooks)
+    if playbooks_truncated:
+        emit("playbooks", "playbook content truncated to fit the context budget")
+
+    findings, analyze_stats = await _stage_analyze(
+        provider, model, provider_name, reviewable, contexts, system_prompt, emit
+    )
     summary, summarize_stats = await _stage_summarize(provider, model, diff_stats, findings, emit)
 
     llm_calls = analyze_stats.pop("llm_calls") + summarize_stats.pop("llm_calls")
@@ -947,6 +1060,7 @@ async def run_review(job: Job, run_id: str, params: dict, emit: Callable[[str, s
         "prompt_chars_total": prompt_chars_total,
         "model": model,
         "provider": provider_name,
+        "playbooks_used": [pb["name"] for pb in playbooks],
     }
 
     return {

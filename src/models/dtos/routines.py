@@ -22,6 +22,11 @@ class LaunchRoutineRequest(BaseModel):
     # services.routines.review._resolve_llm.
     model: str | None = None
     provider: str | None = None
+    # Playbooks PUSHED into this run's analyze prompt (decision 9d) — names,
+    # selection order = priority order. Validated at launch (controller): at
+    # most 4, every name must exist, and each must apply to this run's
+    # routine kind.
+    playbooks: list[str] | None = None
 
     @model_validator(mode="after")
     def _require_target_ref_for_review(self) -> "LaunchRoutineRequest":
