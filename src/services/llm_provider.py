@@ -357,6 +357,50 @@ class OllamaProvider(LLMProvider):
                     except _json.JSONDecodeError:
                         continue
 
+    async def chat_with_tools(
+        self,
+        messages: list[dict],
+        *,
+        model: str,
+        tools: list[dict] | None = None,
+        temperature: float = 0.3,
+        max_tokens: int = 4096,
+    ) -> dict:
+        """
+        Ollama-native tool-calling chat call (decision 9a — v1 is Ollama-only;
+        NOT part of the :class:`LLMProvider` ABC, and not implemented by the
+        other providers).
+
+        Unlike :meth:`chat`, this takes and returns raw Ollama message dicts
+        (``{"role", "content", "tool_calls"?}``) rather than
+        :class:`LLMMessage` — tool-role messages and ``tool_calls`` have no
+        equivalent in the ``LLMMessage``/single-string-reply abstraction the
+        other providers share, and the agent loop (``services.routines.
+        agent_loop``) needs the raw shape to append tool results and read
+        ``message.tool_calls`` back. ``tools`` follows Ollama's ``/api/chat``
+        tool schema (list of ``{"type": "function", "function": {...}}``);
+        omitted/empty disables tool-calling for that call (used by the agent
+        loop's forced final-answer round).
+        """
+        payload: dict = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "keep_alive": self._keep_alive,
+            "options": {
+                "temperature": temperature,
+                "num_predict": max_tokens,
+                "num_ctx": self._num_ctx,
+            },
+        }
+        if tools:
+            payload["tools"] = tools
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            resp = await client.post(f"{self._base_url}/api/chat", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("message") or {"role": "assistant", "content": ""}
+
     async def warmup(self, model: str) -> None:
         """
         Preload the model into memory (respecting keep_alive) so the first real
