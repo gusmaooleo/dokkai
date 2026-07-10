@@ -9,11 +9,13 @@
  * buttons and the search/relations/deep-link "focus this node" actions.
  *
  * Layout: forceatlas2 runs in a Web Worker (`graphology-layout-forceatlas2/
- * worker`) for a fixed ~3s budget, then the final positions are cached in
- * a module-level `Map` keyed by `cacheKey` (`<project>:<mode>`) so revisiting
- * a project/mode within the session skips the layout entirely. Initial
- * positions are a deterministic circular spread by node index — stable
- * across runs, no `Math.random`.
+ * worker`) for a fixed ~3s budget, then the final positions are persisted to
+ * `localStorage` under `dokkai.graphpos.<project>.<mode>`, tagged with the
+ * graph's `generatedAt` fingerprint. Revisiting a project/mode (even across
+ * page reloads) whose stored fingerprint still matches skips the layout
+ * entirely and applies the saved positions instantly; a mismatch (or no
+ * entry) falls back to the deterministic circular seed and a fresh FA2 run,
+ * whose result then overwrites the stored entry.
  */
 
 import {
@@ -61,8 +63,52 @@ const EDGE_COLOR_HIGHLIGHT = { light: "#9c9ca2", dark: "#6e6d78" };
 const NODE_COLOR_DIM = { light: "#d8d8d2", dark: "#43424c" };
 const LABEL_COLOR = { light: "#1B1B1F", dark: "#F9F9F9" };
 
-/** Session-lifetime cache: `<project>:<mode>` -> node id -> final layout position. */
-const positionCache = new Map<string, Record<string, { x: number; y: number }>>();
+/** Shape persisted at `dokkai.graphpos.<project>.<mode>` — positions are
+ *  rounded to 2 decimals to keep the JSON compact. Tagging with
+ *  `generated_at` lets a stale entry (older/newer graph) be detected and
+ *  discarded without a version bump. */
+interface StoredLayout {
+  generated_at: string;
+  positions: Record<string, [number, number]>;
+}
+
+function storageKeyFor(cacheKey: string): string {
+  return `dokkai.graphpos.${cacheKey.replace(":", ".")}`;
+}
+
+/** Reads the persisted layout for `cacheKey`, returning `null` when there's
+ *  no entry, it's stale (`generated_at` mismatch), or it's corrupt JSON. */
+function readStoredPositions(
+  cacheKey: string,
+  generatedAt: string,
+): Record<string, [number, number]> | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(storageKeyFor(cacheKey));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as StoredLayout;
+    if (parsed.generated_at !== generatedAt || !parsed.positions) return null;
+    return parsed.positions;
+  } catch {
+    return null;
+  }
+}
+
+/** Persists the final FA2 layout. Swallows quota/serialization errors —
+ *  losing the cache just means the next visit re-runs the layout. */
+function writeStoredPositions(
+  cacheKey: string,
+  generatedAt: string,
+  positions: Record<string, [number, number]>,
+): void {
+  if (typeof window === "undefined") return;
+  try {
+    const payload: StoredLayout = { generated_at: generatedAt, positions };
+    window.localStorage.setItem(storageKeyFor(cacheKey), JSON.stringify(payload));
+  } catch {
+    // Quota exceeded or a non-serializable value — nothing to do.
+  }
+}
 
 export interface GraphCanvasHandle {
   zoomIn: () => void;
@@ -73,6 +119,10 @@ export interface GraphCanvasHandle {
 
 interface GraphCanvasProps {
   cacheKey: string;
+  /** Fingerprint of the current dataset (project's `generated_at`) used to
+   *  validate the persisted layout cache — a mismatch means the graph
+   *  changed since the layout was saved. */
+  generatedAt: string;
   nodes: NormalizedNode[];
   edges: NormalizedEdge[];
   selectedId: string | null;
@@ -83,7 +133,7 @@ interface GraphCanvasProps {
 }
 
 export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function GraphCanvas(
-  { cacheKey, nodes, edges, selectedId, onSelectNode, isDark, onLayoutStateChange, onReady },
+  { cacheKey, generatedAt, nodes, edges, selectedId, onSelectNode, isDark, onLayoutStateChange, onReady },
   ref,
 ) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -141,9 +191,10 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
 
   // Rebuild the graph, run/apply layout, and (re)mount the Sigma renderer
   // whenever the dataset changes (`cacheKey` — project or entities/files
-  // mode). Reads `nodesRef`/`edgesRef` rather than depending on `nodes`/
-  // `edges` directly so a parent re-render with a fresh-but-equal array
-  // doesn't trigger a pointless rebuild.
+  // mode — or `generatedAt`, e.g. a re-ingested project). Reads
+  // `nodesRef`/`edgesRef` rather than depending on `nodes`/`edges` directly
+  // so a parent re-render with a fresh-but-equal array doesn't trigger a
+  // pointless rebuild.
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -257,26 +308,31 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       onReadyRef.current?.();
     }
 
-    function finish() {
+    // `persist` is true only when this run just computed the layout via FA2
+    // — a cache hit re-applies positions that are already stored, so there's
+    // nothing new to write.
+    function finish(persist: boolean) {
       if (cancelled) return;
-      const snapshot: Record<string, { x: number; y: number }> = {};
-      graph.forEachNode((id, attrs) => {
-        snapshot[id] = { x: attrs.x, y: attrs.y };
-      });
-      positionCache.set(cacheKey, snapshot);
+      if (persist) {
+        const snapshot: Record<string, [number, number]> = {};
+        graph.forEachNode((id, attrs) => {
+          snapshot[id] = [Math.round(attrs.x * 100) / 100, Math.round(attrs.y * 100) / 100];
+        });
+        writeStoredPositions(cacheKey, generatedAt, snapshot);
+      }
       mountSigma();
     }
 
-    const cached = positionCache.get(cacheKey);
+    const cached = readStoredPositions(cacheKey, generatedAt);
     if (cached) {
       graph.forEachNode((id) => {
         const pos = cached[id];
         if (pos) {
-          graph.setNodeAttribute(id, "x", pos.x);
-          graph.setNodeAttribute(id, "y", pos.y);
+          graph.setNodeAttribute(id, "x", pos[0]);
+          graph.setNodeAttribute(id, "y", pos[1]);
         }
       });
-      finish();
+      finish(false);
     } else {
       const settings = forceAtlas2.inferSettings(graph);
       const supervisor = new FA2Layout(graph, { settings: { ...settings, barnesHutOptimize: true } });
@@ -286,7 +342,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
         supervisor.stop();
         supervisor.kill();
         supervisorRef.current = null;
-        finish();
+        finish(true);
       }, LAYOUT_BUDGET_MS);
     }
 
@@ -298,7 +354,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       killSigma();
       graphRef.current = null;
     };
-  }, [cacheKey]);
+  }, [cacheKey, generatedAt]);
 
   // Selection change — recompute the highlight set and ask Sigma to
   // re-run the reducers (cheap: no graph/layout rebuild).

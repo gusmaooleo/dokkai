@@ -309,6 +309,12 @@ export function GraphScreen() {
               key={cacheKey}
               ref={canvasRef}
               cacheKey={cacheKey}
+              // `active.generated_at` (from the `/graph` project listing) is
+              // used for both modes rather than `entityData.generated_at`
+              // (nullable, entities-only) since `GET /graph/{project}/files`
+              // doesn't return one — both views come from the same ingested
+              // graph, so the project's fingerprint is valid for either.
+              generatedAt={active.generated_at}
               nodes={nodes}
               edges={edges}
               selectedId={selectedId}
