@@ -2,7 +2,7 @@
 Review routine — the ``run_review`` :class:`~services.routines.engine.RoutineCallable`
 plugged into ``services.routines.engine.submit_routine`` for ``kind="review"``.
 
-This module owns the whole review pipeline, in five stages:
+This module owns the whole review pipeline, in six stages:
 
   1. **diff** — resolve base/target refs, compute the unified diff, parse it,
      and classify each file as reviewable or skipped (binary/deleted/
@@ -16,13 +16,23 @@ This module owns the whole review pipeline, in five stages:
      (decision 9d, sub-part B): fetch them (priority = selection order) and
      inject their bodies into the analyze system prompt (frontmatter
      stripped), capped at :data:`PLAYBOOK_INJECTION_MAX_CHARS`. A no-op
-     stage otherwise — the prompt is byte-identical to sub-part A.
-  4. **analyze** — one chat call per reviewable file: a strict JSON-array
+     stage otherwise — the prompt is byte-identical to sub-part A. Playbooks
+     are PUSHED — a run only sees the ones its launch payload names.
+  4. **skills** — only when the skills catalog (``skills`` table) is
+     non-empty (decision 9d, sub-part B, step B6): one cheap chat call asks
+     the run's own model to pick at most 3 relevant skills by name from the
+     catalog, given the diffstat; selected skills are fetched (frontmatter
+     stripped) and injected into the analyze system prompt AFTER the
+     playbook section, capped at :data:`SKILL_INJECTION_MAX_CHARS`. Skills
+     are PULLED — the model decides, unlike playbooks. Review has no tool
+     loop (unlike bug hunt's ``load_skill`` tool in ``agent_loop.py``), so
+     this is a standalone selection micro-step instead.
+  5. **analyze** — one chat call per reviewable file: a strict JSON-array
      findings contract, parsed with a one-shot retry on invalid JSON, then
      validated/anchored against the file's changed-line ranges (9a/9h).
-  5. **summarize** — one chat call turning the diffstat + validated findings
-     into the run's markdown summary. Playbooks are NOT injected here — this
-     stage judges findings, not code, so it stays lean.
+  6. **summarize** — one chat call turning the diffstat + validated findings
+     into the run's markdown summary. Playbooks/skills are NOT injected here
+     — this stage judges findings, not code, so it stays lean.
 
 ``_stage_diff``/``_stage_context`` return plain data (not Job/DB-coupled
 state) so they're reusable outside ``run_review`` (see
@@ -63,7 +73,12 @@ from services.jobs import Job
 from services.llm_config import get_config_store
 from services.llm_provider import LLMMessage, LLMProvider, get_provider
 from services.retriever import Retriever
-from services.routines.documents import fetch_playbooks_sync, split_frontmatter
+from services.routines.documents import (
+    fetch_playbooks_sync,
+    fetch_skill_sync,
+    fetch_skills_catalog_sync,
+    split_frontmatter,
+)
 from services.weaviate_client import get_client
 
 # Budgets (9h) — module constants so A5/the gate step can tune them without
@@ -80,10 +95,22 @@ PLAYBOOK_INJECTION_MAX_CHARS = 12_000  # cap on total playbook body chars inject
                                         # competes with a 24k-char user prompt, so 12k here leaves
                                         # headroom. Lowest-priority (last-selected) playbooks are
                                         # truncated first when the combined bodies exceed this.
+SKILL_INJECTION_MAX_CHARS = 8_000      # cap on total skill body chars injected into the analyze
+                                        # system prompt (9d/B6) — a SEPARATE budget from
+                                        # PLAYBOOK_INJECTION_MAX_CHARS: playbooks are house rules
+                                        # (pushed, up to 4), skills are how-to knowledge (pulled, at
+                                        # most 3 per MAX_SELECTED_SKILLS below) — 8k leaves the 12k
+                                        # playbook budget dominant since playbooks are the
+                                        # user-authored, higher-priority signal. Skills are included
+                                        # in selection order; the last ones are truncated/dropped
+                                        # first once the budget is spent (mirrors the playbook cap).
 ANALYZE_TEMPERATURE = 0.15        # low temperature — consistency over creativity for findings
 SUMMARIZE_TEMPERATURE = 0.2
 MAX_TOKENS_ANALYZE = 4096         # provider default; a file's findings array rarely needs more
 MAX_TOKENS_SUMMARIZE = 1024       # the summary is a short markdown blurb, not another findings dump
+MAX_TOKENS_SKILL_SELECT = 256     # the selection output is a short JSON array of at most 3 names
+MAX_SELECTED_SKILLS = 3           # decision 9d — at most 3 skills selected per run (mirrors
+                                   # agent_loop.py's MAX_LOADED_SKILLS for bug hunt)
 ANCHOR_TOLERANCE_LINES = 2        # ±N lines of slack when checking a finding's start_line against a changed range
 
 
@@ -546,45 +573,192 @@ async def _stage_playbooks(names: list[str], emit: Callable[[str, str], None]) -
     return playbooks
 
 
-def _build_analyze_system_prompt(playbooks: list[dict]) -> tuple[str, bool]:
-    """
-    Inject *playbooks* (in priority order) into :data:`_ANALYZE_SYSTEM_PROMPT`
-    at :data:`_PLAYBOOK_MARKER`, under a '## House rules and focus areas
-    (user-provided)' section, each playbook as '### <name>' followed by its
-    BODY (frontmatter stripped via :func:`services.routines.documents.split_frontmatter`).
+# ---------------------------------------------------------------------------
+# Stage 4: skills (decision 9d, sub-part B, step B6) — PULLED how-to knowledge
+# ---------------------------------------------------------------------------
 
-    Total injected chars are capped at :data:`PLAYBOOK_INJECTION_MAX_CHARS`
-    — playbooks are included greedily in priority order, and the LAST
-    (lowest-priority) ones are truncated/dropped first once the budget is
-    spent. Returns ``(system_prompt, truncated)``; with no playbooks, returns
-    the prompt UNCHANGED (byte-identical to sub-part A).
-    """
-    if not playbooks:
-        return _ANALYZE_SYSTEM_PROMPT, False
+_SKILL_SELECTION_SYSTEM_PROMPT = "You select relevant skills for a code review."
 
-    included: list[str] = []
-    used = 0
-    truncated = False
-    for pb in playbooks:
-        _frontmatter, body = split_frontmatter(pb["content"])
-        body = body.strip()
-        remaining = PLAYBOOK_INJECTION_MAX_CHARS - used
-        if remaining <= 0:
-            truncated = True
+_SKILL_SELECTION_RETRY_MESSAGE = (
+    "Your previous output was invalid JSON. Reply again with ONLY the JSON array of "
+    "skill names described above — no prose, no markdown fences."
+)
+
+
+def _build_skill_selection_user_prompt(catalog: list[dict], reviewable: list[FileDiff], diff_stats: dict) -> str:
+    catalog_lines = [f"- {s['name']}: {s['description']}" for s in catalog]
+    extensions = sorted({os.path.splitext(fd.path)[1] or "(no extension)" for fd in reviewable})
+    files_lines = [f"- {fd.path}" for fd in reviewable]
+    return (
+        "Available skills:\n" + "\n".join(catalog_lines) + "\n\n"
+        f"Diffstat: {diff_stats['files_reviewable']} file(s) changed, "
+        f"+{diff_stats['insertions']} -{diff_stats['deletions']}, "
+        f"file types: {', '.join(extensions)}\n"
+        "Files:\n" + "\n".join(files_lines) + "\n\n"
+        f"Respond with ONLY a JSON array of at most {MAX_SELECTED_SKILLS} skill names, "
+        "taken exactly from the 'Available skills' list above, that are relevant to "
+        "reviewing this diff. Respond with exactly [] if none apply. No prose, no "
+        "markdown fences."
+    )
+
+
+async def _select_skills(
+    provider: LLMProvider,
+    model: str,
+    catalog: list[dict],
+    reviewable: list[FileDiff],
+    diff_stats: dict,
+    emit: Callable[[str, str], None],
+) -> tuple[list[str], int]:
+    """
+    One (plus a possible retry) chat call selecting at most
+    :data:`MAX_SELECTED_SKILLS` skill names from *catalog*, given the run's
+    diffstat. Returns ``(selected_names, llm_calls)`` — ``selected_names``
+    is ``[]`` on a parse failure (even after the retry), in which case a
+    warning is emitted and the run simply proceeds without skills (never
+    crashes on model noise, mirroring :func:`_analyze_file`). Names the
+    model invents that aren't in *catalog* are dropped with a warning.
+    """
+    user_prompt = _build_skill_selection_user_prompt(catalog, reviewable, diff_stats)
+    messages = [
+        LLMMessage(role="system", content=_SKILL_SELECTION_SYSTEM_PROMPT),
+        LLMMessage(role="user", content=user_prompt),
+    ]
+    raw = await provider.chat(
+        messages, model=model, temperature=ANALYZE_TEMPERATURE, max_tokens=MAX_TOKENS_SKILL_SELECT
+    )
+    parsed = _parse_json_array(raw)
+    llm_calls = 1
+
+    if parsed is None:
+        messages.append(LLMMessage(role="assistant", content=raw))
+        messages.append(LLMMessage(role="user", content=_SKILL_SELECTION_RETRY_MESSAGE))
+        raw = await provider.chat(
+            messages, model=model, temperature=ANALYZE_TEMPERATURE, max_tokens=MAX_TOKENS_SKILL_SELECT
+        )
+        llm_calls += 1
+        parsed = _parse_json_array(raw)
+        if parsed is None:
+            emit("skills", "parse_failed: skill selection — continuing without skills")
+            return [], llm_calls
+
+    names = [n.strip() for n in parsed if isinstance(n, str) and n.strip()][:MAX_SELECTED_SKILLS]
+    catalog_names = {c["name"] for c in catalog}
+    unknown = [n for n in names if n not in catalog_names]
+    if unknown:
+        emit("skills", f"skill selection named unknown skill(s), ignoring: {', '.join(unknown)}")
+    return [n for n in names if n in catalog_names], llm_calls
+
+
+async def _stage_skills(
+    provider: LLMProvider,
+    model: str,
+    reviewable: list[FileDiff],
+    diff_stats: dict,
+    emit: Callable[[str, str], None],
+) -> tuple[list[dict], int]:
+    """
+    Run the 'skills' stage: only when the skills catalog is non-empty, ask
+    the model to select at most :data:`MAX_SELECTED_SKILLS` relevant skills
+    (see :func:`_select_skills`), then fetch each selected+existing skill
+    and emit ``'loaded skill <name>'`` per fetched doc. A no-op returning
+    ``([], 0)`` when the catalog is empty — the stage simply doesn't run
+    (no events at all), same shape as :func:`_stage_playbooks` with no
+    names. Otherwise emits one ``'selecting skills from catalog of N'``
+    event up front, unconditionally — the stage's own "it ran" signal,
+    since a clean empty selection ([]) would otherwise leave no event
+    behind for observability/tests to key off.
+
+    Uses ``asyncio.to_thread`` for the same reason as ``_stage_playbooks``
+    (see its docstring): ``fetch_skills_catalog_sync``/``fetch_skill_sync``
+    each do their own internal ``asyncio.run()``.
+
+    Returns ``(loaded_skills, llm_calls)`` — *llm_calls* accounts for the
+    selection call(s) so the caller can fold it into the run's total.
+    """
+    catalog = await asyncio.to_thread(fetch_skills_catalog_sync)
+    if not catalog:
+        return [], 0
+
+    emit("skills", f"selecting skills from catalog of {len(catalog)}")
+    names, llm_calls = await _select_skills(provider, model, catalog, reviewable, diff_stats, emit)
+    skills: list[dict] = []
+    for name in names:
+        skill = await asyncio.to_thread(fetch_skill_sync, name)
+        if skill is None:
             continue
-        if len(body) > remaining:
-            body = body[:remaining]
-            truncated = True
-        included.append(f"### {pb['name']}\n{body}")
-        used += len(body)
+        skills.append(skill)
+        emit("skills", f"loaded skill {name}")
+    return skills, llm_calls
 
-    section = "## House rules and focus areas (user-provided)\n\n" + "\n\n".join(included)
-    prompt = _ANALYZE_SYSTEM_PROMPT.replace(_PLAYBOOK_MARKER, section)
-    return prompt, truncated
+
+def _build_analyze_system_prompt(playbooks: list[dict], skills: list[dict]) -> tuple[str, bool, bool]:
+    """
+    Inject *playbooks* (priority order, decision 9d) and *skills* (selection
+    order, step B6) into :data:`_ANALYZE_SYSTEM_PROMPT` at
+    :data:`_PLAYBOOK_MARKER`: playbooks first under a '## House rules and
+    focus areas (user-provided)' section (house rules), skills AFTER them
+    under a '## Loaded skills (analysis capabilities)' section (how-to
+    knowledge) — each entry as '### <name>' followed by its BODY
+    (frontmatter stripped via
+    :func:`services.routines.documents.split_frontmatter`).
+
+    Playbooks are capped at :data:`PLAYBOOK_INJECTION_MAX_CHARS`, skills at
+    the SEPARATE :data:`SKILL_INJECTION_MAX_CHARS` — each list is included
+    greedily in its own order, and the LAST entries of that list are
+    truncated/dropped first once that list's budget is spent.
+
+    Returns ``(system_prompt, playbooks_truncated, skills_truncated)``;
+    with neither playbooks nor skills, returns the prompt UNCHANGED
+    (byte-identical to sub-part A).
+    """
+    if not playbooks and not skills:
+        return _ANALYZE_SYSTEM_PROMPT, False, False
+
+    sections: list[str] = []
+
+    playbooks_truncated = False
+    if playbooks:
+        included: list[str] = []
+        used = 0
+        for pb in playbooks:
+            _frontmatter, body = split_frontmatter(pb["content"])
+            body = body.strip()
+            remaining = PLAYBOOK_INJECTION_MAX_CHARS - used
+            if remaining <= 0:
+                playbooks_truncated = True
+                continue
+            if len(body) > remaining:
+                body = body[:remaining]
+                playbooks_truncated = True
+            included.append(f"### {pb['name']}\n{body}")
+            used += len(body)
+        sections.append("## House rules and focus areas (user-provided)\n\n" + "\n\n".join(included))
+
+    skills_truncated = False
+    if skills:
+        included = []
+        used = 0
+        for sk in skills:
+            _frontmatter, body = split_frontmatter(sk["content"])
+            body = body.strip()
+            remaining = SKILL_INJECTION_MAX_CHARS - used
+            if remaining <= 0:
+                skills_truncated = True
+                continue
+            if len(body) > remaining:
+                body = body[:remaining]
+                skills_truncated = True
+            included.append(f"### {sk['name']}\n{body}")
+            used += len(body)
+        sections.append("## Loaded skills (analysis capabilities)\n\n" + "\n\n".join(included))
+
+    prompt = _ANALYZE_SYSTEM_PROMPT.replace(_PLAYBOOK_MARKER, "\n\n".join(sections))
+    return prompt, playbooks_truncated, skills_truncated
 
 
 # ---------------------------------------------------------------------------
-# Stage 4: analyze
+# Stage 5: analyze
 # ---------------------------------------------------------------------------
 
 _ANALYZE_SYSTEM_PROMPT = """You are a senior software engineer performing a focused code review of one changed file.
@@ -614,10 +788,12 @@ Focus ONLY on the changed lines shown in the diff hunks below — that is what i
 
 # Import-time guard: if this marker ever drifts out of _ANALYZE_SYSTEM_PROMPT
 # (e.g. a future edit to the prompt text above), _build_analyze_system_prompt's
-# str.replace becomes a silent no-op — playbooks would vanish from the prompt
-# while stats.playbooks_used still lists them. Fail loudly at import instead.
+# str.replace becomes a silent no-op — playbooks AND skills (step B6 — both
+# sections share this one injection point, skills after playbooks) would
+# vanish from the prompt while stats.playbooks_used/skills_used still list
+# them. Fail loudly at import instead.
 assert _PLAYBOOK_MARKER in _ANALYZE_SYSTEM_PROMPT, (
-    "_PLAYBOOK_MARKER not found in _ANALYZE_SYSTEM_PROMPT — playbook injection would silently no-op"
+    "_PLAYBOOK_MARKER not found in _ANALYZE_SYSTEM_PROMPT — playbook/skill injection would silently no-op"
 )
 
 _ANALYZE_RETRY_MESSAGE = (
@@ -946,7 +1122,7 @@ async def _stage_analyze(
 
 
 # ---------------------------------------------------------------------------
-# Stage 5: summarize
+# Stage 6: summarize
 # ---------------------------------------------------------------------------
 
 _SUMMARIZE_SYSTEM_PROMPT = (
@@ -1020,17 +1196,20 @@ async def run_review(job: Job, run_id: str, params: dict, emit: Callable[[str, s
     list of playbook names (selection order = priority, decision 9d)
     injected into the analyze system prompt only (see
     :func:`_stage_playbooks` / :func:`_build_analyze_system_prompt`) — the
-    summarize stage never sees them.
+    summarize stage never sees them. There is NO launch param for skills
+    (step B6) — skills are model-PULLED from the full catalog every run,
+    unlike playbooks which are user-PUSHED by name.
 
     Resolves + health-checks the LLM FIRST, before any diff/context work —
     a missing/broken model config fails the run immediately rather than
     after the (potentially expensive) diff+context stages have already run.
 
-    Runs all five stages (resolve, diff, context, playbooks, analyze,
+    Runs all six stages (resolve, diff, context, playbooks, skills, analyze,
     summarize) and returns ``{"summary", "findings", "stats"}`` —
     ``findings`` are validated/anchored dicts shaped for
     ``store.insert_findings``; ``stats`` merges every stage's counters plus
-    the resolved ``model``/``provider`` and ``playbooks_used``.
+    the resolved ``model``/``provider``, ``playbooks_used`` and
+    ``skills_used``.
     """
     repo_path = params["repo_path"]
     target_ref = params["target_ref"]
@@ -1044,16 +1223,20 @@ async def run_review(job: Job, run_id: str, params: dict, emit: Callable[[str, s
     )
 
     playbooks = await _stage_playbooks(params.get("playbooks") or [], emit)
-    system_prompt, playbooks_truncated = _build_analyze_system_prompt(playbooks)
+    skills, skills_llm_calls = await _stage_skills(provider, model, reviewable, diff_stats, emit)
+
+    system_prompt, playbooks_truncated, skills_truncated = _build_analyze_system_prompt(playbooks, skills)
     if playbooks_truncated:
         emit("playbooks", "playbook content truncated to fit the context budget")
+    if skills_truncated:
+        emit("skills", "skill content truncated to fit the context budget")
 
     findings, analyze_stats = await _stage_analyze(
         provider, model, provider_name, reviewable, contexts, system_prompt, emit
     )
     summary, summarize_stats = await _stage_summarize(provider, model, diff_stats, findings, emit)
 
-    llm_calls = analyze_stats.pop("llm_calls") + summarize_stats.pop("llm_calls")
+    llm_calls = skills_llm_calls + analyze_stats.pop("llm_calls") + summarize_stats.pop("llm_calls")
     prompt_chars_total = analyze_stats.pop("prompt_chars_total") + summarize_stats.pop("prompt_chars_total")
 
     stats = {
@@ -1067,6 +1250,7 @@ async def run_review(job: Job, run_id: str, params: dict, emit: Callable[[str, s
         "model": model,
         "provider": provider_name,
         "playbooks_used": [pb["name"] for pb in playbooks],
+        "skills_used": [sk["name"] for sk in skills],
     }
 
     return {
