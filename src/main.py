@@ -38,6 +38,15 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("job history: failed to sweep interrupted jobs on boot: %s", e)
 
+        # Same idea, for routine runs (code review/bughunt) — a run stuck
+        # 'queued'/'running' belongs to a worker that died before finishing.
+        from services.routines.store import sweep_interrupted_routine_runs
+
+        try:
+            await sweep_interrupted_routine_runs()
+        except Exception as e:
+            logger.warning("routines: failed to sweep interrupted runs on boot: %s", e)
+
         # Seed the admin user (or apply DOKKAI_ROOT_* overrides) now that
         # Postgres is confirmed reachable. Best-effort like the rest of this
         # block — a failure here still leaves the API serving, and login's
