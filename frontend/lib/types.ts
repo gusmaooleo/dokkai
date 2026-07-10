@@ -325,6 +325,64 @@ export interface Job {
 export type JobSSEEvent = { type: "job"; data: Job } | { type: "done"; data: Job };
 
 // -----------------------------------------------------------------------
+// Routines (code review / bug hunt) — decision 9e
+// -----------------------------------------------------------------------
+
+export type RoutineKind = "review" | "bughunt";
+export type RoutineStatus = "queued" | "running" | "done" | "failed";
+
+export interface LaunchRoutineRequest {
+  kind: RoutineKind;
+  project: string;
+  target_ref?: string | null;
+  base_ref?: string | null;
+  scope?: string | null;
+  path_prefix?: string | null;
+  model?: string | null;
+  provider?: string | null;
+  playbooks?: string[] | null;
+}
+
+export interface LaunchRoutineResponse {
+  run_id: string;
+  job_id: string;
+}
+
+/** One entry of GET /routines/runs's listing. */
+export interface RoutineRunSummary {
+  id: string;
+  kind: RoutineKind;
+  project: string;
+  status: RoutineStatus;
+  params: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+  severity_counts: Record<string, number>;
+}
+
+export interface BranchInfo {
+  name: string;
+  is_current: boolean;
+  last_commit_date: string;
+}
+
+/** GET /routines/git/branches response. */
+export interface BranchesResponse {
+  branches: BranchInfo[];
+  default_base: string;
+}
+
+/** One entry of GET /routines/playbooks's listing — omits content in favor of content_bytes. */
+export interface PlaybookSummary {
+  id: number;
+  name: string;
+  routines: RoutineKind[];
+  content_bytes: number;
+  created_at: string;
+  updated_at: string;
+}
+
+// -----------------------------------------------------------------------
 // Config
 // -----------------------------------------------------------------------
 

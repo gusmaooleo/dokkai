@@ -43,6 +43,11 @@ function NavLink({ item, active, showJobBadge }: { item: NavItem; active: boolea
     >
       <Icon size={19} strokeWidth={1.7} className="shrink-0" />
       <span className="flex-1 text-left">{item.label}</span>
+      {item.beta && (
+        <span className="shrink-0 rounded-[4px] border border-border px-[5px] py-px font-mono text-[9px] font-semibold tracking-[0.06em] text-[color:var(--text-faint)] uppercase">
+          beta
+        </span>
+      )}
       {showJobBadge && (
         <span className="size-[7px] shrink-0 animate-[dk-pulse_1.4s_ease-in-out_infinite] rounded-full bg-accent" />
       )}

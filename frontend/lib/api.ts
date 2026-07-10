@@ -6,6 +6,7 @@
 
 import type {
   AuthStatus,
+  BranchesResponse,
   Conversation,
   ConversationSummary,
   CreateUserRequest,
@@ -18,14 +19,18 @@ import type {
   HealthResponse,
   IngestRequest,
   Job,
+  LaunchRoutineRequest,
+  LaunchRoutineResponse,
   LLMConfig,
   LLMConfigRequest,
   LoginResponse,
   Me,
   ModelsListResponse,
   NeighborhoodPayload,
+  PlaybookSummary,
   ProjectGraphDTO,
   ProviderHealth,
+  RoutineRunSummary,
   RunJobResponse,
   User,
 } from "./types";
@@ -225,6 +230,26 @@ export const instancesApi = {
     }),
   listJobs: () => request<Job[]>("/instances/jobs"),
   getJob: (jobId: string) => request<Job>(`/instances/jobs/${jobId}`),
+};
+
+// -----------------------------------------------------------------------
+// Routines (code review / bug hunt)
+// -----------------------------------------------------------------------
+
+export const routinesApi = {
+  launch: (data: LaunchRoutineRequest) =>
+    request<LaunchRoutineResponse>("/routines/runs", { method: "POST", body: data }),
+  listRuns: (opts?: { project?: string; kind?: string; limit?: number }) =>
+    request<RoutineRunSummary[]>("/routines/runs", {
+      query: { project: opts?.project, kind: opts?.kind, limit: opts?.limit },
+    }),
+  deleteRun: (runId: string) =>
+    request<{ message: string; run_id: string }>(`/routines/runs/${encodeURIComponent(runId)}`, {
+      method: "DELETE",
+    }),
+  branches: (project: string) =>
+    request<BranchesResponse>("/routines/git/branches", { query: { project } }),
+  listPlaybooks: () => request<PlaybookSummary[]>("/routines/playbooks"),
 };
 
 // -----------------------------------------------------------------------

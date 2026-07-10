@@ -12,7 +12,7 @@ import { usePathname } from "next/navigation";
 
 import { useAuth } from "@/lib/auth";
 import { cn } from "@/lib/utils";
-import { isNavActive, PRIMARY_NAV, SECONDARY_NAV } from "./nav-items";
+import { isNavActive, PRIMARY_NAV, SECONDARY_NAV, type NavItem } from "./nav-items";
 
 export function MobileNav({ open, onClose }: { open: boolean; onClose: () => void }) {
   const pathname = usePathname();
@@ -20,7 +20,10 @@ export function MobileNav({ open, onClose }: { open: boolean; onClose: () => voi
 
   if (!open || !user) return null;
 
-  const items = [...PRIMARY_NAV, ...SECONDARY_NAV.filter((item) => !item.adminOnly || user.role === "admin")];
+  const items: NavItem[] = [
+    ...PRIMARY_NAV,
+    ...SECONDARY_NAV.filter((item) => !item.adminOnly || user.role === "admin"),
+  ];
 
   return (
     <>
@@ -41,13 +44,18 @@ export function MobileNav({ open, onClose }: { open: boolean; onClose: () => voi
             href={item.href}
             onClick={onClose}
             className={cn(
-              "flex h-[39px] items-center rounded-[10px] border border-transparent px-[11px] text-sm",
+              "flex h-[39px] items-center gap-2 rounded-[10px] border border-transparent px-[11px] text-sm",
               isNavActive(pathname, item.href)
                 ? "border-[color:var(--accent-ring)] bg-[color:var(--accent-weak)] font-semibold text-accent"
                 : "font-medium text-muted-foreground",
             )}
           >
-            {item.label}
+            <span className="flex-1">{item.label}</span>
+            {item.beta && (
+              <span className="shrink-0 rounded-[4px] border border-border px-[5px] py-px font-mono text-[9px] font-semibold tracking-[0.06em] text-[color:var(--text-faint)] uppercase">
+                beta
+              </span>
+            )}
           </Link>
         ))}
         <button
