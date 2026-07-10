@@ -247,12 +247,38 @@ export interface RunJobResponse {
 
 export type JobKind = "pipeline" | "refresh" | "graph" | "review" | "bughunt";
 export type JobStatus = "queued" | "running" | "succeeded" | "failed";
-export type JobStage = "" | "cgr" | "chunk" | "describe" | "upsert" | "update" | "done";
+export type JobStage =
+  | ""
+  | "cgr"
+  | "chunk"
+  | "describe"
+  | "upsert"
+  | "update"
+  | "diff"
+  | "context"
+  | "playbooks"
+  | "skills"
+  | "analyze"
+  | "summarize"
+  | "resolve"
+  | "hunt"
+  | "findings"
+  | "done";
 
 export interface StageProgress {
   stage: string;
   done: number;
   total: number;
+}
+
+/** One entry of a job's bounded step-event log (routine jobs only — see
+ * `services.jobs.add_job_event`). `seq` is monotonic even across the
+ * 200-entry trim, so a client can detect dropped history by a seq gap. */
+export interface JobEventEntry {
+  seq: number;
+  stage: string;
+  message: string;
+  ts: string;
 }
 
 export interface DescriptionStats {
@@ -314,6 +340,9 @@ export interface Job {
   stage_progress: StageProgress | null;
   result: PipelineResult | RefreshResult | GraphOnlyResult | null;
   error: string | null;
+  /** Routine (review/bughunt) step log only — null for pipeline/refresh/graph
+   * jobs, which never call `add_job_event`. */
+  events: JobEventEntry[] | null;
   created_at: string;
   updated_at: string;
 }
@@ -358,6 +387,52 @@ export interface RoutineRunSummary {
   created_at: string;
   updated_at: string;
   severity_counts: Record<string, number>;
+}
+
+/**
+ * A finding's supporting evidence — see `services.routines.review`'s /
+ * `services.routines.bughunt`'s `_validate_finding`. `hunk_excerpt` is
+ * review-only (bughunt has no diff to excerpt from); every other field is
+ * shared.
+ */
+export interface FindingEvidence {
+  hunk_excerpt?: string;
+  entities?: string[];
+  model?: string;
+  provider?: string;
+}
+
+export interface FindingDTO {
+  id: number;
+  file_path: string;
+  start_line: number | null;
+  end_line: number | null;
+  severity: string;
+  category: string;
+  title: string;
+  body: string;
+  suggestion: string | null;
+  evidence: FindingEvidence | null;
+  anchored: boolean;
+  created_at: string;
+}
+
+/** GET /routines/runs/{id} response — a run's full detail, findings included. */
+export interface RoutineRunDetail {
+  id: string;
+  /** The underlying job this run executed as — stream/poll it the same way
+   * as any other job (GET /instances/jobs/{job_id} and its /events route). */
+  job_id: string;
+  kind: RoutineKind;
+  project: string;
+  status: RoutineStatus;
+  params: Record<string, unknown>;
+  summary: string | null;
+  stats: Record<string, unknown> | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+  findings: FindingDTO[];
 }
 
 export interface BranchInfo {

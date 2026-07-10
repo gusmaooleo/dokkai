@@ -5,7 +5,7 @@
  * own status vocabulary (`queued|running|done|failed` — no `succeeded`).
  */
 
-import type { RoutineKind, RoutineRunSummary, RoutineStatus } from "@/lib/types";
+import type { RoutineKind, RoutineStatus } from "@/lib/types";
 
 /** Mirrors `ConversationCard`'s/`JobCard`'s `rel()`-derived helper — no date lib. */
 export function relativeTime(iso: string): string {
@@ -37,9 +37,13 @@ export const STATUS_CLASSES: Record<RoutineStatus, string> = {
   failed: "bg-[color:var(--accent-weak)] text-accent",
 };
 
-const SEVERITY_ORDER = ["critical", "high", "medium", "low", "info"] as const;
+/** Worst-to-least-severe order — shared by the run-history pills (C3) and
+ * the run-detail Findings tab's per-file grouping/finding rows (C4). */
+export const SEVERITY_ORDER = ["critical", "high", "medium", "low", "info"] as const;
 
-const SEVERITY_CLASSES: Record<string, string> = {
+/** Severity chip color classes — one finding's own chip (finding-row.tsx)
+ * reuses these directly, not just the aggregate `severityEntries` pills. */
+export const SEVERITY_CLASSES: Record<string, string> = {
   critical: "text-accent bg-[color:var(--accent-weak)]",
   high: "text-[#b8631f] bg-[rgba(216,127,42,.14)]",
   medium: "text-[#a9821f] bg-[rgba(196,155,42,.15)]",
@@ -56,8 +60,11 @@ export function severityEntries(counts: Record<string, number>): { severity: str
   }));
 }
 
-/** `target_ref` for a review run, or a truncated `scope` for a bug hunt run. */
-export function targetSummary(run: RoutineRunSummary): string {
+/** `target_ref` for a review run, or a truncated `scope` for a bug hunt run.
+ * Takes the `{kind, params}` slice shared by `RoutineRunSummary` (run-history
+ * cards, C3) and `RoutineRunDetail` (the run-detail header, C4) — narrower
+ * than either full type so both satisfy it structurally. */
+export function targetSummary(run: { kind: RoutineKind; params: Record<string, unknown> }): string {
   const params = run.params ?? {};
   if (run.kind === "review") {
     const target = typeof params.target_ref === "string" ? params.target_ref : null;
@@ -68,4 +75,19 @@ export function targetSummary(run: RoutineRunSummary): string {
   const scope = typeof params.scope === "string" ? params.scope : null;
   if (!scope) return "—";
   return scope.length > 90 ? `${scope.slice(0, 90)}…` : scope;
+}
+
+/** `created_at` → `updated_at` elapsed time, e.g. `"2m 14s"`/`"1h 4m"` — the
+ * run-detail header's duration figure (9e). For a still-running run
+ * `updated_at` is simply the latest progress tick, so this reads as "elapsed
+ * so far", which is the intended meaning while live. */
+export function formatDuration(createdAt: string, updatedAt: string): string {
+  const ms = Math.max(0, new Date(updatedAt).getTime() - new Date(createdAt).getTime());
+  const totalSeconds = Math.round(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
 }

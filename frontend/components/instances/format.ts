@@ -24,13 +24,42 @@ export function truncateMiddle(text: string, maxLength = 46): string {
   return `${text.slice(0, keep)}…${text.slice(text.length - keep)}`;
 }
 
-/** In-progress stages for each job kind, in order — excludes the terminal `done`. */
+/**
+ * In-progress stages for each job kind, in order — excludes the terminal
+ * `done`. review/bughunt mirror the exact `emit(stage, ...)` call sites in
+ * `services/routines/{review,bughunt}.py` (decision 9d/B — sub-part B added
+ * the conditional `playbooks`/`skills` stages on top of sub-part A's
+ * diff/context/analyze/summarize).
+ *
+ * NOT mirrored here: bughunt's `hunt` stage delegates to the agentic tool
+ * loop (`services/routines/agent_loop.py`), whose OWN `emit(...)` calls use
+ * `stage="agent"` (every tool call / skill load during the loop) — a label
+ * this list deliberately does NOT include. `components/routines/
+ * step-timeline.tsx`'s `STAGE_ALIASES` folds `"agent"` into `"hunt"` at
+ * render time instead, since the loop is conceptually part of the `hunt`
+ * step, not a step of its own.
+ */
 const STAGES_BY_KIND: Record<JobKind, string[]> = {
   pipeline: ["cgr", "chunk", "describe", "upsert"],
   refresh: ["chunk", "describe", "update"],
   graph: ["cgr"],
-  review: ["diff", "context", "analyze", "summarize"],
-  bughunt: [], // not implemented yet — see JOB_KIND_LABEL/launchRoutine's 400
+  review: ["diff", "context", "playbooks", "skills", "analyze", "summarize"],
+  bughunt: ["resolve", "playbooks", "hunt", "findings", "summarize"],
+};
+
+/**
+ * Stages within `STAGES_BY_KIND` that only run conditionally — `playbooks`
+ * fires only when the run's launch payload named at least one playbook,
+ * `skills` only when the skills catalog is non-empty (`_stage_playbooks`/
+ * `_stage_skills` in `review.py`, `_stage_playbooks` in `bughunt.py`). A run
+ * with none of these never emits an event for that stage — callers that
+ * render a live/expandable timeline (`components/routines/step-timeline.tsx`)
+ * should only show it once at least one event names it, never as a
+ * perpetually-pending step.
+ */
+export const OPTIONAL_STAGES_BY_KIND: Partial<Record<JobKind, string[]>> = {
+  review: ["playbooks", "skills"],
+  bughunt: ["playbooks"],
 };
 
 const STAGE_LABELS: Record<string, string> = {
@@ -41,7 +70,12 @@ const STAGE_LABELS: Record<string, string> = {
   update: "Update",
   diff: "Diff",
   context: "Context",
+  playbooks: "Playbooks",
+  skills: "Skills",
   analyze: "Analyze",
+  resolve: "Resolve",
+  hunt: "Hunt",
+  findings: "Findings",
   summarize: "Summarize",
   done: "Done",
 };

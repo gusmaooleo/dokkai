@@ -2778,6 +2778,13 @@ components:
       type: object
       properties:
         id: { type: string, format: uuid }
+        job_id:
+          type: string
+          format: uuid
+          description: >-
+            The underlying job this run executed as — poll/stream it the same
+            way as any other job (GET /instances/jobs/{job_id} and its
+            /events SSE route) for live per-stage progress.
         kind: { type: string, enum: [review, bughunt] }
         project: { type: string }
         status: { type: string, enum: [queued, running, done, failed] }

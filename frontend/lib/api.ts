@@ -30,6 +30,7 @@ import type {
   PlaybookSummary,
   ProjectGraphDTO,
   ProviderHealth,
+  RoutineRunDetail,
   RoutineRunSummary,
   RunJobResponse,
   User,
@@ -243,6 +244,7 @@ export const routinesApi = {
     request<RoutineRunSummary[]>("/routines/runs", {
       query: { project: opts?.project, kind: opts?.kind, limit: opts?.limit },
     }),
+  getRun: (runId: string) => request<RoutineRunDetail>(`/routines/runs/${encodeURIComponent(runId)}`),
   deleteRun: (runId: string) =>
     request<{ message: string; run_id: string }>(`/routines/runs/${encodeURIComponent(runId)}`, {
       method: "DELETE",

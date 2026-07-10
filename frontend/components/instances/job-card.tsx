@@ -18,6 +18,12 @@ type PillState = "done" | "active" | "todo";
 
 function pillState(job: Job, stage: string, index: number): PillState {
   if (job.status === "succeeded" || job.stage === "done") return "done";
+  // KNOWN LIMITATION (deferred): for review/bughunt jobs, `job.stage` stays
+  // "" for the whole run (routine emits only append to `job.events`, they
+  // never set `job.stage` — see `step-timeline.tsx`'s docstring), so every
+  // pill below reads "todo" until the job succeeds. The run-detail page's
+  // step timeline is the accurate live view for those kinds; C6 will link
+  // Instances rows there instead of fixing this pill row.
   const stages = stagesFor(job.kind);
   const currentIndex = stages.indexOf(job.stage);
   if (currentIndex === -1) return "todo";
