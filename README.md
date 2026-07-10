@@ -155,7 +155,7 @@ Something not working? `dokkai doctor` complements `up`/`status`: it checks the 
 
 | Command | Description |
 | --- | --- |
-| `dokkai up` | `docker compose up -d` for Weaviate, wait for it to become ready, probe Ollama and the configured embed/descriptor models (warnings only, non-fatal), report whether the API is reachable. Exits 1 only on a `docker compose`/Weaviate failure (or when the dokkai repo root cannot be resolved). |
+| `dokkai up [--ui]` | `docker compose up -d` for Weaviate, wait for it to become ready, probe Ollama and the configured embed/descriptor models (warnings only, non-fatal), report whether the API is reachable. With `--ui`, also brings up the frontend UI container (`docker compose --profile ui up -d`) and waits for it to become reachable. Exits 1 only on a `docker compose`/Weaviate failure (or when the dokkai repo root cannot be resolved). |
 | `dokkai status` | Read-only health check (API, Weaviate, Ollama + model presence) plus a list of ingested projects. Always exits 0. |
 | `dokkai ingest <repo-path> [--recreate] [--no-describe] [--yes]` | Validates the path, confirms `--recreate` interactively (or via `--yes`), calls `POST /instances/pipeline`, and streams live stage progress (SSE with a polling fallback) to a result summary. |
 | `dokkai graph <repo-path\|project> [--out <file>]` | Graph-only run: a **directory** argument enqueues `POST /instances/graph` (cgr only, no LLM/Weaviate) and prints the canonical graph JSON path (with `--out`, also exports the normalized graph); a **project name** argument fetches and prints/writes its normalized structural graph (`GET /graph/{project}?include=structural`) — stdout output pipes cleanly when `--out` is omitted. |
@@ -164,6 +164,8 @@ Something not working? `dokkai doctor` complements `up`/`status`: it checks the 
 | `dokkai doctor` | Read-only environment diagnosis: node/docker/uv/`DOKKAI_HOME` (required), Weaviate readiness, Ollama reachability + `EMBED_MODEL`/`DESC_MODEL` presence, and API reachability (warnings). Prints the exact fix command for each missing/warning item. Exits 1 if a required item is missing, 0 otherwise. |
 
 Global flag: `--api <url>` — dokkai API URL (default `http://localhost:8000`).
+
+`up`-only flag: `--ui` — also start the frontend UI container (compose `ui` profile) and wait for it to become reachable at `http://localhost:3000`.
 
 `ingest`-only flags:
 
@@ -230,6 +232,20 @@ cd frontend
 npm install
 npm run dev         # http://localhost:3000
 ```
+
+**Or, one command via Docker** (builds and runs the production frontend in a
+container alongside Weaviate/Postgres — the API itself still runs via
+`./dev.sh`, see [Current limitations](#current-limitations)):
+
+```bash
+dokkai up --ui
+# equivalent: docker compose --profile ui up -d
+```
+
+`docker compose up -d` (no profile) is unchanged — the `ui` service only
+starts when the `ui` profile is requested. `NEXT_PUBLIC_API_URL` is inlined
+into the frontend bundle at **build time**; if you change it, rebuild the
+image (`docker compose --profile ui build ui`).
 
 First login is `admin`/`admin` (or your `DOKKAI_ROOT_USER`/`DOKKAI_ROOT_PASSWORD` — see [Authentication](#authentication)).
 

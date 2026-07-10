@@ -8,6 +8,8 @@ import { modelInstalled, probeOllama } from "../lib/ollama.js";
 const WEAVIATE_READY_TIMEOUT_MS = 60_000;
 const WEAVIATE_POLL_INTERVAL_MS = 1_000;
 const OLLAMA_PROBE_TIMEOUT_MS = 5_000;
+const UI_READY_TIMEOUT_MS = 20_000;
+const UI_POLL_INTERVAL_MS = 1_000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -55,6 +57,20 @@ async function waitForWeaviateReady(url: string): Promise<boolean> {
   return false;
 }
 
+async function waitForUiReady(url: string): Promise<boolean> {
+  const deadline = Date.now() + UI_READY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetchWithTimeout(url, 3_000);
+      if (response.ok) return true;
+    } catch {
+      // not ready yet — keep polling
+    }
+    await sleep(UI_POLL_INTERVAL_MS);
+  }
+  return false;
+}
+
 async function checkOllama(
   baseUrl: string,
   embedModel: string,
@@ -86,11 +102,14 @@ async function checkOllama(
   }
 }
 
-export async function runUp(flags: { api?: string }): Promise<void> {
+export async function runUp(flags: { api?: string; ui?: boolean }): Promise<void> {
   const home = resolveDokkaiHome();
 
   console.log(chalk.bold(`Starting docker compose services in ${home}...`));
-  const exitCode = await runCommand("docker", ["compose", "up", "-d"], home);
+  const composeArgs = flags.ui
+    ? ["compose", "--profile", "ui", "up", "-d"]
+    : ["compose", "up", "-d"];
+  const exitCode = await runCommand("docker", composeArgs, home);
   if (exitCode !== 0) {
     console.error(
       chalk.red(`docker compose up failed with exit code ${exitCode}`),
@@ -125,6 +144,19 @@ export async function runUp(flags: { api?: string }): Promise<void> {
         `dokkai API is not running — start it with ./dev.sh (from ${home})`,
       ),
     );
+  }
+
+  if (flags.ui) {
+    const uiUrl = "http://localhost:3000";
+    const uiSpinner = ora(`Waiting for the frontend UI at ${uiUrl}...`).start();
+    const uiReady = await waitForUiReady(uiUrl);
+    if (uiReady) {
+      uiSpinner.succeed(chalk.green(`Frontend UI is reachable at ${uiUrl}`));
+    } else {
+      uiSpinner.fail(
+        `Frontend UI did not become reachable at ${uiUrl} within 20s`,
+      );
+    }
   }
 
   console.log(chalk.green("dokkai is up."));
