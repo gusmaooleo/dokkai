@@ -1,3 +1,5 @@
+import { ChatScreen } from "@/components/chat/chat-screen";
+
 export default async function ChatConversationPage({
   params,
 }: {
@@ -5,12 +7,5 @@ export default async function ChatConversationPage({
 }) {
   const { id } = await params;
 
-  return (
-    <div className="p-6">
-      <h2 className="font-display text-lg font-semibold text-foreground">Chat</h2>
-      <p className="mt-1 text-sm text-muted-foreground">
-        Conversation {id} — coming in a later step.
-      </p>
-    </div>
-  );
+  return <ChatScreen conversationId={id} />;
 }
