@@ -55,28 +55,42 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("auth: failed to seed admin user on boot: %s", e)
 
-    # If OLLAMA_CHAT_MODEL is set, preconfigure the local LLM and warm it on
-    # boot — so the first /chat isn't a cold start and the model stays resident
-    # (keep_alive). Seeding the config also means you don't have to re-POST
-    # /config/llm after every restart. Warming runs in the background and is
-    # best-effort, so the server still starts if Ollama isn't up yet.
-    model = os.getenv("OLLAMA_CHAT_MODEL")
-    if model:
-        from services.llm_config import get_config_store, LLMConfig
-        from services.llm_provider import OllamaProvider
+    # The persisted LLM config (Postgres) takes precedence over the
+    # OLLAMA_CHAT_MODEL env seed — the DB row only exists once someone has
+    # POSTed /config/llm, at which point it should survive restarts. If
+    # there's no row yet (or Postgres is unreachable), fall back to seeding
+    # from OLLAMA_CHAT_MODEL as before. load_persisted_config() never raises
+    # (it swallows and logs any Postgres error itself), so unlike init_db()
+    # above this call doesn't need its own try/except to keep boot alive.
+    from services.llm_config import get_config_store, load_persisted_config
 
-        base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        get_config_store().set_llm_config(
-            LLMConfig(is_local=True, provider_name="ollama", model=model, base_url=base_url)
-        )
+    persisted_config = await load_persisted_config()
+    if persisted_config is not None:
+        get_config_store().set_llm_config(persisted_config)
+    else:
+        # If OLLAMA_CHAT_MODEL is set, preconfigure the local LLM and warm it
+        # on boot — so the first /chat isn't a cold start and the model stays
+        # resident (keep_alive). Seeding the config also means you don't have
+        # to re-POST /config/llm after every restart. Warming runs in the
+        # background and is best-effort, so the server still starts if
+        # Ollama isn't up yet.
+        model = os.getenv("OLLAMA_CHAT_MODEL")
+        if model:
+            from services.llm_config import LLMConfig
+            from services.llm_provider import OllamaProvider
 
-        async def _warm() -> None:
-            try:
-                await OllamaProvider(base_url=base_url).warmup(model)
-            except Exception:
-                pass  # Ollama may not be up yet; the first real request will load it
+            base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+            get_config_store().set_llm_config(
+                LLMConfig(is_local=True, provider_name="ollama", model=model, base_url=base_url)
+            )
 
-        asyncio.create_task(_warm())
+            async def _warm() -> None:
+                try:
+                    await OllamaProvider(base_url=base_url).warmup(model)
+                except Exception:
+                    pass  # Ollama may not be up yet; the first real request will load it
+
+            asyncio.create_task(_warm())
 
     yield
 

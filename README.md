@@ -491,6 +491,8 @@ All configuration is via environment variables (loaded from `.env` at startup).
 
 > **Two Ollama endpoints, on purpose:** `OLLAMA_EMBED_ENDPOINT` is called by the Weaviate **container** (so it needs `host.docker.internal`), while `OLLAMA_BASE_URL` is called by the **API process** on the host (so it's `localhost`).
 
+> **LLM config persistence:** `POST /config/llm` write‑through persists the active provider/model to Postgres, and it's reloaded from there on every boot — taking precedence over `OLLAMA_CHAT_MODEL`. The env var is only a one‑time seed for a fresh install: it's used when no config has been saved yet (or Postgres is unreachable at boot), and that seed itself is never written back to the DB.
+
 ---
 
 ## Authentication
@@ -624,7 +626,8 @@ dokkai/
 
 These are known and tracked in the [Roadmap](#roadmap):
 
-- **In‑memory LLM config** — the active LLM provider/model resets on restart (re‑seedable via `OLLAMA_CHAT_MODEL`). Chat history is persisted in Postgres (see [Configuration](#configuration)); if Postgres is unreachable, the conversation endpoints and `/chat` degrade gracefully (503 / SSE `error` event) instead of crashing the API — though in practice, since [auth](#authentication) also requires Postgres to resolve a session, a fully unreachable Postgres now 503s every protected route at the auth layer regardless.
+- **LLM config persistence needs Postgres** — `POST /config/llm` always applies the change in memory immediately, but if Postgres is down at the time, the change won't survive a restart (logged server-side as a warning) until Postgres is back and you re‑POST. See [Configuration](#configuration) for the full persistence semantics.
+- Chat history is persisted in Postgres (see [Configuration](#configuration)); if Postgres is unreachable, the conversation endpoints and `/chat` degrade gracefully (503 / SSE `error` event) instead of crashing the API — though in practice, since [auth](#authentication) also requires Postgres to resolve a session, a fully unreachable Postgres now 503s every protected route at the auth layer regardless.
 - **Single repository at a time** per collection.
 - **Retrieval bias toward tests** — for "how does X work?" queries, test files often out‑rank the real implementation (test descriptions read like specs). End‑to‑end tests are also decoupled from implementation by the HTTP boundary, so graph expansion can't bridge them.
 - **The API is not yet containerized** — only Weaviate runs in `docker compose`; the API runs via `dev.sh`.
