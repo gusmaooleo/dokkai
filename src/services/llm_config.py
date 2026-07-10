@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import httpx
 
 from services.db import DatabaseUnavailableError, get_pool
-from services.llm_provider import get_provider, LLMProvider
+from services.llm_provider import effective_base_url, get_provider, LLMProvider
 
 logger = logging.getLogger(__name__)
 
@@ -210,10 +210,15 @@ async def validate_and_save_config(
             or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
         )
 
-        # Check Ollama is reachable
+        # Check Ollama is reachable. The probe itself is a USE-time HTTP call
+        # (services.llm_provider.effective_base_url rewrites localhost ->
+        # host.docker.internal inside the API container), but the value we
+        # go on to PERSIST below is resolved_base_url, unrewritten — the
+        # 14-A invariant is "never rewrite the stored value", not "never
+        # probe a rewritten one".
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(f"{resolved_base_url}/api/tags")
+                resp = await client.get(f"{effective_base_url(resolved_base_url)}/api/tags")
                 resp.raise_for_status()
                 data = resp.json()
         except Exception as e:

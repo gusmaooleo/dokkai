@@ -31,8 +31,15 @@ program
     "check/start local dependencies via docker compose and verify Ollama " +
       "models are present",
   )
-  .option("--ui", "also start the frontend UI container (compose `ui` profile)")
-  .action((options: { ui?: boolean }) =>
+  .option(
+    "--full",
+    "also start the API and frontend UI containers (compose `full` profile)",
+  )
+  .option(
+    "--ui",
+    "deprecated alias for --full (also starts the containerized API)",
+  )
+  .action((options: { full?: boolean; ui?: boolean }) =>
     runUp({ ...program.opts(), ...options }),
   );
 
