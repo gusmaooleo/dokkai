@@ -1572,6 +1572,11 @@ components:
       properties:
         conversation_id: { type: string }
         project_name: { type: string }
+        audience: { type: string }
+        title:
+          type: string
+          nullable: true
+          description: Derived from the first user message at creation; null for conversations created before this field existed (UI falls back to the preview).
         message_count: { type: integer }
         last_message_preview: { type: string }
         created_at: { type: string }
@@ -1594,6 +1599,10 @@ components:
         conversation_id: { type: string }
         project_name: { type: string }
         audience: { type: string }
+        title:
+          type: string
+          nullable: true
+          description: Derived from the first user message at creation; null for conversations created before this field existed (UI falls back to the preview).
         created_at: { type: string }
         updated_at: { type: string }
         messages:
