@@ -245,7 +245,7 @@ export interface RunJobResponse {
   status: string;
 }
 
-export type JobKind = "pipeline" | "refresh" | "graph";
+export type JobKind = "pipeline" | "refresh" | "graph" | "review" | "bughunt";
 export type JobStatus = "queued" | "running" | "succeeded" | "failed";
 export type JobStage = "" | "cgr" | "chunk" | "describe" | "upsert" | "update" | "done";
 

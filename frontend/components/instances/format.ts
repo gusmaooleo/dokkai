@@ -29,6 +29,8 @@ const STAGES_BY_KIND: Record<JobKind, string[]> = {
   pipeline: ["cgr", "chunk", "describe", "upsert"],
   refresh: ["chunk", "describe", "update"],
   graph: ["cgr"],
+  review: ["diff", "context", "analyze", "summarize"],
+  bughunt: [], // not implemented yet — see JOB_KIND_LABEL/launchRoutine's 400
 };
 
 const STAGE_LABELS: Record<string, string> = {
@@ -37,6 +39,10 @@ const STAGE_LABELS: Record<string, string> = {
   describe: "Describe",
   upsert: "Upsert",
   update: "Update",
+  diff: "Diff",
+  context: "Context",
+  analyze: "Analyze",
+  summarize: "Summarize",
   done: "Done",
 };
 
@@ -52,6 +58,8 @@ export const JOB_KIND_LABEL: Record<JobKind, string> = {
   pipeline: "Full ingestion",
   refresh: "Describe refresh",
   graph: "Graph only",
+  review: "Code review",
+  bughunt: "Bug hunt",
 };
 
 /** Short result summary for a terminal job's completed row. */

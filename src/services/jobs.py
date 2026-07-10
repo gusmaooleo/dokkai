@@ -25,6 +25,7 @@ import os
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
+from typing import Callable
 
 import asyncpg
 
@@ -54,7 +55,7 @@ class Job:
     repo_path: str
     recreate: bool = False
     describe: bool = True
-    kind: str = "pipeline"   # pipeline | refresh | graph
+    kind: str = "pipeline"   # pipeline | refresh | graph | review | bughunt
     project: str = ""        # refresh jobs only
     force: bool = False      # refresh jobs only
     status: str = "queued"   # queued | running | succeeded | failed
@@ -64,11 +65,44 @@ class Job:
     stage_progress: dict | None = None  # {"stage": ..., "done": N, "total": N}
     result: dict | None = None
     error: str | None = None
+    events: list[dict] | None = None  # routine (review/bughunt) step log only — see add_job_event
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+_MAX_JOB_EVENTS = 200
+
+
+def add_job_event(job: Job, stage: str, message: str) -> None:
+    """
+    Append a bounded, monotonic-seq progress event to a job's in-memory event
+    log. Used by routine (review/bughunt) runners to stream step-by-step
+    progress — built-in kinds (pipeline/refresh/graph) never call this, so
+    their ``events`` stays ``None`` and their payload doesn't grow.
+
+    Only the last ``_MAX_JOB_EVENTS`` events are kept (oldest dropped first),
+    but ``seq`` keeps incrementing across drops so a client can detect a gap
+    by seeing consecutive seqs jump by more than 1.
+
+    In-memory only — does NOT persist to Postgres itself. Events ride along
+    in the job's JSONB snapshot only at the existing running/terminal
+    write-through points (see module docstring), so there are no per-tick DB
+    writes. Bumps ``updated_at`` so the existing SSE stream
+    (``GET /instances/jobs/{id}/events``, which polls on that field) picks
+    up new events live without any change to that endpoint.
+    """
+    events = job.events
+    if events is None:
+        events = []
+        job.events = events
+    next_seq = (events[-1]["seq"] + 1) if events else 0
+    events.append({"seq": next_seq, "stage": stage, "message": message, "ts": _now()})
+    if len(events) > _MAX_JOB_EVENTS:
+        del events[: len(events) - _MAX_JOB_EVENTS]
+    job.updated_at = _now()
 
 
 class JobStore:
@@ -97,6 +131,18 @@ class JobStore:
     def create_graph_only(self, repo_path: str) -> Job:
         project = os.path.basename(os.path.normpath(repo_path))
         job = Job(id=str(uuid.uuid4()), repo_path=repo_path, kind="graph", project=project)
+        self._jobs[job.id] = job
+        return job
+
+    def create_external(self, job_id: str, kind: str, project: str, repo_path: str) -> Job:
+        """
+        Create a job for an externally-driven kind (``review``/``bughunt`` —
+        see ``services.routines.engine.submit_routine``). Unlike the other
+        ``create_*`` methods, the id is supplied by the caller: a
+        ``routine_runs`` row referencing it must already exist before this
+        job starts running.
+        """
+        job = Job(id=job_id, repo_path=repo_path, kind=kind, project=project)
         self._jobs[job.id] = job
         return job
 
@@ -437,6 +483,78 @@ async def submit_graph_only(repo_path: str) -> Job:
     job = store.create_graph_only(repo_path)
     await _persist_job_via_pool(job)
     task = asyncio.create_task(asyncio.to_thread(_run_graph_only_sync, job))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return job
+
+
+# -----------------------------------------------------------------------
+# External job kinds (review / bughunt — services.routines.engine)
+# -----------------------------------------------------------------------
+#
+# This module intentionally does NOT import services.routines: the
+# dependency runs the other way (routines imports jobs). The mechanism is a
+# submit-with-runner API rather than a kind→callable registry — the caller
+# (routines.engine.submit_routine) hands this module a plain sync callable
+# that fully owns the actual routine work; this module only ever manages
+# generic Job lifecycle (status, timestamps, write-through, the per-project
+# lock) exactly like it does for pipeline/refresh/graph, without knowing
+# anything about what "review" or "bughunt" mean.
+
+ExternalRunner = Callable[[Job, Callable[[str, str], None]], None]
+
+
+def _run_external_sync(job: Job, runner: ExternalRunner) -> None:
+    """
+    Execute an externally-driven job (review/bughunt) in a worker thread,
+    mirroring ``_run_pipeline_sync``'s thread/status/persist pattern. Unlike
+    the built-in kinds, the actual work is fully owned by ``runner`` — this
+    function only manages Job lifecycle plumbing (status, timestamps,
+    write-through) and hands the runner an ``emit(stage, message)`` closure
+    for step events (see ``add_job_event``).
+    """
+    job.status = "running"
+    job.updated_at = _now()
+    _persist_job_from_worker(job)
+
+    def emit(stage: str, message: str) -> None:
+        add_job_event(job, stage, message)
+
+    try:
+        runner(job, emit)
+        job.status = "succeeded"
+        job.stage = "done"
+    except Exception as e:  # surface a readable error to the poller
+        job.status = "failed"
+        job.error = f"{type(e).__name__}: {e}"
+    finally:
+        job.updated_at = _now()
+        _persist_job_from_worker(job)
+
+
+async def submit_external(
+    kind: str, project: str, repo_path: str, job_id: str, runner: ExternalRunner
+) -> Job:
+    """
+    Create a job for an externally-driven kind (``review``/``bughunt``) with
+    a caller-supplied id and spawn it on a worker thread. Returns
+    immediately with the queued job.
+
+    ``job_id`` is supplied by the caller (``services.routines.engine``)
+    because a ``routine_runs`` row referencing it must already exist before
+    this job starts — see ``submit_routine`` there.
+
+    Raises ``ProjectJobConflict`` if a job is already queued/running for the
+    same project (any kind, 9g) — see ``submit_pipeline`` for why the
+    check-then-create is race-free on the event loop.
+    """
+    store = get_job_store()
+    active = store.active_job_for_project(project)
+    if active is not None:
+        raise ProjectJobConflict(project)
+    job = store.create_external(job_id, kind, project, repo_path)
+    await _persist_job_via_pool(job)
+    task = asyncio.create_task(asyncio.to_thread(_run_external_sync, job, runner))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     return job

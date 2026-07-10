@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from controllers import auth, instances, chat, config, graph
+from controllers import auth, instances, chat, config, graph, routines
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -37,6 +37,15 @@ async def lifespan(app: FastAPI):
             await sweep_interrupted_jobs()
         except Exception as e:
             logger.warning("job history: failed to sweep interrupted jobs on boot: %s", e)
+
+        # Same idea, for routine runs (code review/bughunt) — a run stuck
+        # 'queued'/'running' belongs to a worker that died before finishing.
+        from services.routines.store import sweep_interrupted_routine_runs
+
+        try:
+            await sweep_interrupted_routine_runs()
+        except Exception as e:
+            logger.warning("routines: failed to sweep interrupted runs on boot: %s", e)
 
         # Seed the admin user (or apply DOKKAI_ROOT_* overrides) now that
         # Postgres is confirmed reachable. Best-effort like the rest of this
@@ -121,6 +130,7 @@ app.include_router(instances.router)
 app.include_router(chat.router)
 app.include_router(config.router)
 app.include_router(graph.router)
+app.include_router(routines.router)
 
 @app.get("/")
 async def root():

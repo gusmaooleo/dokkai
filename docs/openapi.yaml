@@ -51,6 +51,11 @@ tags:
     description: Configure and inspect the active LLM provider.
   - name: Graph
     description: Read-only queries over an ingested project's dependency graph.
+  - name: Routines
+    description: >-
+      Code review / bug-hunt routines, run as background jobs on the same job
+      system as ingestion. Sub-part A ships `kind: review` only —
+      `kind: bughunt` is honest-400ed until a later release.
 
 paths:
   /:
@@ -1000,6 +1005,287 @@ paths:
           $ref: "#/components/responses/ServiceUnavailable"
 
   # ---------------------------------------------------------------------------
+  # Routines
+  # ---------------------------------------------------------------------------
+  /routines/runs:
+    post:
+      tags: [Routines]
+      summary: Launch a routine run
+      description: |
+        Launch a routine run (currently only `kind: review`) as a
+        **background job** on the same job system as ingestion, and return
+        immediately with `run_id`/`job_id`. Poll `GET /routines/runs/{run_id}`
+        (or stream `GET /instances/jobs/{job_id}/events`, same SSE framing as
+        ingestion jobs) for live per-stage progress (`diff` → `context` →
+        `analyze` → `summarize`) and the final result.
+
+        `kind: bughunt` is honest-400ed — that routine ships in a later
+        release.
+
+        For `kind: review`, pre-flights run **before** the job is created,
+        in order, so a bad request fails synchronously with an actionable
+        message instead of only surfacing inside the job's result: the
+        project must have an ingested graph (`404`), its `repo_path` must be
+        a git repository (`400`), `base_ref` (or the project's default base
+        branch)/`target_ref` must resolve (`400`), and the LLM — resolved
+        from the launch payload's `model`/`provider` or else the active
+        config from `POST /config/llm` — must be configured and healthy
+        (`400`).
+
+        **Model resolution — no hardcoded default**: `model`/`provider` in
+        the request body override the active LLM config (`POST /config/llm`)
+        for this run only; if neither the request nor the active config
+        supplies a usable provider+model, the launch fails with the
+        `no_llm_configured` example below.
+
+        Review and ingestion of the **same project** are mutually
+        exclusive — this shares the same per-project job lock as
+        `/instances/pipeline`/`/instances/graph`/`/instances/{project}/describe`.
+
+        Requires the `admin` or `user` role.
+      operationId: launchRoutine
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LaunchRoutineRequest"
+            examples:
+              review_default_base:
+                summary: Review against the default base branch, active LLM config
+                value:
+                  kind: review
+                  project: your-repo
+                  target_ref: feature/my-branch
+              review_explicit_base:
+                summary: Review against an explicit base_ref
+                value:
+                  kind: review
+                  project: your-repo
+                  target_ref: feature/my-branch
+                  base_ref: develop
+              review_model_override:
+                summary: Override the model/provider for just this run
+                value:
+                  kind: review
+                  project: your-repo
+                  target_ref: feature/my-branch
+                  model: qwen2.5-coder:14b
+                  provider: ollama
+      responses:
+        "202":
+          description: Run created and job accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LaunchRoutineResponse"
+        "400":
+          description: >-
+            `kind: bughunt` (not yet implemented), a git-level failure (not a
+            repo / unresolvable ref), or no usable LLM could be resolved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                bughunt_not_yet:
+                  summary: kind = bughunt (arrives in a later release)
+                  value:
+                    detail: "bug hunt routines arrive in a later release"
+                bad_ref:
+                  summary: target_ref/base_ref does not resolve
+                  value:
+                    detail: "unknown git ref 'no-such-branch' in repository '/path/to/repo'"
+                no_llm_configured:
+                  summary: No LLM provider configured, and none given in the launch payload
+                  value:
+                    detail: "No LLM provider configured for this review. POST to /config/llm to set one up, or pass model/provider in the launch payload."
+                model_unavailable:
+                  summary: model override not pulled in Ollama
+                  value:
+                    detail: "model 'qwen2.5-coder:14b' is not available in Ollama at http://localhost:11434 — pull it with 'ollama pull qwen2.5-coder:14b'"
+        "404":
+          description: The project has no ingested graph.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "no graph found for project 'your-repo' — run POST /instances/pipeline to ingest it"
+        "409":
+          description: A pipeline/refresh/graph/review job is already queued/running for this project.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "another job is running for project 'your-repo'"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    get:
+      tags: [Routines]
+      summary: List routine runs
+      description: |
+        Most recent first, optionally filtered by `project` and/or `kind`.
+        Each entry carries `severity_counts` (severity → count over that
+        run's findings).
+
+        Requires any authenticated role.
+      operationId: listRoutineRuns
+      parameters:
+        - name: project
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: kind
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [review, bughunt]
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        "200":
+          description: Routine runs.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/RoutineRunSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /routines/runs/{run_id}:
+    get:
+      tags: [Routines]
+      summary: Get a routine run
+      description: A run's full detail, findings included. Requires any authenticated role.
+      operationId: getRoutineRun
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The run's detail.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoutineRunDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No routine run with that id.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "routine run 'b0dc2159-5b52-4b73-a7ca-9f094496d64b' not found"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    delete:
+      tags: [Routines]
+      summary: Delete a routine run
+      description: Cascades to the run's findings. Requires the `admin` or `user` role.
+      operationId: deleteRoutineRun
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: "Routine run deleted" }
+                  run_id: { type: string, format: uuid }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: No routine run with that id.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "routine run 'b0dc2159-5b52-4b73-a7ca-9f094496d64b' not found"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /routines/git/branches:
+    get:
+      tags: [Routines]
+      summary: List a project's git branches
+      description: |
+        Local branches (`refs/heads`) of the project's repository, current
+        branch and most-recently-committed first, plus the resolved
+        `default_base` (`origin/HEAD`'s target if set, else the first of
+        `main`/`master` that exists locally).
+
+        Requires any authenticated role.
+      operationId: getBranches
+      parameters:
+        - name: project
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Branches and default base.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BranchesResponse"
+        "400":
+          description: The project's repo_path is not a git repository, or a default base branch could not be determined.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "could not determine a default base branch for repository '/path/to/repo' — no origin/HEAD and no local 'main' or 'master' branch"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: The project has no ingested graph.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "no graph found for project 'your-repo' — run POST /instances/pipeline to ingest it"
+
+  # ---------------------------------------------------------------------------
   # Chat
   # ---------------------------------------------------------------------------
   /chat:
@@ -1872,3 +2158,153 @@ components:
             $ref: "#/components/schemas/FileEdgeDTO"
         stats:
           $ref: "#/components/schemas/FileViewStatsDTO"
+
+    LaunchRoutineRequest:
+      type: object
+      required: [kind, project]
+      properties:
+        kind:
+          type: string
+          enum: [review, bughunt]
+          description: Only `review` is implemented; `bughunt` returns 400 in this release.
+        project:
+          type: string
+          description: An already-ingested project's `project_name`.
+          example: your-repo
+        target_ref:
+          type: string
+          nullable: true
+          description: "Required for `kind: review` (422 if omitted). Unused for `bughunt` in this release."
+          example: feature/my-branch
+        base_ref:
+          type: string
+          nullable: true
+          description: >-
+            Defaults to the project repo's default base branch
+            (`origin/HEAD`'s target, else local `main`/`master`) when omitted.
+          example: develop
+        scope:
+          type: string
+          nullable: true
+          description: bughunt-only; unused in this release (bughunt itself 400s at launch).
+        model:
+          type: string
+          nullable: true
+          description: Override the active LLM config's model for this run only.
+          example: qwen2.5-coder:14b
+        provider:
+          type: string
+          nullable: true
+          description: >-
+            Override the active LLM config's provider for this run only.
+            Supported providers: ollama, openai, anthropic — an unknown value
+            is rejected at launch with a 400, not a validation error.
+
+    LaunchRoutineResponse:
+      type: object
+      properties:
+        run_id: { type: string, format: uuid }
+        job_id:
+          type: string
+          format: uuid
+          description: Poll/stream this the same way as any other job — see GET /instances/jobs/{job_id} and its /events SSE route.
+
+    RoutineRunSummary:
+      type: object
+      description: One entry of GET /routines/runs's listing.
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [review, bughunt] }
+        project: { type: string }
+        status: { type: string, enum: [queued, running, done, failed] }
+        params:
+          type: object
+          description: The launch params this run was submitted with (repo_path, target_ref, base_ref, model, provider).
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        severity_counts:
+          type: object
+          additionalProperties:
+            type: integer
+          description: 'Finding count by severity, e.g. {"high": 2, "low": 5}. Empty object if the run has no findings yet.'
+
+    FindingDTO:
+      type: object
+      properties:
+        id: { type: integer }
+        file_path: { type: string }
+        start_line: { type: integer, nullable: true }
+        end_line: { type: integer, nullable: true }
+        severity:
+          type: string
+          enum: [critical, high, medium, low, info]
+        category:
+          type: string
+          enum: [bug, security, performance, maintainability, style, other]
+        title: { type: string }
+        body: { type: string }
+        suggestion: { type: string, nullable: true }
+        evidence:
+          type: object
+          nullable: true
+          description: 'Supporting context: {hunk_excerpt, entities, model, provider}.'
+        anchored:
+          type: boolean
+          description: >-
+            False when the model's start_line didn't fall within (±2 lines
+            of) a changed range — the finding is kept, not dropped; treat
+            its line numbers as approximate. See the "Code review routines"
+            section of the README for the retrieval-staleness caveat this
+            relates to.
+        created_at: { type: string, format: date-time }
+
+    RoutineRunDetail:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [review, bughunt] }
+        project: { type: string }
+        status: { type: string, enum: [queued, running, done, failed] }
+        params:
+          type: object
+          description: The launch params this run was submitted with.
+        summary:
+          type: string
+          nullable: true
+          description: Markdown summary of the run. Null until the run reaches status = done.
+        stats:
+          type: object
+          nullable: true
+          description: >-
+            Per-stage counters (files changed/reviewable/skipped, hunks,
+            insertions/deletions, entities_matched, context_chars_total,
+            findings_total, findings_anchored, parse_failures, llm_calls,
+            prompt_chars_total, wall_seconds_analyze, wall_seconds_summarize)
+            plus the resolved model/provider. Null until the run reaches a
+            terminal status.
+        error:
+          type: string
+          nullable: true
+          description: Set when status = failed.
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        findings:
+          type: array
+          items:
+            $ref: "#/components/schemas/FindingDTO"
+
+    BranchInfo:
+      type: object
+      properties:
+        name: { type: string }
+        is_current: { type: boolean }
+        last_commit_date: { type: string, format: date-time }
+
+    BranchesResponse:
+      type: object
+      properties:
+        branches:
+          type: array
+          items:
+            $ref: "#/components/schemas/BranchInfo"
+        default_base: { type: string }
