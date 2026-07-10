@@ -3,22 +3,34 @@
 /**
  * Tiny theme toggle: `data-theme` on `<html>` is the single source of truth
  * (set synchronously pre-hydration by the inline script in `app/layout.tsx`
- * so there's no flash of wrong theme). This hook just reads it on mount and
- * flips it — light/dark are the only two values dokkai supports.
+ * so there's no flash of wrong theme). This context just reads it on mount
+ * and flips it — light/dark are the only two values dokkai supports.
+ *
+ * Context-backed (not per-instance state) so every consumer — sidebar,
+ * login, graph canvas — re-renders together when the sidebar's toggle
+ * button flips the theme.
  */
 
-import { useCallback, useState } from "react";
+import { createContext, useCallback, useContext, useState, type ReactNode } from "react";
 
 const THEME_KEY = "dokkai.theme";
 
 export type Theme = "light" | "dark";
+
+interface ThemeContextValue {
+  theme: Theme;
+  isDark: boolean;
+  toggleTheme: () => void;
+}
+
+const ThemeContext = createContext<ThemeContextValue | undefined>(undefined);
 
 function readTheme(): Theme {
   if (typeof document === "undefined") return "light";
   return document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
 }
 
-export function useTheme() {
+export function ThemeProvider({ children }: { children: ReactNode }) {
   // Lazy initializer: reads the real `data-theme` (set pre-hydration by the
   // inline script in `app/layout.tsx`) directly, rather than starting at
   // "light" and syncing via an effect — one render, no theme-flip flicker.
@@ -36,5 +48,15 @@ export function useTheme() {
     });
   }, []);
 
-  return { theme, isDark: theme === "dark", toggleTheme };
+  return (
+    <ThemeContext.Provider value={{ theme, isDark: theme === "dark", toggleTheme }}>
+      {children}
+    </ThemeContext.Provider>
+  );
+}
+
+export function useTheme(): ThemeContextValue {
+  const ctx = useContext(ThemeContext);
+  if (!ctx) throw new Error("useTheme must be used within a ThemeProvider");
+  return ctx;
 }

@@ -44,14 +44,22 @@ function latestSources(messages: ChatMessageState[]) {
   return [];
 }
 
-export function ChatScreen({ conversationId: initialConversationId }: { conversationId?: string }) {
+export function ChatScreen({
+  conversationId: initialConversationId,
+  initialComposerText,
+}: {
+  conversationId?: string;
+  /** Prefills the composer — set from `/chat?prefill=`, used by the graph
+   *  screen's "Ask about this in chat" button. */
+  initialComposerText?: string;
+}) {
   const router = useRouter();
   const { user } = useAuth();
   const { active, loading: projectLoading } = useProject();
   const { toast } = useToast();
 
   const [messages, setMessages] = useState<ChatMessageState[]>([]);
-  const [composerText, setComposerText] = useState("");
+  const [composerText, setComposerText] = useState(initialComposerText ?? "");
   const [audience, setAudience] = useState<Audience>("developer");
   const [conversationId, setConversationId] = useState<string | undefined>(initialConversationId);
   const [streaming, setStreaming] = useState(false);
