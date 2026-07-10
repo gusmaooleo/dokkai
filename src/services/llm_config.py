@@ -8,13 +8,17 @@ in a database-backed implementation later.
 
 from __future__ import annotations
 
+import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 import httpx
 
+from services.db import DatabaseUnavailableError, get_pool
 from services.llm_provider import get_provider, LLMProvider
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -93,6 +97,83 @@ def set_config_store(store: ConfigStore) -> None:
     """Replace the global config store (e.g., switch to DB-backed)."""
     global _config_store
     _config_store = store
+
+
+# -----------------------------------------------------------------------
+# Postgres persistence (write-through) — the DB row is the durable copy of
+# the active config; InMemoryConfigStore remains the runtime source of truth
+# and is what every read (GET /config/llm, get_active_provider) consults.
+# -----------------------------------------------------------------------
+
+async def load_persisted_config() -> LLMConfig | None:
+    """
+    Load the persisted LLM config from Postgres, if a row exists.
+
+    Never raises: returns None if there is no saved row yet, or if Postgres
+    is unreachable at all — a pool that never got created (get_pool raises
+    DatabaseUnavailableError) *or* a pool that was created at boot but whose
+    connection has since died (raw asyncpg/OS errors from ``fetchrow``, e.g.
+    ``asyncpg.InterfaceError``, which isn't even a ``PostgresError``). Callers
+    (boot) should fall back to the env seed in either case. Logs a warning
+    when the reason is a down Postgres.
+    """
+    try:
+        pool = await get_pool()
+        row = await pool.fetchrow(
+            "SELECT is_local, provider_name, model, key, base_url FROM llm_config WHERE id = 1"
+        )
+    except DatabaseUnavailableError as e:
+        logger.warning(
+            "LLM config: Postgres unavailable, falling back to env seed: %s", e
+        )
+        return None
+    except Exception as e:
+        logger.warning(
+            "LLM config: failed to load persisted config, falling back to env seed: %s", e
+        )
+        return None
+
+    if row is None:
+        return None
+
+    return LLMConfig(
+        is_local=row["is_local"],
+        provider_name=row["provider_name"],
+        model=row["model"],
+        key=row["key"] or "",
+        base_url=row["base_url"],
+    )
+
+
+async def save_persisted_config(config: LLMConfig) -> None:
+    """
+    Upsert the active LLM config into the single-row ``llm_config`` table.
+
+    Raises if Postgres is unreachable: :class:`DatabaseUnavailableError` when
+    no pool has ever been created, or a raw asyncpg/OS error when a
+    previously-created pool's connection has since died. Callers decide how
+    to degrade (the in-memory config is the runtime source of truth
+    regardless).
+    """
+    pool = await get_pool()
+    await pool.execute(
+        """
+        INSERT INTO llm_config (id, is_local, provider_name, model, key, base_url, updated_at)
+        VALUES (1, $1, $2, $3, $4, $5, now())
+        ON CONFLICT (id) DO UPDATE SET
+            is_local = EXCLUDED.is_local,
+            provider_name = EXCLUDED.provider_name,
+            model = EXCLUDED.model,
+            key = EXCLUDED.key,
+            base_url = EXCLUDED.base_url,
+            updated_at = now()
+        """,
+        config.is_local,
+        config.provider_name,
+        config.model,
+        config.key,
+        config.base_url,
+    )
 
 
 # -----------------------------------------------------------------------
@@ -187,6 +268,22 @@ async def validate_and_save_config(
 
     store = get_config_store()
     store.set_llm_config(config)
+
+    # Write-through to Postgres. Best-effort: the in-memory config (the
+    # runtime source of truth) is already updated above, so a down Postgres
+    # doesn't block the request — just log it, since the change won't
+    # survive a restart until persistence is back. Broad except: a pool
+    # created at boot but since disconnected raises raw asyncpg/OS errors
+    # from ``execute`` (not DatabaseUnavailableError, which only fires when
+    # no pool exists at all) — a failed persist must never fail the POST.
+    try:
+        await save_persisted_config(config)
+    except Exception as e:
+        logger.warning(
+            "LLM config: saved in memory but failed to persist to Postgres "
+            "(will not survive a restart): %s", e,
+        )
+
     return True, f"LLM config saved: {name}/{model}"
 
 

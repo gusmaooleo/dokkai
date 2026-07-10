@@ -15,6 +15,8 @@ class ProjectGraphDTO(BaseModel):
     nodes: int
     edges: int
     generated_at: str
+    chunks: int | None = None
+    repo_path: str | None = None
 
 
 class GraphNodeDTO(BaseModel):
@@ -52,6 +54,11 @@ class GraphResponse(BaseModel):
 
 class NeighborhoodNodeDTO(GraphNodeDTO):
     hop: int
+
+
+class EntityDetailResponse(GraphNodeDTO):
+    description: str | None = None
+    chunk_text: str | None = None
 
 
 class NeighborhoodStatsDTO(BaseModel):

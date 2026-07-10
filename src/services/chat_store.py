@@ -42,6 +42,7 @@ class Conversation:
     conversation_id: str
     project_name: str
     audience: str = "developer"
+    title: str | None = None
     messages: list[ChatMessage] = field(default_factory=list)
     created_at: str = ""
     updated_at: str = ""
@@ -107,6 +108,28 @@ class ChatStore(ABC):
 # Postgres-based implementation
 # -----------------------------------------------------------------------
 
+_TITLE_MAX_LEN = 80
+
+
+def derive_title(text: str, max_len: int = _TITLE_MAX_LEN) -> str:
+    """
+    Derive a conversation title from a message.
+
+    Collapses internal whitespace/newlines to single spaces, then truncates
+    to ``max_len`` characters on a whole-word boundary where possible,
+    appending a single-character ellipsis ("…") when truncated.
+    """
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= max_len:
+        return collapsed
+
+    truncated = collapsed[:max_len]
+    last_space = truncated.rfind(" ")
+    if last_space > 0:
+        truncated = truncated[:last_space]
+    return truncated + "…"
+
+
 def _row_to_message(row: Any) -> ChatMessage:
     raw_sources = row["sources"]
     sources = json.loads(raw_sources) if isinstance(raw_sources, str) else (raw_sources or [])
@@ -161,7 +184,7 @@ class PostgresChatStore(ChatStore):
             """
             INSERT INTO conversations (id, project_name, audience)
             VALUES ($1, $2, $3)
-            RETURNING id, project_name, audience, created_at, updated_at
+            RETURNING id, project_name, audience, title, created_at, updated_at
             """,
             conv_id,
             project_name,
@@ -171,6 +194,7 @@ class PostgresChatStore(ChatStore):
             conversation_id=str(row["id"]),
             project_name=row["project_name"],
             audience=row["audience"],
+            title=row["title"],
             messages=[],
             created_at=row["created_at"].isoformat(),
             updated_at=row["updated_at"].isoformat(),
@@ -192,13 +216,14 @@ class PostgresChatStore(ChatStore):
             async with conn.transaction():
                 await conn.execute(
                     """
-                    INSERT INTO conversations (id, project_name, audience)
-                    VALUES ($1, $2, $3)
+                    INSERT INTO conversations (id, project_name, audience, title)
+                    VALUES ($1, $2, $3, $4)
                     ON CONFLICT (id) DO NOTHING
                     """,
                     conv_uuid,
                     project_name,
                     audience,
+                    derive_title(message.content) if message.role == "user" else None,
                 )
                 await conn.execute(
                     """
@@ -232,7 +257,7 @@ class PostgresChatStore(ChatStore):
         pool = await get_pool()
         conv_row = await pool.fetchrow(
             """
-            SELECT id, project_name, audience, created_at, updated_at
+            SELECT id, project_name, audience, title, created_at, updated_at
             FROM conversations WHERE id = $1
             """,
             conv_uuid,
@@ -253,6 +278,7 @@ class PostgresChatStore(ChatStore):
             conversation_id=str(conv_row["id"]),
             project_name=conv_row["project_name"],
             audience=conv_row["audience"],
+            title=conv_row["title"],
             messages=[_row_to_message(r) for r in message_rows],
             created_at=conv_row["created_at"].isoformat(),
             updated_at=conv_row["updated_at"].isoformat(),
@@ -263,7 +289,7 @@ class PostgresChatStore(ChatStore):
         pool = await get_pool()
         conv_rows = await pool.fetch(
             """
-            SELECT id, project_name, audience, created_at, updated_at
+            SELECT id, project_name, audience, title, created_at, updated_at
             FROM conversations ORDER BY updated_at DESC
             """
         )
@@ -283,6 +309,7 @@ class PostgresChatStore(ChatStore):
                 conversation_id=str(row["id"]),
                 project_name=row["project_name"],
                 audience=row["audience"],
+                title=row["title"],
                 messages=messages_by_conv.get(row["id"], []),
                 created_at=row["created_at"].isoformat(),
                 updated_at=row["updated_at"].isoformat(),

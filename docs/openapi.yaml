@@ -813,6 +813,66 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
+  /graph/{project}/entity:
+    get:
+      tags: [Graph]
+      summary: Get a single entity
+      description: |
+        Returns `name`'s graph node — resolved the same way
+        `GET /graph/{project}/neighborhood` resolves its `entity` query
+        parameter — enriched with `description` and `chunk_text` fetched
+        from Weaviate via the same deterministic UUID lookup the MCP
+        `get_entity` tool uses.
+
+        `description`/`chunk_text` are `null` (not an error) when the
+        entity has no chunk in Weaviate — e.g. a structural-only node — or
+        when Weaviate itself is unreachable: the graph JSON is the source
+        of truth for the entity's existence, not Weaviate.
+
+        Requires any authenticated role.
+      operationId: getEntity
+      parameters:
+        - name: project
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Qualified name of the entity to fetch.
+          example: src.alarms.AlarmValidationUseCase
+      responses:
+        "200":
+          description: The entity's graph node, plus its Weaviate description/chunk_text.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EntityDetailResponse"
+        "404":
+          description: No graph for this project, or the entity was not found in it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                no_graph:
+                  summary: Project never ingested
+                  value:
+                    detail: "no graph found for project 'your-repo' — run POST /instances/pipeline to ingest it"
+                entity_not_found:
+                  summary: Qualified name not in this project's graph
+                  value:
+                    detail: "entity 'src.alarms.AlarmValidationUseCase' not found in project 'your-repo' graph"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
   /graph/{project}/neighborhood:
     get:
       tags: [Graph]
@@ -1572,6 +1632,11 @@ components:
       properties:
         conversation_id: { type: string }
         project_name: { type: string }
+        audience: { type: string }
+        title:
+          type: string
+          nullable: true
+          description: Derived from the first user message at creation; null for conversations created before this field existed (UI falls back to the preview).
         message_count: { type: integer }
         last_message_preview: { type: string }
         created_at: { type: string }
@@ -1594,6 +1659,10 @@ components:
         conversation_id: { type: string }
         project_name: { type: string }
         audience: { type: string }
+        title:
+          type: string
+          nullable: true
+          description: Derived from the first user message at creation; null for conversations created before this field existed (UI falls back to the preview).
         created_at: { type: string }
         updated_at: { type: string }
         messages:
@@ -1672,6 +1741,8 @@ components:
         nodes: { type: integer, description: Total node count in the graph. }
         edges: { type: integer, description: Total relationship count in the graph. }
         generated_at: { type: string, description: Export timestamp from the graph JSON, or the file's mtime as a fallback. }
+        chunks: { type: integer, nullable: true, description: Weaviate chunk count for the project. `null` if Weaviate is unreachable. }
+        repo_path: { type: string, nullable: true, description: "Absolute filesystem root of the ingested repo, derived from a `File` node's `absolute_path` minus its relative `path` suffix. `null` if underivable." }
 
     GraphNodeDTO:
       type: object
@@ -1725,6 +1796,14 @@ components:
         - type: object
           properties:
             hop: { type: integer, description: "0 = the center entity, 1 = direct neighbor, ..." }
+
+    EntityDetailResponse:
+      allOf:
+        - $ref: "#/components/schemas/GraphNodeDTO"
+        - type: object
+          properties:
+            description: { type: string, nullable: true, description: LLM micro-description from Weaviate. `null` if the entity has no chunk there, or Weaviate is unreachable. }
+            chunk_text: { type: string, nullable: true, description: Full chunk text (header + terms + doc + source) from Weaviate. `null` under the same conditions as `description`. }
 
     NeighborhoodStatsDTO:
       type: object

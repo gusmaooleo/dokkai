@@ -48,6 +48,8 @@ class ChatResponse(BaseModel):
 class ConversationSummary(BaseModel):
     conversation_id: str
     project_name: str
+    audience: str
+    title: str | None = None
     message_count: int
     last_message_preview: str
     created_at: str

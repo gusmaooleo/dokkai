@@ -80,6 +80,8 @@ async def list_conversations():
         ConversationSummary(
             conversation_id=conv.conversation_id,
             project_name=conv.project_name,
+            audience=conv.audience,
+            title=conv.title,
             message_count=len(conv.messages),
             last_message_preview=(
                 conv.messages[-1].content[:120] + "..."
@@ -109,6 +111,7 @@ async def get_conversation(conversation_id: str):
         "conversation_id": conv.conversation_id,
         "project_name": conv.project_name,
         "audience": conv.audience,
+        "title": conv.title,
         "created_at": conv.created_at,
         "updated_at": conv.updated_at,
         "messages": [
