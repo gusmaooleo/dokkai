@@ -706,7 +706,7 @@
               "host": ["{{baseUrl}}"],
               "path": ["chat", "conversations"]
             },
-            "description": "List stored conversations (persisted as JSON under data/conversations/)."
+            "description": "List stored conversations (persisted in Postgres). Includes title (derived from the first user message, null for older conversations) and audience."
           },
           "response": []
         },
@@ -753,7 +753,7 @@
               "host": ["{{baseUrl}}"],
               "path": ["graph"]
             },
-            "description": "List every project with an ingested graph in ingested/. Returns [] when nothing has been ingested yet. Restart-proof -- read straight off the filesystem."
+            "description": "List every project with an ingested graph in ingested/. Includes chunks (Weaviate chunk count, null if Weaviate is unreachable) and repo_path (derived from a File node, null if underivable). Returns [] when nothing has been ingested yet. Restart-proof -- read straight off the filesystem."
           },
           "response": []
         },
@@ -787,6 +787,21 @@
               ]
             },
             "description": "Every node (code entities, folders, files, modules, packages, the project, external packages) and every edge, up to limit."
+          },
+          "response": []
+        },
+        {
+          "name": "Get entity",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/graph/{{projectName}}/entity?name={{entityQualifiedName}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["graph", "{{projectName}}", "entity"],
+              "query": [{ "key": "name", "value": "{{entityQualifiedName}}" }]
+            },
+            "description": "Resolved graph node for name (same resolution as the neighborhood endpoint's entity param), enriched with description and chunk_text fetched from Weaviate via the same deterministic-UUID lookup the MCP get_entity tool uses. description/chunk_text are null (not an error) when the entity has no chunk in Weaviate or Weaviate is unreachable. 404 if the project has no graph, or if the entity isn't in it."
           },
           "response": []
         },

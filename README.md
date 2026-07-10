@@ -15,6 +15,7 @@ Everything runs **100% locally** — Weaviate for vectors, Ollama for both embed
 - [Why](#why)
 - [MCP server](#mcp-server)
 - [CLI](#cli)
+- [Frontend UI](#frontend-ui)
 - [How it works](#how-it-works)
 - [Descriptions (Tier 2)](#descriptions-tier-2)
 - [Features](#features)
@@ -214,6 +215,54 @@ Runs an initial catch-up ingest, then re-ingests incrementally on every save (de
 
 ---
 
+## Frontend UI
+
+A Next.js web UI (`frontend/`) covers the same surface as the API: chat with
+the codebase, browse its dependency graph, manage ingestions, and configure
+the LLM — all authenticated against the same `admin`/`user`/`viewer` accounts
+as the CLI and MCP server.
+
+**Run it:**
+
+```bash
+# API must already be reachable — ./dev.sh + docker compose up -d (see Quickstart)
+cd frontend
+npm install
+npm run dev         # http://localhost:3000
+```
+
+First login is `admin`/`admin` (or your `DOKKAI_ROOT_USER`/`DOKKAI_ROOT_PASSWORD` — see [Authentication](#authentication)).
+
+**Screens:**
+
+- **Login** — username/password against `/auth/login`; shows a hint when the default `admin`/`admin` credentials are still active.
+- **Shell** — sidebar project switcher, nav, a live job-pulse indicator, light/dark theme, and a persistent banner for admins while the default admin credentials are active.
+- **Chat** — SSE-streamed answers with a sources panel (seed/hop/via provenance badges, code, jump-to-graph), an audience switcher (developer/manager/customer), and markdown rendering.
+- **History** — search, group and resume past conversations, or delete them.
+- **Graph** — interactive dependency graph (sigma.js): search/focus/zoom, neighborhood highlighting on selection, a detail panel (description, relations), an Entities/Files toggle, `?focus=` deep links, and a "chat about this" prefill.
+- **Instances** — live job progress over SSE with the real stage vocabulary, a new-ingestion dialog (including the `--recreate` wipes-all-projects warning), and a projects grid.
+- **Settings** — LLM provider/model selection and health check, plus an account card to change your own password.
+- **Admin** — user management (create/list/delete, roles `admin`/`user`/`viewer`).
+
+**Configuration:**
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `NEXT_PUBLIC_API_URL` | `http://localhost:8000` | Base URL of the Dokkai API, inlined at build time |
+
+If the frontend is served from an origin other than `http://localhost:3000` /
+`http://127.0.0.1:3000`, add it to the API's `DOKKAI_CORS_ORIGINS` — see
+[Configuration](#configuration).
+
+**Roles in the UI** mirror the API (see [Authentication](#authentication)):
+`viewer` is read-only (no chat composer, no destructive buttons); `user` gets
+everything except the Admin screen and LLM config writes; `admin` gets
+everything, plus the default-admin banner.
+
+See [`frontend/README.md`](frontend/README.md) for the stack, folder layout and dev commands.
+
+---
+
 ## How it works
 
 ```
@@ -302,6 +351,7 @@ Full pipeline run on `saffira_back-end` (medium TS/Python backend), local Ollama
 - ✅ **npm CLI** (`dokkai`) — `up`/`status`/`ingest`/`graph`/`srcs`/`watch`/`doctor` commands: live job progress, one-command SRCS sessions (Claude Code, Codex, a local Ollama REPL, or an agentic local-model MCP loop), debounced incremental re-ingestion on save, and environment diagnostics (see [CLI](#cli))
 - ✅ **Graph-only ingestion** (`POST /instances/graph`, `dokkai graph`) — run just `cgr` with no LLM/Weaviate involved
 - ✅ **Authentication** — always-on, Grafana-style bearer-token auth with 3 roles (admin/user/viewer), a default `admin`/`admin` seed overridable via env, and CLI auto-login (see [Authentication](#authentication))
+- ✅ **Frontend UI** — Next.js web app: streaming chat with sources, interactive dependency graph, conversation history, ingestion/job monitoring, LLM config and user administration, role-gated (see [Frontend UI](#frontend-ui))
 
 ---
 
@@ -317,7 +367,7 @@ Full pipeline run on `saffira_back-end` (medium TS/Python backend), local Ollama
 | Generation | Ollama · `qwen2.5-coder` (any Ollama chat model) |
 | MCP server | Official Python `mcp` SDK (`FastMCP`), stdio transport |
 | CLI | Node.js (≥22.12) / TypeScript, `commander` + `chalk` + `ora` |
-| Frontend (WIP) | Next.js 16 · React 19 · Tailwind v4 |
+| Frontend | Next.js 16 · React 19 · Tailwind v4 · shadcn · sigma.js |
 
 ---
 
@@ -445,7 +495,7 @@ curl -N -X POST localhost:8000/chat \
 
 ### 7. (Optional) Frontend
 
-A Next.js scaffold lives in [`frontend/`](frontend/) (not yet wired to the API — see [Roadmap](#roadmap)). The API already allows CORS from any origin.
+A Next.js web UI lives in [`frontend/`](frontend/) — see [Frontend UI](#frontend-ui) for the full walkthrough.
 
 ```bash
 cd frontend
@@ -500,7 +550,7 @@ All configuration is via environment variables (loaded from `.env` at startup).
 Auth is **always on** — Grafana-style: there's no way to disable it, and there's nothing to configure before first boot.
 
 - **First boot seeds `admin`/`admin`** (only when the `users` table is empty). Setting `DOKKAI_ROOT_USER`/`DOKKAI_ROOT_PASSWORD` before that first boot seeds those credentials instead. If you set/change either var on a **later** boot, the API re-applies it onto user id 1 (the seeded admin), overwriting its username/password and invalidating all of its existing sessions — this is the supported way to reset a lost admin password.
-- **⚠️ Change the default password.** `GET /auth/status` (public) and `GET /auth/me` both return `default_admin_active: true` for as long as any user named `admin` still verifies against the password `admin` — the CLI prints a one-time warning when it sees this flag; the planned UI (feature 07) will show it on every screen. Change it with `PATCH /auth/users/me/password`, or set `DOKKAI_ROOT_PASSWORD` and restart.
+- **⚠️ Change the default password.** `GET /auth/status` (public) and `GET /auth/me` both return `default_admin_active: true` for as long as any user named `admin` still verifies against the password `admin` — the CLI prints a one-time warning when it sees this flag, and the [frontend UI](#frontend-ui) shows a persistent banner for admins. Change it with `PATCH /auth/users/me/password`, or set `DOKKAI_ROOT_PASSWORD` and restart.
 - **Tokens** are opaque, random 30-day bearer tokens (`Authorization: Bearer <token>`), stored SHA-256-hashed in Postgres — the plaintext token is only ever returned once, at login. `POST /auth/logout` revokes the session used for that request; changing your own password (`PATCH /auth/users/me/password`) revokes every *other* session for your user but keeps the one making the request. Passwords are hashed with stdlib `hashlib.scrypt` (no new dependency).
 - **Roles** (assigned per-user, checked per-route):
 
@@ -612,7 +662,7 @@ dokkai/
 │   └── models/dtos/             # pydantic request/response models
 ├── shell/run_cgr.sh             # code-graph-rag runner (ephemeral Memgraph)
 ├── cli/                         # npm CLI package (`dokkai`) — see CLI section
-├── frontend/                    # Next.js app (WIP)
+├── frontend/                    # Next.js web UI — see Frontend UI section
 ├── docker-compose.yml           # Weaviate (text2vec-ollama) + Postgres (conversation/job history)
 ├── dev.sh                       # dev server launcher
 └── ingested/                    # canonical graph JSON per project — <project>.json,
@@ -648,7 +698,7 @@ These are known and tracked in the [Roadmap](#roadmap):
 | 04 | npm CLI (`dokkai`) + SRCS mode | ✅ done (pending merge) |
 | 05 | Postgres conversation history | ✅ done (pending merge) |
 | 06 | Basic auth (root user via env) | ✅ done (pending merge) |
-| 07 | Frontend UI (chat + graph + config) | planned |
+| 07 | Frontend UI (chat + graph + config) | ✅ done (pending merge) |
 | 08 | PDF ingestion — local NotebookLM | planned |
 | 09 | Code review & bug‑hunt routines | planned |
 | 10 | Documentation site (en/pt/zh/es) | planned |
@@ -673,9 +723,9 @@ These are known and tracked in the [Roadmap](#roadmap):
 - [ ] **Feature clustering** — group related entities (controller + use‑case + repository + job) into a feature and retrieve the whole subgraph together.
 
 ### Frontend (Next.js)
-- [ ] Wire the UI to the API: streaming chat, sources panel with provenance (`hop` / `via`), audience switcher.
-- [ ] **Interactive system graph** — visualize the dependency graph of the ingested codebase.
-- [ ] Environment & model configuration UI.
+- [x] Wire the UI to the API: streaming chat, sources panel with provenance (`hop` / `via`), audience switcher — see [feature 07](#feature-roadmap).
+- [x] **Interactive system graph** — visualize the dependency graph of the ingested codebase.
+- [x] Model configuration UI (LLM provider/model + health check). Full environment/API-key management from the UI is a separate, still-planned item — see "Remote environment configuration" below.
 
 ### One‑command infrastructure
 - [ ] Containerize the API (fill in the `Dockerfile`) and add the API + frontend to `docker-compose.yml`, so `docker compose up` brings up the **entire** stack.
