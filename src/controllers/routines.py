@@ -1,32 +1,53 @@
 """
-Routines API endpoints — code review / bug hunt runs.
+Routines API endpoints — code review / bug hunt runs, plus their attachable
+playbooks and skills documents (decision 9d).
 
-POST   /routines/runs           — launch a review run as a background job
-                                   (bughunt: 400, not yet — later release)
-GET    /routines/runs           — list runs, each with severity_counts
-GET    /routines/runs/{run_id}  — a run's full detail, findings included
-DELETE /routines/runs/{run_id}  — delete a run (cascades to its findings)
-GET    /routines/git/branches   — a project's local branches + default base
+POST   /routines/runs                 — launch a review or bug-hunt run as a
+                                         background job
+GET    /routines/runs                 — list runs, each with severity_counts
+GET    /routines/runs/{run_id}        — a run's full detail, findings included
+DELETE /routines/runs/{run_id}        — delete a run (cascades to its findings)
+GET    /routines/git/branches         — a project's local branches + default base
+GET    /routines/playbooks            — list playbooks (no content, with content_bytes)
+GET    /routines/playbooks/{name}     — a playbook's full detail (with content)
+POST   /routines/playbooks            — create a playbook
+PATCH  /routines/playbooks/{name}     — update a playbook's content/routines
+DELETE /routines/playbooks/{name}     — delete a playbook
+GET    /routines/skills               — list skills (no content, with content_bytes)
+GET    /routines/skills/{name}        — a skill's full detail (with content)
+POST   /routines/skills               — create a skill
+PATCH  /routines/skills/{name}        — update a skill's description/content
+DELETE /routines/skills/{name}        — delete a skill
 """
 
 from __future__ import annotations
 
+import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from models.dtos.routines import (
     BranchInfo,
+    CreatePlaybookRequest,
+    CreateSkillRequest,
     FindingDTO,
     LaunchRoutineRequest,
     LaunchRoutineResponse,
+    PlaybookDTO,
+    PlaybookSummary,
     RoutineRunDetail,
     RoutineRunSummary,
+    SkillDTO,
+    SkillSummary,
+    UpdatePlaybookRequest,
+    UpdateSkillRequest,
 )
 from services.auth import require_auth, require_role
 from services.db import DatabaseUnavailableError
 from services.git_repo import GitError, default_base, is_git_repo, list_branches, resolve_ref
 from services.graph_store import GraphNotFoundError, _derive_repo_path, get_graph
 from services.jobs import ProjectJobConflict
-from services.routines import store
+from services.routines import documents, store
+from services.routines.bughunt import _non_ollama_error, run_bughunt
 from services.routines.engine import submit_routine
 from services.routines.review import _resolve_llm, run_review
 
@@ -71,46 +92,81 @@ async def launchRoutine(data: LaunchRoutineRequest) -> LaunchRoutineResponse:
     ``GET /routines/runs/{run_id}`` (or the shared ``GET /instances/jobs/{job_id}``)
     for progress and the final result.
 
-    ``kind='bughunt'`` is honest-400ed — that routine arrives in a later
-    release. For ``kind='review'``, pre-flights run BEFORE the job is
-    created, in order, so a bad request fails synchronously with an
-    actionable message rather than only surfacing inside the job's result:
-    the project must have an ingested graph (404), its repo_path must be a
-    git repository (400), ``base_ref``/``target_ref`` must resolve (400),
-    and the LLM (from the launch payload or the active config, 12h) must be
-    resolvable and healthy (400) — the same resolution
-    ``services.routines.review.run_review`` itself does, run here too so its
-    failure message reaches the caller synchronously instead of only inside
-    a failed job/run.
+    Pre-flights run BEFORE the job is created, in order, so a bad request
+    fails synchronously with an actionable message rather than only
+    surfacing inside the job's result: the project must have an ingested
+    graph (404); for ``kind='review'``, its repo_path must be a git
+    repository and ``base_ref``/``target_ref`` must resolve (400 — skipped
+    for ``kind='bughunt'``, which has no diff to anchor against, decision
+    9b); every named playbook (decision 9d) must exist and apply to THIS
+    run's kind, with at most 4 selected (400); the LLM (from the launch
+    payload or the active config, 12h) must be resolvable and healthy (400)
+    — the same resolution ``run_review``/``run_bughunt`` themselves do, run
+    here too so its failure message reaches the caller synchronously instead
+    of only inside a failed job/run; and for ``kind='bughunt'`` specifically,
+    the resolved provider must be ``"ollama"`` (decision 9a — the agent loop
+    is Ollama-native only in this release, 400 with the same message
+    ``services.routines.agent_loop.run_agent_loop`` itself would raise).
     """
-    if data.kind == "bughunt":
-        raise HTTPException(status_code=400, detail="bug hunt routines arrive in a later release")
-
     repo_path = _resolve_repo_path(data.project)
 
-    try:
-        if not is_git_repo(repo_path):
-            raise GitError(f"'{repo_path}' is not a git repository — check the project's repo_path")
-        base = data.base_ref or default_base(repo_path)
-        resolve_ref(repo_path, base)
-        resolve_ref(repo_path, data.target_ref)
-    except GitError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    if data.kind == "review":
+        try:
+            if not is_git_repo(repo_path):
+                raise GitError(f"'{repo_path}' is not a git repository — check the project's repo_path")
+            base = data.base_ref or default_base(repo_path)
+            resolve_ref(repo_path, base)
+            resolve_ref(repo_path, data.target_ref)
+        except GitError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
-    params = {
-        "repo_path": repo_path,
-        "target_ref": data.target_ref,
-        "base_ref": data.base_ref,
-        "model": data.model,
-        "provider": data.provider,
-    }
+    playbook_names = data.playbooks or []
+    if len(playbook_names) > 4:
+        raise HTTPException(status_code=400, detail="a run can use at most 4 playbooks")
     try:
-        await _resolve_llm(params)
+        for name in playbook_names:
+            playbook = await documents.get_playbook(name)
+            if playbook is None:
+                raise HTTPException(status_code=400, detail=f"playbook '{name}' not found")
+            if data.kind not in playbook["routines"]:
+                raise HTTPException(
+                    status_code=400, detail=f"playbook '{name}' does not apply to {data.kind} routines"
+                )
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    if data.kind == "review":
+        params = {
+            "repo_path": repo_path,
+            "target_ref": data.target_ref,
+            "base_ref": data.base_ref,
+            "model": data.model,
+            "provider": data.provider,
+            "playbooks": data.playbooks,
+        }
+        runner = run_review
+    else:
+        params = {
+            "repo_path": repo_path,
+            "scope": data.scope,
+            "path_prefix": data.path_prefix,
+            "model": data.model,
+            "provider": data.provider,
+            "playbooks": data.playbooks,
+        }
+        runner = run_bughunt
+
+    noun = "bug hunt" if data.kind == "bughunt" else "review"
+    try:
+        _provider, _model, provider_name = await _resolve_llm(params, noun=noun)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    if data.kind == "bughunt" and provider_name != "ollama":
+        raise HTTPException(status_code=400, detail=str(_non_ollama_error(provider_name)))
+
     try:
-        result = await submit_routine("review", data.project, repo_path, params, run_review)
+        result = await submit_routine(data.kind, data.project, repo_path, params, runner)
     except ProjectJobConflict as e:
         raise HTTPException(status_code=409, detail=str(e))
     except DatabaseUnavailableError as e:
@@ -198,3 +254,163 @@ async def getBranches(project: str = Query(...)):
         "branches": [BranchInfo(**b) for b in branches],
         "default_base": base,
     }
+
+
+# -------------------------------------------------------------------------
+# Playbooks / skills (decision 9d) — GETs are read-only (viewer allowed),
+# POST/PATCH/DELETE mutate state and require role admin/user (6k/12p).
+# -------------------------------------------------------------------------
+
+
+@router.get("/playbooks", response_model=list[PlaybookSummary])
+async def listPlaybooks():
+    """List playbooks. Omits ``content`` in favor of ``content_bytes`` — use
+    ``GET /routines/playbooks/{name}`` for the full content."""
+    try:
+        rows = await documents.list_playbooks()
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return [
+        PlaybookSummary(
+            id=r["id"],
+            name=r["name"],
+            routines=r["routines"],
+            content_bytes=len(r["content"].encode("utf-8")),
+            created_at=r["created_at"],
+            updated_at=r["updated_at"],
+        )
+        for r in rows
+    ]
+
+
+@router.get("/playbooks/{name}", response_model=PlaybookDTO)
+async def getPlaybook(name: str):
+    """A playbook's full detail, content included."""
+    try:
+        row = await documents.get_playbook(name)
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"playbook '{name}' not found")
+    return PlaybookDTO(**row)
+
+
+@router.post(
+    "/playbooks", response_model=PlaybookDTO, status_code=201, dependencies=[Depends(require_write)]
+)
+async def createPlaybook(data: CreatePlaybookRequest):
+    """Create a playbook."""
+    try:
+        row = await documents.create_playbook(data.name, data.content, data.routines)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except asyncpg.UniqueViolationError:
+        raise HTTPException(status_code=409, detail=f"playbook '{data.name}' already exists")
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return PlaybookDTO(**row)
+
+
+@router.patch(
+    "/playbooks/{name}", response_model=PlaybookDTO, dependencies=[Depends(require_write)]
+)
+async def updatePlaybook(name: str, data: UpdatePlaybookRequest):
+    """Update a playbook's content and/or routines. Fields left unset are
+    left unchanged."""
+    try:
+        row = await documents.update_playbook(name, data.content, data.routines)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"playbook '{name}' not found")
+    return PlaybookDTO(**row)
+
+
+@router.delete("/playbooks/{name}", dependencies=[Depends(require_write)])
+async def deletePlaybook(name: str):
+    """Delete a playbook."""
+    try:
+        deleted = await documents.delete_playbook(name)
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"playbook '{name}' not found")
+    return {"message": "Playbook deleted", "name": name}
+
+
+@router.get("/skills", response_model=list[SkillSummary])
+async def listSkills():
+    """List skills. Omits ``content`` in favor of ``content_bytes`` — use
+    ``GET /routines/skills/{name}`` for the full content."""
+    try:
+        rows = await documents.list_skills()
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return [
+        SkillSummary(
+            id=r["id"],
+            name=r["name"],
+            description=r["description"],
+            content_bytes=len(r["content"].encode("utf-8")),
+            created_at=r["created_at"],
+            updated_at=r["updated_at"],
+        )
+        for r in rows
+    ]
+
+
+@router.get("/skills/{name}", response_model=SkillDTO)
+async def getSkill(name: str):
+    """A skill's full detail, content included."""
+    try:
+        row = await documents.get_skill(name)
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"skill '{name}' not found")
+    return SkillDTO(**row)
+
+
+@router.post(
+    "/skills", response_model=SkillDTO, status_code=201, dependencies=[Depends(require_write)]
+)
+async def createSkill(data: CreateSkillRequest):
+    """Create a skill."""
+    try:
+        row = await documents.create_skill(data.name, data.description, data.content)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except asyncpg.UniqueViolationError:
+        raise HTTPException(status_code=409, detail=f"skill '{data.name}' already exists")
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return SkillDTO(**row)
+
+
+@router.patch("/skills/{name}", response_model=SkillDTO, dependencies=[Depends(require_write)])
+async def updateSkill(name: str, data: UpdateSkillRequest):
+    """Update a skill's description and/or content. Fields left unset are
+    left unchanged."""
+    try:
+        row = await documents.update_skill(name, data.description, data.content)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"skill '{name}' not found")
+    return SkillDTO(**row)
+
+
+@router.delete("/skills/{name}", dependencies=[Depends(require_write)])
+async def deleteSkill(name: str):
+    """Delete a skill."""
+    try:
+        deleted = await documents.delete_skill(name)
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"skill '{name}' not found")
+    return {"message": "Skill deleted", "name": name}

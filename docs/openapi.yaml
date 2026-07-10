@@ -54,8 +54,10 @@ tags:
   - name: Routines
     description: >-
       Code review / bug-hunt routines, run as background jobs on the same job
-      system as ingestion. Sub-part A ships `kind: review` only —
-      `kind: bughunt` is honest-400ed until a later release.
+      system as ingestion, plus the playbooks/skills documents a run can
+      attach to its prompt. Sub-part A shipped `kind: review`; sub-part B
+      adds `kind: bughunt` (Ollama-native tool-calling loop only in this
+      release) and the playbooks/skills CRUD.
 
 paths:
   /:
@@ -1012,25 +1014,28 @@ paths:
       tags: [Routines]
       summary: Launch a routine run
       description: |
-        Launch a routine run (currently only `kind: review`) as a
+        Launch a routine run (`kind: review` or `kind: bughunt`) as a
         **background job** on the same job system as ingestion, and return
         immediately with `run_id`/`job_id`. Poll `GET /routines/runs/{run_id}`
         (or stream `GET /instances/jobs/{job_id}/events`, same SSE framing as
-        ingestion jobs) for live per-stage progress (`diff` → `context` →
-        `analyze` → `summarize`) and the final result.
+        ingestion jobs) for live per-stage progress and the final result.
+        Review progresses `diff` → `context` → `playbooks` → `skills` →
+        `analyze` → `summarize`; bug hunt progresses `resolve` → `playbooks`
+        → `hunt` → `findings` → `summarize`.
 
-        `kind: bughunt` is honest-400ed — that routine ships in a later
-        release.
-
-        For `kind: review`, pre-flights run **before** the job is created,
-        in order, so a bad request fails synchronously with an actionable
-        message instead of only surfacing inside the job's result: the
-        project must have an ingested graph (`404`), its `repo_path` must be
-        a git repository (`400`), `base_ref` (or the project's default base
-        branch)/`target_ref` must resolve (`400`), and the LLM — resolved
-        from the launch payload's `model`/`provider` or else the active
-        config from `POST /config/llm` — must be configured and healthy
-        (`400`).
+        Pre-flights run **before** the job is created, in order, so a bad
+        request fails synchronously with an actionable message instead of
+        only surfacing inside the job's result: the project must have an
+        ingested graph (`404`); for `kind: review`, its `repo_path` must be a
+        git repository and `base_ref` (or the project's default base
+        branch)/`target_ref` must resolve (`400` — skipped for
+        `kind: bughunt`, which has no diff to anchor against); every named
+        `playbooks` entry must exist and apply to this run's `kind`, at most
+        4 (`400`); the LLM — resolved from the launch payload's
+        `model`/`provider` or else the active config from `POST /config/llm`
+        — must be configured and healthy (`400`); and for `kind: bughunt`
+        specifically, the resolved provider must be `ollama` (`400` — the
+        agentic tool-calling loop is Ollama-native only in this release).
 
         **Model resolution — no hardcoded default**: `model`/`provider` in
         the request body override the active LLM config (`POST /config/llm`)
@@ -1038,7 +1043,7 @@ paths:
         supplies a usable provider+model, the launch fails with the
         `no_llm_configured` example below.
 
-        Review and ingestion of the **same project** are mutually
+        A routine run and ingestion of the **same project** are mutually
         exclusive — this shares the same per-project job lock as
         `/instances/pipeline`/`/instances/graph`/`/instances/{project}/describe`.
 
@@ -1072,6 +1077,29 @@ paths:
                   target_ref: feature/my-branch
                   model: qwen2.5-coder:14b
                   provider: ollama
+              review_with_playbooks:
+                summary: Review with up to 4 pushed playbooks (priority order)
+                value:
+                  kind: review
+                  project: your-repo
+                  target_ref: feature/my-branch
+                  playbooks: [security-basics, house-style]
+              bughunt_default:
+                summary: Bug hunt over a scope, restricted to a path prefix
+                value:
+                  kind: bughunt
+                  project: your-repo
+                  scope: look for unhandled errors and resource leaks in the ingestion pipeline
+                  path_prefix: src/services
+              bughunt_with_playbooks:
+                summary: Bug hunt with playbooks and an explicit model override
+                value:
+                  kind: bughunt
+                  project: your-repo
+                  scope: audit the auth module for privilege-escalation bugs
+                  playbooks: [security-basics]
+                  model: qwen2.5-coder:14b
+                  provider: ollama
       responses:
         "202":
           description: Run created and job accepted.
@@ -1081,21 +1109,31 @@ paths:
                 $ref: "#/components/schemas/LaunchRoutineResponse"
         "400":
           description: >-
-            `kind: bughunt` (not yet implemented), a git-level failure (not a
-            repo / unresolvable ref), or no usable LLM could be resolved.
+            A git-level failure (not a repo / unresolvable ref, `kind: review`
+            only), an invalid/inapplicable/excess `playbooks` entry, no usable
+            LLM could be resolved, or (`kind: bughunt` only) the resolved
+            provider isn't `ollama`.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
               examples:
-                bughunt_not_yet:
-                  summary: kind = bughunt (arrives in a later release)
-                  value:
-                    detail: "bug hunt routines arrive in a later release"
                 bad_ref:
-                  summary: target_ref/base_ref does not resolve
+                  summary: target_ref/base_ref does not resolve (kind = review)
                   value:
                     detail: "unknown git ref 'no-such-branch' in repository '/path/to/repo'"
+                playbook_not_found:
+                  summary: A named playbook does not exist
+                  value:
+                    detail: "playbook 'security-basics' not found"
+                playbook_wrong_kind:
+                  summary: A named playbook doesn't apply to this run's kind
+                  value:
+                    detail: "playbook 'security-basics' does not apply to bughunt routines"
+                too_many_playbooks:
+                  summary: More than 4 playbooks named
+                  value:
+                    detail: "a run can use at most 4 playbooks"
                 no_llm_configured:
                   summary: No LLM provider configured, and none given in the launch payload
                   value:
@@ -1104,6 +1142,10 @@ paths:
                   summary: model override not pulled in Ollama
                   value:
                     detail: "model 'qwen2.5-coder:14b' is not available in Ollama at http://localhost:11434 — pull it with 'ollama pull qwen2.5-coder:14b'"
+                bughunt_non_ollama:
+                  summary: kind = bughunt resolved to a non-Ollama provider
+                  value:
+                    detail: "bug hunt requires Ollama-native tool calling in this release — provider 'openai' is not supported yet"
         "404":
           description: The project has no ingested graph.
           content:
@@ -1113,7 +1155,7 @@ paths:
               example:
                 detail: "no graph found for project 'your-repo' — run POST /instances/pipeline to ingest it"
         "409":
-          description: A pipeline/refresh/graph/review job is already queued/running for this project.
+          description: A pipeline/refresh/graph/routine job is already queued/running for this project.
           content:
             application/json:
               schema:
@@ -1125,7 +1167,13 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "422":
-          $ref: "#/components/responses/ValidationError"
+          description: >-
+            Request body failed validation — includes `target_ref` missing
+            for `kind: review`, or `scope` missing for `kind: bughunt`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
     get:
@@ -1284,6 +1332,436 @@ paths:
                 $ref: "#/components/schemas/Error"
               example:
                 detail: "no graph found for project 'your-repo' — run POST /instances/pipeline to ingest it"
+
+  # ---------------------------------------------------------------------------
+  # Routines — Playbooks / skills
+  # ---------------------------------------------------------------------------
+  /routines/playbooks:
+    get:
+      tags: [Routines]
+      summary: List playbooks
+      description: |
+        Omits `content` in favor of `content_bytes` — use
+        `GET /routines/playbooks/{name}` for the full content.
+
+        Requires any authenticated role.
+      operationId: listPlaybooks
+      responses:
+        "200":
+          description: Playbooks.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PlaybookSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    post:
+      tags: [Routines]
+      summary: Create a playbook
+      description: |
+        `routines` defaults to `["review", "bughunt"]` (applies to both
+        kinds) when omitted. `content` is markdown, up to 16KB, with
+        optional leading YAML frontmatter (stored/returned verbatim — not
+        parsed by the API).
+
+        Requires the `admin` or `user` role.
+      operationId: createPlaybook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePlaybookRequest"
+            examples:
+              default:
+                value:
+                  name: security-basics
+                  content: "# Security basics\n\n- Never log secrets.\n- Validate all external input."
+                  routines: [review, bughunt]
+      responses:
+        "201":
+          description: Playbook created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlaybookDTO"
+        "400":
+          description: Validation failure (empty/too-long/invalid name, oversized content, or an unknown routine kind).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                bad_name:
+                  summary: name contains a slash or control character
+                  value:
+                    detail: "name must not contain slashes or control characters"
+                content_too_large:
+                  summary: content exceeds the 16KB limit
+                  value:
+                    detail: "playbook content exceeds the 16KB limit (17000 bytes)"
+                unknown_routine:
+                  summary: routines names an unknown kind
+                  value:
+                    detail: "unknown routine kind 'code_review' — valid kinds: review, bughunt"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: A playbook with this name already exists.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "playbook 'security-basics' already exists"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /routines/playbooks/{name}:
+    get:
+      tags: [Routines]
+      summary: Get a playbook
+      description: A playbook's full detail, `content` included. Requires any authenticated role.
+      operationId: getPlaybook
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The playbook.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlaybookDTO"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No playbook with that name.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "playbook 'security-basics' not found"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    patch:
+      tags: [Routines]
+      summary: Update a playbook
+      description: |
+        Updates `content` and/or `routines`. Fields left unset are left
+        unchanged.
+
+        Requires the `admin` or `user` role.
+      operationId: updatePlaybook
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdatePlaybookRequest"
+            examples:
+              content_only:
+                value:
+                  content: "# Security basics (v2)\n\n- Never log secrets."
+              routines_only:
+                value:
+                  routines: [bughunt]
+      responses:
+        "200":
+          description: Updated playbook.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlaybookDTO"
+        "400":
+          description: Validation failure (oversized content or an unknown routine kind) — same shape as create.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: No playbook with that name.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "playbook 'security-basics' not found"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    delete:
+      tags: [Routines]
+      summary: Delete a playbook
+      description: Requires the `admin` or `user` role.
+      operationId: deletePlaybook
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: "Playbook deleted" }
+                  name: { type: string }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: No playbook with that name.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "playbook 'security-basics' not found"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /routines/skills:
+    get:
+      tags: [Routines]
+      summary: List skills
+      description: |
+        Omits `content` in favor of `content_bytes` — use
+        `GET /routines/skills/{name}` for the full content.
+
+        Requires any authenticated role.
+      operationId: listSkills
+      responses:
+        "200":
+          description: Skills.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SkillSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    post:
+      tags: [Routines]
+      summary: Create a skill
+      description: |
+        `description` is what a run's own model sees in the skills catalog
+        when deciding whether to load this skill — keep it short and
+        relevance-scoped. `content` is markdown, up to 16KB, with optional
+        leading YAML frontmatter (stored/returned verbatim, stripped before
+        the body is injected into a run's prompt).
+
+        Requires the `admin` or `user` role.
+      operationId: createSkill
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSkillRequest"
+            examples:
+              default:
+                value:
+                  name: sql-injection-review
+                  description: How to spot SQL injection in raw-query code paths.
+                  content: "# SQL injection review\n\nLook for string-concatenated queries..."
+      responses:
+        "201":
+          description: Skill created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SkillDTO"
+        "400":
+          description: Validation failure (empty/too-long/invalid name, empty description, or oversized content).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                bad_name:
+                  summary: name contains a slash or control character
+                  value:
+                    detail: "name must not contain slashes or control characters"
+                empty_description:
+                  summary: description is empty/whitespace
+                  value:
+                    detail: "description must not be empty"
+                content_too_large:
+                  summary: content exceeds the 16KB limit
+                  value:
+                    detail: "skill content exceeds the 16KB limit (17000 bytes)"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: A skill with this name already exists.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "skill 'sql-injection-review' already exists"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /routines/skills/{name}:
+    get:
+      tags: [Routines]
+      summary: Get a skill
+      description: A skill's full detail, `content` included. Requires any authenticated role.
+      operationId: getSkill
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The skill.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SkillDTO"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No skill with that name.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "skill 'sql-injection-review' not found"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    patch:
+      tags: [Routines]
+      summary: Update a skill
+      description: |
+        Updates `description` and/or `content`. Fields left unset are left
+        unchanged.
+
+        Requires the `admin` or `user` role.
+      operationId: updateSkill
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateSkillRequest"
+            examples:
+              content_only:
+                value:
+                  content: "# SQL injection review (v2)\n\n..."
+              description_only:
+                value:
+                  description: How to spot SQL injection and command injection in raw-query code paths.
+      responses:
+        "200":
+          description: Updated skill.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SkillDTO"
+        "400":
+          description: Validation failure (oversized content or empty description) — same shape as create.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: No skill with that name.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "skill 'sql-injection-review' not found"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    delete:
+      tags: [Routines]
+      summary: Delete a skill
+      description: Requires the `admin` or `user` role.
+      operationId: deleteSkill
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: "Skill deleted" }
+                  name: { type: string }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: No skill with that name.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                detail: "skill 'sql-injection-review' not found"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   # ---------------------------------------------------------------------------
   # Chat
@@ -2166,7 +2644,11 @@ components:
         kind:
           type: string
           enum: [review, bughunt]
-          description: Only `review` is implemented; `bughunt` returns 400 in this release.
+          description: >-
+            `review` diffs `target_ref` against `base_ref`; `bughunt`
+            free-text-investigates `scope` over the whole project via an
+            agentic tool loop (Ollama-native only in this release — a
+            non-Ollama resolved provider 400s at launch).
         project:
           type: string
           description: An already-ingested project's `project_name`.
@@ -2174,19 +2656,31 @@ components:
         target_ref:
           type: string
           nullable: true
-          description: "Required for `kind: review` (422 if omitted). Unused for `bughunt` in this release."
+          description: "Required for `kind: review` (422 if omitted). Unused for `kind: bughunt`."
           example: feature/my-branch
         base_ref:
           type: string
           nullable: true
           description: >-
-            Defaults to the project repo's default base branch
-            (`origin/HEAD`'s target, else local `main`/`master`) when omitted.
+            `kind: review` only. Defaults to the project repo's default base
+            branch (`origin/HEAD`'s target, else local `main`/`master`) when
+            omitted.
           example: develop
         scope:
           type: string
           nullable: true
-          description: bughunt-only; unused in this release (bughunt itself 400s at launch).
+          description: >-
+            Required for `kind: bughunt` (422 if omitted) — a free-text
+            description of what to investigate. Unused for `kind: review`.
+          example: look for unhandled errors and resource leaks in the ingestion pipeline
+        path_prefix:
+          type: string
+          nullable: true
+          description: >-
+            `kind: bughunt` only. Restricts *reported* findings to files
+            under this repo-relative prefix; the agent may still investigate
+            other files for context. Unused for `kind: review`.
+          example: src/services
         model:
           type: string
           nullable: true
@@ -2199,6 +2693,20 @@ components:
             Override the active LLM config's provider for this run only.
             Supported providers: ollama, openai, anthropic — an unknown value
             is rejected at launch with a 400, not a validation error.
+            `kind: bughunt` additionally requires the resolved provider to be
+            `ollama` (400 otherwise).
+        playbooks:
+          type: array
+          items: { type: string }
+          nullable: true
+          description: >-
+            Playbook names PUSHED into this run's prompt, in priority order
+            (at most 4). Each name must already exist and must apply to this
+            run's `kind` (a playbook's own `routines` field) — validated at
+            launch (400). Applies to both `kind: review` and `kind: bughunt`.
+            See `/routines/playbooks`. There is no equivalent field for
+            skills — those are model-PULLED from the full catalog every run.
+          example: [security-basics]
 
     LaunchRoutineResponse:
       type: object
@@ -2219,7 +2727,11 @@ components:
         status: { type: string, enum: [queued, running, done, failed] }
         params:
           type: object
-          description: The launch params this run was submitted with (repo_path, target_ref, base_ref, model, provider).
+          description: >-
+            The launch params this run was submitted with — for `kind:
+            review`: repo_path, target_ref, base_ref, model, provider,
+            playbooks; for `kind: bughunt`: repo_path, scope, path_prefix,
+            model, provider, playbooks.
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         severity_counts:
@@ -2247,15 +2759,19 @@ components:
         evidence:
           type: object
           nullable: true
-          description: 'Supporting context: {hunk_excerpt, entities, model, provider}.'
+          description: >-
+            Supporting context. `kind: review`: {hunk_excerpt, entities,
+            model, provider}. `kind: bughunt`: {entities, model, provider}
+            (no diff hunk to excerpt — bughunt has no diff).
         anchored:
           type: boolean
           description: >-
-            False when the model's start_line didn't fall within (±2 lines
-            of) a changed range — the finding is kept, not dropped; treat
-            its line numbers as approximate. See the "Code review routines"
-            section of the README for the retrieval-staleness caveat this
-            relates to.
+            `kind: review`: false when the model's start_line didn't fall
+            within (±2 lines of) a changed range. `kind: bughunt`: true only
+            when start_line falls within a graph code-entity's line span on
+            file_path. Either way the finding is kept, not dropped, when
+            unanchored — treat its line numbers as approximate. See the
+            "Code review routines" section of the README.
         created_at: { type: string, format: date-time }
 
     RoutineRunDetail:
@@ -2276,12 +2792,19 @@ components:
           type: object
           nullable: true
           description: >-
-            Per-stage counters (files changed/reviewable/skipped, hunks,
-            insertions/deletions, entities_matched, context_chars_total,
-            findings_total, findings_anchored, parse_failures, llm_calls,
-            prompt_chars_total, wall_seconds_analyze, wall_seconds_summarize)
-            plus the resolved model/provider. Null until the run reaches a
-            terminal status.
+            Per-stage counters, shape depends on `kind`. `kind: review`:
+            files changed/reviewable/skipped, hunks, insertions/deletions,
+            entities_matched, context_chars_total, playbooks_used,
+            skills_used, findings_total, findings_anchored, parse_failures,
+            llm_calls, prompt_chars_total, wall_seconds_analyze,
+            wall_seconds_summarize. `kind: bughunt`: rounds,
+            tool_calls_made, tool_payload_chars, loaded_skills, tools_called,
+            pushback_used (the mechanical read-before-report guard fired),
+            playbooks_used, findings_total, findings_anchored,
+            findings_dropped, parse_failures, llm_calls,
+            wall_seconds_resolve, wall_seconds_hunt, wall_seconds_findings,
+            wall_seconds_summarize. Both kinds include the resolved
+            model/provider. Null until the run reaches a terminal status.
         error:
           type: string
           nullable: true
@@ -2308,3 +2831,123 @@ components:
           items:
             $ref: "#/components/schemas/BranchInfo"
         default_base: { type: string }
+
+    PlaybookSummary:
+      type: object
+      description: One entry of GET /routines/playbooks's listing — omits content in favor of content_bytes.
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        routines:
+          type: array
+          items: { type: string, enum: [review, bughunt] }
+          description: Which routine kind(s) this playbook applies to — defaults to both on create.
+        content_bytes: { type: integer, description: UTF-8 byte length of content (16KB max). }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    PlaybookDTO:
+      type: object
+      description: Full playbook detail — GET-by-name/create/update response shape.
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        routines:
+          type: array
+          items: { type: string, enum: [review, bughunt] }
+        content:
+          type: string
+          description: >-
+            Markdown, up to 16KB. May start with a YAML frontmatter block
+            (`---\n...\n---\n`), stored/returned verbatim — the API does not
+            parse it.
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CreatePlaybookRequest:
+      type: object
+      required: [name, content]
+      properties:
+        name:
+          type: string
+          description: >-
+            Non-empty, ≤128 chars, no leading/trailing whitespace, no `/`,
+            `\`, or control characters (it's a REST path segment).
+          example: security-basics
+        content:
+          type: string
+          description: Markdown, up to 16KB (UTF-8 bytes).
+        routines:
+          type: array
+          items: { type: string, enum: [review, bughunt] }
+          nullable: true
+          description: Defaults to `["review", "bughunt"]` (applies to both) when omitted.
+
+    UpdatePlaybookRequest:
+      type: object
+      description: Fields left unset are left unchanged.
+      properties:
+        content:
+          type: string
+          nullable: true
+        routines:
+          type: array
+          items: { type: string, enum: [review, bughunt] }
+          nullable: true
+
+    SkillSummary:
+      type: object
+      description: One entry of GET /routines/skills's listing — omits content in favor of content_bytes.
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        description:
+          type: string
+          description: What a run's own model sees in the skills catalog when deciding whether to load this skill.
+        content_bytes: { type: integer, description: UTF-8 byte length of content (16KB max). }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    SkillDTO:
+      type: object
+      description: Full skill detail — GET-by-name/create/update response shape.
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        description: { type: string }
+        content:
+          type: string
+          description: >-
+            Markdown, up to 16KB. May start with a YAML frontmatter block,
+            stored/returned verbatim — stripped before the body is injected
+            into a run's prompt.
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CreateSkillRequest:
+      type: object
+      required: [name, description, content]
+      properties:
+        name:
+          type: string
+          description: >-
+            Non-empty, ≤128 chars, no leading/trailing whitespace, no `/`,
+            `\`, or control characters (it's a REST path segment).
+          example: sql-injection-review
+        description:
+          type: string
+          description: Non-empty. What a run's own model sees when deciding whether to load this skill.
+        content:
+          type: string
+          description: Markdown, up to 16KB (UTF-8 bytes).
+
+    UpdateSkillRequest:
+      type: object
+      description: Fields left unset are left unchanged.
+      properties:
+        description:
+          type: string
+          nullable: true
+        content:
+          type: string
+          nullable: true
