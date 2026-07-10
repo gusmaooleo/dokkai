@@ -464,6 +464,7 @@ All configuration is via environment variables (loaded from `.env` at startup).
 | `DATABASE_URL` | `postgresql://dokkai:dokkai@localhost:5432/dokkai` | Postgres connection string for conversation and job history (`docker compose up -d` starts a matching Postgres service). Boot-time SQL migrations run automatically. If Postgres is unreachable at startup, the API still serves — see [Current limitations](#current-limitations) |
 | `DOKKAI_ROOT_USER` | _(unset — `admin` seeded)_ | Optional override for the admin username, applied on boot (and re-applied if changed) — see [Authentication](#authentication) |
 | `DOKKAI_ROOT_PASSWORD` | _(unset — `admin` seeded)_ | Optional override for the admin password, applied on boot; changing it invalidates that user's existing sessions — see [Authentication](#authentication) |
+| `DOKKAI_CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | Comma-separated list of origins allowed to call the API from a browser (CORS) |
 | `WEAVIATE_HOST` | `localhost` | Weaviate host (client side) |
 | `WEAVIATE_HTTP_PORT` | `8080` | Weaviate HTTP port |
 | `WEAVIATE_GRPC_PORT` | `50051` | Weaviate gRPC port |

@@ -83,11 +83,21 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Dokkai API", lifespan=lifespan)
 
-# CORS — allow the Next.js frontend and any local dev tools
+# CORS — restrict to the configured frontend origin(s). DOKKAI_CORS_ORIGINS is a
+# comma-separated list of allowed origins (default: the Next.js dev server on
+# localhost:3000). We authenticate with bearer headers, not cookies, so
+# allow_credentials is False.
+_cors_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "DOKKAI_CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+    ).split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
