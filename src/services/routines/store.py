@@ -125,6 +125,62 @@ async def delete_run(run_id: str) -> bool:
     return result == "DELETE 1"
 
 
+def _row_to_finding_dict(row: asyncpg.Record) -> dict:
+    evidence = row["evidence"]
+    return {
+        "id": row["id"],
+        "file_path": row["file_path"],
+        "start_line": row["start_line"],
+        "end_line": row["end_line"],
+        "severity": row["severity"],
+        "category": row["category"],
+        "title": row["title"],
+        "body": row["body"],
+        "suggestion": row["suggestion"],
+        "evidence": evidence if isinstance(evidence, dict) or evidence is None else json.loads(evidence),
+        "anchored": row["anchored"],
+        "created_at": row["created_at"].isoformat(),
+    }
+
+
+async def list_findings(run_id: str) -> list[dict]:
+    """A run's findings, in insertion order — used by ``GET /routines/runs/{id}``."""
+    pool = await get_pool()
+    try:
+        run_uuid = uuid.UUID(run_id)
+    except ValueError:
+        return []
+    rows = await pool.fetch("SELECT * FROM findings WHERE run_id = $1 ORDER BY id", run_uuid)
+    return [_row_to_finding_dict(r) for r in rows]
+
+
+async def severity_counts_for_runs(run_ids: list[str]) -> dict[str, dict[str, int]]:
+    """
+    ``{run_id: {severity: count}}`` for every id in *run_ids*, computed with
+    ONE ``GROUP BY (run_id, severity)`` query — used by
+    ``GET /routines/runs`` to attach each listed run's ``severity_counts``
+    without an N+1 query per row. A run with no findings simply has no key
+    in the returned dict.
+    """
+    if not run_ids:
+        return {}
+    pool = await get_pool()
+    uuids = [uuid.UUID(r) for r in run_ids]
+    rows = await pool.fetch(
+        """
+        SELECT run_id, severity, count(*) AS n
+        FROM findings
+        WHERE run_id = ANY($1::uuid[])
+        GROUP BY run_id, severity
+        """,
+        uuids,
+    )
+    counts: dict[str, dict[str, int]] = {}
+    for row in rows:
+        counts.setdefault(str(row["run_id"]), {})[row["severity"]] = row["n"]
+    return counts
+
+
 # -------------------------------------------------------------------------
 # Sync API — worker thread (direct connection per call)
 # -------------------------------------------------------------------------

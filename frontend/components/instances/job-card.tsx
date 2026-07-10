@@ -42,7 +42,7 @@ export function JobCard({ job }: { job: Job }) {
       <div className="mb-3.5 flex flex-wrap items-center gap-2.5">
         <span className="font-mono text-[15px] font-semibold text-foreground">{job.project}</span>
         <span className="rounded-[6px] border border-border bg-surface-2 px-2 py-0.5 font-mono text-[10.5px] text-muted-foreground">
-          {JOB_KIND_LABEL[job.kind]}
+          {JOB_KIND_LABEL[job.kind] ?? job.kind}
         </span>
         <span className="flex-1" />
         <span className="font-mono text-[11px] text-[color:var(--text-faint)]">
