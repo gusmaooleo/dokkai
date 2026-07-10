@@ -38,7 +38,7 @@ Not sure what's missing? `dokkai doctor` checks node/docker/uv/`DOKKAI_HOME` plu
 
 | Command | Description |
 | --- | --- |
-| `dokkai up` | `docker compose up -d` for Weaviate, wait for it to become ready, probe Ollama and the configured embed/descriptor models (warnings only), report whether the API is reachable |
+| `dokkai up [--ui]` | `docker compose up -d` for Weaviate, wait for it to become ready, probe Ollama and the configured embed/descriptor models (warnings only), report whether the API is reachable. With `--ui`, also starts the frontend UI container (compose `ui` profile) and waits for it to become reachable |
 | `dokkai status` | Read-only health check (API, Weaviate, Ollama + model presence) and a list of ingested projects; always exits 0 |
 | `dokkai ingest <repo-path> [--recreate] [--no-describe] [--yes]` | Run the full ingestion pipeline via the API, with live stage progress (SSE, polling fallback) |
 | `dokkai graph <repo-path\|project> [--out <file>]` | Graph-only run (no LLM, no vectorization) for a directory, or a normalized graph export for an already-ingested project name |
@@ -49,6 +49,7 @@ Not sure what's missing? `dokkai doctor` checks node/docker/uv/`DOKKAI_HOME` plu
 Flags:
 
 - `--api <url>` (global) — dokkai API URL. Default `http://localhost:8000`.
+- `--ui` (`up`) — also start the frontend UI container (`docker compose --profile ui up -d`) and wait for it to become reachable at `http://localhost:3000`.
 - `--recreate` (`ingest`) — drop and rebuild the **entire** Weaviate collection (all projects) before inserting. Prompts for confirmation unless `--yes` is also passed.
 - `--no-describe` (`ingest`, `watch`) — skip per-entity LLM descriptions; the `summary` vector stays empty and search quality is reduced. Skips the descriptor pre-flight the API otherwise enforces.
 - `--yes` (`ingest`) — skip the `--recreate` confirmation prompt.

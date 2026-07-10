@@ -31,7 +31,10 @@ program
     "check/start local dependencies via docker compose and verify Ollama " +
       "models are present",
   )
-  .action(() => runUp(program.opts()));
+  .option("--ui", "also start the frontend UI container (compose `ui` profile)")
+  .action((options: { ui?: boolean }) =>
+    runUp({ ...program.opts(), ...options }),
+  );
 
 program
   .command("status")

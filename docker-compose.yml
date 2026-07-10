@@ -37,6 +37,18 @@ services:
       timeout: 3s
       retries: 10
 
+  ui:
+    profiles: ["ui"]
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    restart: on-failure:0
+    ports:
+      - "3000:3000"
+    # Browser-side only — no depends_on: the API/Weaviate/Postgres are reached
+    # from the client's browser, not from this container.
+
 volumes:
   weaviate_data:
   postgres_data:
