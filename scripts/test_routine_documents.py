@@ -178,6 +178,9 @@ async def test_validation() -> None:
         (" leading-space", "leading-whitespace name"),
         ("trailing-space ", "trailing-whitespace name"),
         ("x" * (documents._MAX_NAME_LEN + 1), "too-long name"),
+        ("a/b", "slash-containing name"),
+        ("a\\b", "backslash-containing name"),
+        ("a\tb", "tab-containing name"),
     ]:
         try:
             await documents.create_playbook(bad_name, "content")

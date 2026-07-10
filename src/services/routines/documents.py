@@ -87,6 +87,12 @@ def _validate_name(name: str) -> None:
         raise ValueError("name must not have leading/trailing whitespace")
     if len(name) > _MAX_NAME_LEN:
         raise ValueError(f"name exceeds the {_MAX_NAME_LEN}-character limit ({len(name)} chars)")
+    # '/' and '\' break the REST GET/PATCH/DELETE-by-name path param (FastAPI
+    # won't match a literal slash there, even URL-encoded as %2F); control
+    # characters are similarly hostile to a path segment. Reject both so a
+    # name is always reachable after creation.
+    if any(c in ("/", "\\") or ord(c) < 32 or ord(c) == 127 for c in name):
+        raise ValueError("name must not contain slashes or control characters")
 
 
 def _validate_content(content: str, label: str) -> None:

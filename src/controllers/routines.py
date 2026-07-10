@@ -1,32 +1,53 @@
 """
-Routines API endpoints — code review / bug hunt runs.
+Routines API endpoints — code review / bug hunt runs, plus their attachable
+playbooks and skills documents (decision 9d).
 
-POST   /routines/runs           — launch a review run as a background job
-                                   (bughunt: 400, not yet — later release)
-GET    /routines/runs           — list runs, each with severity_counts
-GET    /routines/runs/{run_id}  — a run's full detail, findings included
-DELETE /routines/runs/{run_id}  — delete a run (cascades to its findings)
-GET    /routines/git/branches   — a project's local branches + default base
+POST   /routines/runs                 — launch a review run as a background
+                                         job (bughunt: 400, not yet — later
+                                         release)
+GET    /routines/runs                 — list runs, each with severity_counts
+GET    /routines/runs/{run_id}        — a run's full detail, findings included
+DELETE /routines/runs/{run_id}        — delete a run (cascades to its findings)
+GET    /routines/git/branches         — a project's local branches + default base
+GET    /routines/playbooks            — list playbooks (no content, with content_bytes)
+GET    /routines/playbooks/{name}     — a playbook's full detail (with content)
+POST   /routines/playbooks            — create a playbook
+PATCH  /routines/playbooks/{name}     — update a playbook's content/routines
+DELETE /routines/playbooks/{name}     — delete a playbook
+GET    /routines/skills               — list skills (no content, with content_bytes)
+GET    /routines/skills/{name}        — a skill's full detail (with content)
+POST   /routines/skills               — create a skill
+PATCH  /routines/skills/{name}        — update a skill's description/content
+DELETE /routines/skills/{name}        — delete a skill
 """
 
 from __future__ import annotations
 
+import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from models.dtos.routines import (
     BranchInfo,
+    CreatePlaybookRequest,
+    CreateSkillRequest,
     FindingDTO,
     LaunchRoutineRequest,
     LaunchRoutineResponse,
+    PlaybookDTO,
+    PlaybookSummary,
     RoutineRunDetail,
     RoutineRunSummary,
+    SkillDTO,
+    SkillSummary,
+    UpdatePlaybookRequest,
+    UpdateSkillRequest,
 )
 from services.auth import require_auth, require_role
 from services.db import DatabaseUnavailableError
 from services.git_repo import GitError, default_base, is_git_repo, list_branches, resolve_ref
 from services.graph_store import GraphNotFoundError, _derive_repo_path, get_graph
 from services.jobs import ProjectJobConflict
-from services.routines import store
+from services.routines import documents, store
 from services.routines.engine import submit_routine
 from services.routines.review import _resolve_llm, run_review
 
@@ -198,3 +219,163 @@ async def getBranches(project: str = Query(...)):
         "branches": [BranchInfo(**b) for b in branches],
         "default_base": base,
     }
+
+
+# -------------------------------------------------------------------------
+# Playbooks / skills (decision 9d) — GETs are read-only (viewer allowed),
+# POST/PATCH/DELETE mutate state and require role admin/user (6k/12p).
+# -------------------------------------------------------------------------
+
+
+@router.get("/playbooks", response_model=list[PlaybookSummary])
+async def listPlaybooks():
+    """List playbooks. Omits ``content`` in favor of ``content_bytes`` — use
+    ``GET /routines/playbooks/{name}`` for the full content."""
+    try:
+        rows = await documents.list_playbooks()
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return [
+        PlaybookSummary(
+            id=r["id"],
+            name=r["name"],
+            routines=r["routines"],
+            content_bytes=len(r["content"].encode("utf-8")),
+            created_at=r["created_at"],
+            updated_at=r["updated_at"],
+        )
+        for r in rows
+    ]
+
+
+@router.get("/playbooks/{name}", response_model=PlaybookDTO)
+async def getPlaybook(name: str):
+    """A playbook's full detail, content included."""
+    try:
+        row = await documents.get_playbook(name)
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"playbook '{name}' not found")
+    return PlaybookDTO(**row)
+
+
+@router.post(
+    "/playbooks", response_model=PlaybookDTO, status_code=201, dependencies=[Depends(require_write)]
+)
+async def createPlaybook(data: CreatePlaybookRequest):
+    """Create a playbook."""
+    try:
+        row = await documents.create_playbook(data.name, data.content, data.routines)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except asyncpg.UniqueViolationError:
+        raise HTTPException(status_code=409, detail=f"playbook '{data.name}' already exists")
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return PlaybookDTO(**row)
+
+
+@router.patch(
+    "/playbooks/{name}", response_model=PlaybookDTO, dependencies=[Depends(require_write)]
+)
+async def updatePlaybook(name: str, data: UpdatePlaybookRequest):
+    """Update a playbook's content and/or routines. Fields left unset are
+    left unchanged."""
+    try:
+        row = await documents.update_playbook(name, data.content, data.routines)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"playbook '{name}' not found")
+    return PlaybookDTO(**row)
+
+
+@router.delete("/playbooks/{name}", dependencies=[Depends(require_write)])
+async def deletePlaybook(name: str):
+    """Delete a playbook."""
+    try:
+        deleted = await documents.delete_playbook(name)
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"playbook '{name}' not found")
+    return {"message": "Playbook deleted", "name": name}
+
+
+@router.get("/skills", response_model=list[SkillSummary])
+async def listSkills():
+    """List skills. Omits ``content`` in favor of ``content_bytes`` — use
+    ``GET /routines/skills/{name}`` for the full content."""
+    try:
+        rows = await documents.list_skills()
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return [
+        SkillSummary(
+            id=r["id"],
+            name=r["name"],
+            description=r["description"],
+            content_bytes=len(r["content"].encode("utf-8")),
+            created_at=r["created_at"],
+            updated_at=r["updated_at"],
+        )
+        for r in rows
+    ]
+
+
+@router.get("/skills/{name}", response_model=SkillDTO)
+async def getSkill(name: str):
+    """A skill's full detail, content included."""
+    try:
+        row = await documents.get_skill(name)
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"skill '{name}' not found")
+    return SkillDTO(**row)
+
+
+@router.post(
+    "/skills", response_model=SkillDTO, status_code=201, dependencies=[Depends(require_write)]
+)
+async def createSkill(data: CreateSkillRequest):
+    """Create a skill."""
+    try:
+        row = await documents.create_skill(data.name, data.description, data.content)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except asyncpg.UniqueViolationError:
+        raise HTTPException(status_code=409, detail=f"skill '{data.name}' already exists")
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return SkillDTO(**row)
+
+
+@router.patch("/skills/{name}", response_model=SkillDTO, dependencies=[Depends(require_write)])
+async def updateSkill(name: str, data: UpdateSkillRequest):
+    """Update a skill's description and/or content. Fields left unset are
+    left unchanged."""
+    try:
+        row = await documents.update_skill(name, data.description, data.content)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"skill '{name}' not found")
+    return SkillDTO(**row)
+
+
+@router.delete("/skills/{name}", dependencies=[Depends(require_write)])
+async def deleteSkill(name: str):
+    """Delete a skill."""
+    try:
+        deleted = await documents.delete_skill(name)
+    except DatabaseUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"skill '{name}' not found")
+    return {"message": "Skill deleted", "name": name}

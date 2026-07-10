@@ -81,3 +81,74 @@ class BranchInfo(BaseModel):
     name: str
     is_current: bool
     last_commit_date: str
+
+
+# -------------------------------------------------------------------------
+# Playbooks / skills (decision 9d) — B2
+# -------------------------------------------------------------------------
+
+
+class PlaybookSummary(BaseModel):
+    """List-item shape: omits ``content`` (up to 16KB each) in favor of
+    ``content_bytes``, so listing every playbook stays cheap. Full content
+    is only on the GET-by-name detail (:class:`PlaybookDTO`)."""
+
+    id: int
+    name: str
+    routines: list[str]
+    content_bytes: int
+    created_at: str
+    updated_at: str
+
+
+class PlaybookDTO(BaseModel):
+    id: int
+    name: str
+    routines: list[str]
+    content: str
+    created_at: str
+    updated_at: str
+
+
+class CreatePlaybookRequest(BaseModel):
+    name: str
+    content: str
+    routines: list[str] | None = None
+
+
+class UpdatePlaybookRequest(BaseModel):
+    content: str | None = None
+    routines: list[str] | None = None
+
+
+class SkillSummary(BaseModel):
+    """List-item shape: omits ``content`` in favor of ``content_bytes`` —
+    see :class:`PlaybookSummary`. Full content is only on the GET-by-name
+    detail (:class:`SkillDTO`)."""
+
+    id: int
+    name: str
+    description: str
+    content_bytes: int
+    created_at: str
+    updated_at: str
+
+
+class SkillDTO(BaseModel):
+    id: int
+    name: str
+    description: str
+    content: str
+    created_at: str
+    updated_at: str
+
+
+class CreateSkillRequest(BaseModel):
+    name: str
+    description: str
+    content: str
+
+
+class UpdateSkillRequest(BaseModel):
+    description: str | None = None
+    content: str | None = None
