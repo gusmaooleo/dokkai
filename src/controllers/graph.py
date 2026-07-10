@@ -5,6 +5,8 @@ GET /graph                          — list projects with ingested graphs
 GET /graph/{project}                — full project graph (code entities by
                                        default, or the full structural graph
                                        with ?include=structural)
+GET /graph/{project}/entity         — single entity's node + description/
+                                       chunk_text
 GET /graph/{project}/neighborhood   — BFS neighborhood of a single entity
 GET /graph/{project}/files          — file-level dependency view
 """
@@ -16,6 +18,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from models.dtos.graph import (
+    EntityDetailResponse,
     FileViewResponse,
     GraphResponse,
     NeighborhoodResponse,
@@ -25,6 +28,7 @@ from services.auth import require_auth
 from services.graph_store import (
     EntityNotFoundError,
     GraphNotFoundError,
+    get_entity_detail,
     get_file_view,
     get_full_graph,
     get_neighborhood,
@@ -69,6 +73,33 @@ async def getGraph(
     try:
         payload = get_full_graph(project, structural=include == "structural", limit=limit)
     except GraphNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return payload
+
+
+@router.get("/{project}/entity", response_model=EntityDetailResponse)
+async def getEntity(
+    project: str,
+    name: str = Query(..., description="Qualified name of the entity to fetch."),
+):
+    """
+    Return a single entity's graph node, enriched with its Weaviate
+    ``description`` and ``chunk_text``.
+
+    Resolves *name* in *project*'s graph the same way
+    :func:`~services.graph_store.get_neighborhood` does (see
+    :func:`services.graph_store.resolve_entity`). ``description``/
+    ``chunk_text`` are ``null`` when the entity has no chunk in Weaviate
+    (e.g. a structural-only node) or Weaviate is unreachable — the graph
+    JSON is the source of truth for the entity's existence, not Weaviate.
+    See :func:`services.graph_store.get_entity_detail` for the full
+    contract.
+    """
+    try:
+        payload = get_entity_detail(project, name)
+    except GraphNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except EntityNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return payload
 

@@ -18,7 +18,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 from services.chunker import CODE_ENTITY_LABELS
+from services.retriever import Retriever
 from services.vectorize import _ingested_dir, find_latest_graph_json
+from services.weaviate_client import count_chunks_by_project, get_client
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +180,51 @@ def _get_graph(project_name: str, *, retried: bool) -> Graph:
     return graph
 
 
+def _safe_chunk_counts() -> dict[str, int]:
+    """
+    Chunk count per project (see
+    :func:`services.weaviate_client.count_chunks_by_project`), or ``{}`` when
+    Weaviate is unreachable — a logged warning, never a failed listing.
+    """
+    try:
+        client = get_client()
+    except Exception as e:
+        logger.warning("graph listing: Weaviate unreachable, omitting chunk counts: %s", e)
+        return {}
+    try:
+        counts = count_chunks_by_project(client)
+    except Exception as e:
+        logger.warning("graph listing: failed to fetch chunk counts: %s", e)
+        return {}
+    finally:
+        client.close()
+    return {c["project"]: c["chunks"] for c in counts}
+
+
+def _derive_repo_path(graph: Graph) -> str | None:
+    """
+    Derive the repo's absolute filesystem root from any ``File`` node: its
+    ``absolute_path`` with the (repo-relative) ``path`` suffix stripped.
+    Returns ``None`` when no ``File`` node carries both properties, or when
+    ``absolute_path`` doesn't actually end with ``path`` at a path-separator
+    boundary (a bare ``str.endswith`` would wrongly match e.g. path
+    ``bar.py`` against ``absolute_path`` ``/a/b/foo-bar.py``).
+    """
+    for node in graph.nodes:
+        if node["labels"][0] != "File":
+            continue
+        props = node.get("properties", {})
+        path = props.get("path")
+        absolute_path = props.get("absolute_path")
+        if not path or not absolute_path:
+            continue
+        suffix = path if path.startswith("/") else "/" + path
+        if not absolute_path.endswith(suffix):
+            continue
+        return absolute_path[: -len(suffix)].rstrip("/") or None
+    return None
+
+
 def list_graphs() -> list[dict[str, Any]]:
     """
     List every project with an ingested graph in ``ingested/``.
@@ -195,6 +242,11 @@ def list_graphs() -> list[dict[str, Any]]:
     corrupt/unparseable JSON is skipped with a logged warning rather than
     failing the whole listing. Returns ``[]`` when ``ingested/`` is absent
     or empty.
+
+    Each entry also carries ``chunks`` (Weaviate chunk count for the
+    project, via one group-by aggregate shared across all projects; ``None``
+    if Weaviate is unreachable) and ``repo_path`` (see
+    :func:`_derive_repo_path`; ``None`` if underivable).
     """
     ingested_dir = _ingested_dir()
     if not ingested_dir.is_dir():
@@ -203,6 +255,8 @@ def list_graphs() -> list[dict[str, Any]]:
     project_names = {
         _TRAILING_TIMESTAMP_RE.sub("", path.stem) for path in ingested_dir.glob("*.json")
     }
+
+    chunk_counts = _safe_chunk_counts()
 
     projects: list[dict[str, Any]] = []
     for project_name in sorted(project_names):
@@ -228,6 +282,8 @@ def list_graphs() -> list[dict[str, Any]]:
                 "nodes": len(graph.nodes),
                 "edges": len(graph.relationships),
                 "generated_at": generated_at,
+                "chunks": chunk_counts.get(project_name),
+                "repo_path": _derive_repo_path(graph),
             }
         )
 
@@ -435,6 +491,72 @@ def resolve_file(project_name: str, path: str) -> dict[str, Any] | None:
             return normalize_node(node)
 
     return None
+
+
+def _fetch_chunk_fields(
+    project_name: str, qualified_name: str
+) -> tuple[str | None, str | None]:
+    """
+    Fetch ``(description, chunk_text)`` for an entity from Weaviate via the
+    deterministic UUID (same lookup as the MCP ``get_entity`` tool — see
+    :meth:`services.retriever.Retriever.get_by_qualified_name`).
+
+    Degrades to ``(None, None)`` — with a logged warning — when Weaviate is
+    unreachable, or returns ``(None, None)`` (no warning) when the entity
+    simply has no chunk there (e.g. a structural-only node). The graph JSON,
+    not Weaviate, is the source of truth for the entity's existence.
+    """
+    try:
+        client = get_client()
+    except Exception as e:
+        logger.warning(
+            "entity detail: Weaviate unreachable, returning without description/chunk_text: %s",
+            e,
+        )
+        return None, None
+    try:
+        chunk = Retriever(client).get_by_qualified_name(qualified_name, project_name)
+    except Exception as e:
+        logger.warning(
+            "entity detail: failed to fetch chunk for '%s' in project '%s': %s",
+            qualified_name,
+            project_name,
+            e,
+        )
+        return None, None
+    finally:
+        client.close()
+
+    if chunk is None:
+        return None, None
+    return chunk.description or None, chunk.chunk_text or None
+
+
+def get_entity_detail(project_name: str, qualified_name: str) -> dict[str, Any]:
+    """
+    Assemble the entity-detail response payload for *qualified_name* in
+    *project_name*'s graph.
+
+    Resolves the entity the same way :func:`get_neighborhood` does (see
+    :func:`resolve_entity`), then enriches the normalized node with
+    ``description``/``chunk_text`` fetched from Weaviate (see
+    :func:`_fetch_chunk_fields`) — both ``None`` when Weaviate has no chunk
+    for the entity, or is unreachable.
+
+    Raises :class:`GraphNotFoundError` when no graph has been ingested for
+    the project, and :class:`EntityNotFoundError` when *qualified_name*
+    cannot be resolved in the project's graph.
+    """
+    graph = get_graph(project_name)
+    node = resolve_entity(graph, qualified_name)
+    if node is None:
+        raise EntityNotFoundError(project_name, qualified_name)
+
+    description, chunk_text = _fetch_chunk_fields(project_name, qualified_name)
+    payload = normalize_node(node)
+    payload["description"] = description
+    payload["chunk_text"] = chunk_text
+    return payload
 
 
 def get_neighborhood(
