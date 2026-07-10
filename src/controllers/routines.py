@@ -2,9 +2,8 @@
 Routines API endpoints — code review / bug hunt runs, plus their attachable
 playbooks and skills documents (decision 9d).
 
-POST   /routines/runs                 — launch a review run as a background
-                                         job (bughunt: 400, not yet — later
-                                         release)
+POST   /routines/runs                 — launch a review or bug-hunt run as a
+                                         background job
 GET    /routines/runs                 — list runs, each with severity_counts
 GET    /routines/runs/{run_id}        — a run's full detail, findings included
 DELETE /routines/runs/{run_id}        — delete a run (cascades to its findings)
@@ -48,6 +47,7 @@ from services.git_repo import GitError, default_base, is_git_repo, list_branches
 from services.graph_store import GraphNotFoundError, _derive_repo_path, get_graph
 from services.jobs import ProjectJobConflict
 from services.routines import documents, store
+from services.routines.bughunt import _non_ollama_error, run_bughunt
 from services.routines.engine import submit_routine
 from services.routines.review import _resolve_llm, run_review
 
@@ -92,32 +92,33 @@ async def launchRoutine(data: LaunchRoutineRequest) -> LaunchRoutineResponse:
     ``GET /routines/runs/{run_id}`` (or the shared ``GET /instances/jobs/{job_id}``)
     for progress and the final result.
 
-    ``kind='bughunt'`` is honest-400ed — that routine arrives in a later
-    release. For ``kind='review'``, pre-flights run BEFORE the job is
-    created, in order, so a bad request fails synchronously with an
-    actionable message rather than only surfacing inside the job's result:
-    the project must have an ingested graph (404), its repo_path must be a
-    git repository (400), ``base_ref``/``target_ref`` must resolve (400),
-    every named playbook (decision 9d) must exist and apply to 'review' with
-    at most 4 selected (400), and the LLM (from the launch payload or the
-    active config, 12h) must be resolvable and healthy (400) — the same
-    resolution ``services.routines.review.run_review`` itself does, run here
-    too so its failure message reaches the caller synchronously instead of
-    only inside a failed job/run.
+    Pre-flights run BEFORE the job is created, in order, so a bad request
+    fails synchronously with an actionable message rather than only
+    surfacing inside the job's result: the project must have an ingested
+    graph (404); for ``kind='review'``, its repo_path must be a git
+    repository and ``base_ref``/``target_ref`` must resolve (400 — skipped
+    for ``kind='bughunt'``, which has no diff to anchor against, decision
+    9b); every named playbook (decision 9d) must exist and apply to THIS
+    run's kind, with at most 4 selected (400); the LLM (from the launch
+    payload or the active config, 12h) must be resolvable and healthy (400)
+    — the same resolution ``run_review``/``run_bughunt`` themselves do, run
+    here too so its failure message reaches the caller synchronously instead
+    of only inside a failed job/run; and for ``kind='bughunt'`` specifically,
+    the resolved provider must be ``"ollama"`` (decision 9a — the agent loop
+    is Ollama-native only in this release, 400 with the same message
+    ``services.routines.agent_loop.run_agent_loop`` itself would raise).
     """
-    if data.kind == "bughunt":
-        raise HTTPException(status_code=400, detail="bug hunt routines arrive in a later release")
-
     repo_path = _resolve_repo_path(data.project)
 
-    try:
-        if not is_git_repo(repo_path):
-            raise GitError(f"'{repo_path}' is not a git repository — check the project's repo_path")
-        base = data.base_ref or default_base(repo_path)
-        resolve_ref(repo_path, base)
-        resolve_ref(repo_path, data.target_ref)
-    except GitError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    if data.kind == "review":
+        try:
+            if not is_git_repo(repo_path):
+                raise GitError(f"'{repo_path}' is not a git repository — check the project's repo_path")
+            base = data.base_ref or default_base(repo_path)
+            resolve_ref(repo_path, base)
+            resolve_ref(repo_path, data.target_ref)
+        except GitError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     playbook_names = data.playbooks or []
     if len(playbook_names) > 4:
@@ -127,28 +128,45 @@ async def launchRoutine(data: LaunchRoutineRequest) -> LaunchRoutineResponse:
             playbook = await documents.get_playbook(name)
             if playbook is None:
                 raise HTTPException(status_code=400, detail=f"playbook '{name}' not found")
-            if "review" not in playbook["routines"]:
+            if data.kind not in playbook["routines"]:
                 raise HTTPException(
-                    status_code=400, detail=f"playbook '{name}' does not apply to review routines"
+                    status_code=400, detail=f"playbook '{name}' does not apply to {data.kind} routines"
                 )
     except DatabaseUnavailableError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    params = {
-        "repo_path": repo_path,
-        "target_ref": data.target_ref,
-        "base_ref": data.base_ref,
-        "model": data.model,
-        "provider": data.provider,
-        "playbooks": data.playbooks,
-    }
+    if data.kind == "review":
+        params = {
+            "repo_path": repo_path,
+            "target_ref": data.target_ref,
+            "base_ref": data.base_ref,
+            "model": data.model,
+            "provider": data.provider,
+            "playbooks": data.playbooks,
+        }
+        runner = run_review
+    else:
+        params = {
+            "repo_path": repo_path,
+            "scope": data.scope,
+            "path_prefix": data.path_prefix,
+            "model": data.model,
+            "provider": data.provider,
+            "playbooks": data.playbooks,
+        }
+        runner = run_bughunt
+
+    noun = "bug hunt" if data.kind == "bughunt" else "review"
     try:
-        await _resolve_llm(params)
+        _provider, _model, provider_name = await _resolve_llm(params, noun=noun)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    if data.kind == "bughunt" and provider_name != "ollama":
+        raise HTTPException(status_code=400, detail=str(_non_ollama_error(provider_name)))
+
     try:
-        result = await submit_routine("review", data.project, repo_path, params, run_review)
+        result = await submit_routine(data.kind, data.project, repo_path, params, runner)
     except ProjectJobConflict as e:
         raise HTTPException(status_code=409, detail=str(e))
     except DatabaseUnavailableError as e:

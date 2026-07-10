@@ -458,7 +458,7 @@ def _stage_context(
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_llm(params: dict) -> tuple[LLMProvider, str, str]:
+async def _resolve_llm(params: dict, *, noun: str = "review") -> tuple[LLMProvider, str, str]:
     """
     Resolve ``(provider, model, provider_name)`` for the analyze/summarize
     stages: ``params['model']``/``params['provider']`` override the ACTIVE
@@ -476,6 +476,12 @@ async def _resolve_llm(params: dict) -> tuple[LLMProvider, str, str]:
     override fails with an actionable message up front rather than as a
     raw HTTP error mid-analyze.
 
+    *noun* names the routine kind in the "no provider configured" message
+    below (default ``"review"`` — this function's original/only caller for a
+    long time, so the review-path message stays byte-identical; documented
+    API behavior other tooling depends on). ``services.routines.bughunt``
+    passes ``noun="bug hunt"`` when it reuses this same resolution chain.
+
     Raises :class:`ValueError` if neither the params nor the active config
     supply a provider+model, or if the resolved model isn't actually
     available.
@@ -485,7 +491,7 @@ async def _resolve_llm(params: dict) -> tuple[LLMProvider, str, str]:
     model = params.get("model") or (config.model if config else None)
     if not provider_name or not model:
         raise ValueError(
-            "No LLM provider configured for this review. "
+            f"No LLM provider configured for this {noun}. "
             "POST to /config/llm to set one up, or pass model/provider in the launch payload."
         )
 

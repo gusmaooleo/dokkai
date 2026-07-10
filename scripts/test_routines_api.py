@@ -120,17 +120,26 @@ async def main() -> None:
                 "no graph found for project 'does-not-exist-project'" in resp.json()["detail"],
             )
 
-            # --- negative: bughunt 400 (not implemented yet) ---
+            # --- negative: bughunt missing scope -> 422 (DTO validator, mirrors review's target_ref) ---
             resp = await client.post(
                 "/routines/runs",
                 json={"kind": "bughunt", "project": PROJECT},
                 headers=auth_headers(admin_token),
             )
-            check("bughunt 400", resp.status_code == 400)
-            check(
-                "bughunt honest 400 message",
-                resp.json()["detail"] == "bug hunt routines arrive in a later release",
+            check("bughunt missing scope 422", resp.status_code == 422)
+
+            # --- negative: bughunt non-ollama provider override -> 400 ---
+            resp = await client.post(
+                "/routines/runs",
+                json={
+                    "kind": "bughunt",
+                    "project": PROJECT,
+                    "scope": "error handling",
+                    "provider": "openai",
+                },
+                headers=auth_headers(admin_token),
             )
+            check("bughunt non-ollama provider 400", resp.status_code == 400)
 
             # --- launch a review run (default/persisted model) ---
             started = time.monotonic()

@@ -16,8 +16,13 @@ class LaunchRoutineRequest(BaseModel):
     # sub-part A.
     target_ref: str | None = None
     base_ref: str | None = None
-    # bughunt only — unused in sub-part A (bughunt itself 400s at launch).
+    # Required for kind='bughunt' (validated below): a free-text query
+    # describing what to investigate.
     scope: str | None = None
+    # bughunt only — restricts REPORTED findings to files under this
+    # (repo-relative) prefix; the agent may still investigate elsewhere for
+    # context. Unused for kind='review'.
+    path_prefix: str | None = None
     # Override the active LLM config (12h) for this run — see
     # services.routines.review._resolve_llm.
     model: str | None = None
@@ -32,6 +37,8 @@ class LaunchRoutineRequest(BaseModel):
     def _require_target_ref_for_review(self) -> "LaunchRoutineRequest":
         if self.kind == "review" and not self.target_ref:
             raise ValueError("target_ref is required for kind='review'")
+        if self.kind == "bughunt" and not self.scope:
+            raise ValueError("scope is required for bug hunt routines")
         return self
 
 
