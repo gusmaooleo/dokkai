@@ -84,7 +84,7 @@ from services.chunker import CODE_ENTITY_LABELS
 from services.graph_store import GraphNotFoundError, resolve_file
 from services.jobs import Job
 from services.llm_provider import LLMMessage, LLMProvider
-from services.routines.agent_loop import build_tools, run_agent_loop
+from services.routines.agent_loop import build_tools, find_json_object_candidates, run_agent_loop
 from services.routines.documents import split_frontmatter
 from services.routines.review import (
     ANALYZE_TEMPERATURE,
@@ -105,6 +105,22 @@ from services.weaviate_client import get_client
 # the loop's own budgets (MAX_ROUNDS, tool payload chars, skills cap) live
 # in agent_loop.py and are reused via run_agent_loop's defaults.
 MAX_TOKENS_HUNT_RETRY = 4096  # the JSON-reformat retry call — as generous as review's analyze budget
+
+# Read-before-report guard: tool names that count as "actually read the
+# code" for a finding to be considered evidence-backed (mechanical check on
+# run_agent_loop's own tools_called, not a prompt-only ask).
+_READ_TOOL_NAMES = frozenset({"get_entity", "get_file"})
+
+# Bounded pushback round (at most ONE per run): a fresh, small run_agent_loop
+# call — small max_rounds since this is a narrow "go verify and correct
+# yourself" ask, not a full re-investigation.
+PUSHBACK_MAX_ROUNDS = 4
+
+_PUSHBACK_MESSAGE = (
+    "Your findings are not acceptable yet — you have not read the actual code. "
+    "Call get_entity or get_file on each file you suspect, verify your claims "
+    "against the real code, then give the corrected final JSON verdict."
+)
 
 
 class BughuntError(RuntimeError):
@@ -148,11 +164,11 @@ _HUNT_PLAYBOOK_MARKER = (
     "playbooks/rules land here. -->"
 )
 
-_HUNT_SYSTEM_PROMPT = f"""You are a senior software engineer hunting for bugs in a codebase. You have no knowledge of this code beyond what the tools return — use them. Investigate the scope described in the user message using search/get_entity/neighbors/get_file/grep_project; call load_skill for any skill clearly relevant to the investigation (at most 3, see the catalog below).
+_HUNT_SYSTEM_PROMPT = f"""You are a senior software engineer hunting for bugs in a codebase. You have no knowledge of this code beyond what the tools return — use them. Investigate the scope described in the user message thoroughly: run multiple searches (search/grep_project) with different queries to cover the scope, then call get_entity or get_file on every specific piece of code you suspect, BEFORE reporting it — findings based only on search-result snippets are not acceptable, you must have actually read the code first. Use neighbors to check callers/callees when relevant, and call load_skill for any skill clearly relevant to the investigation (at most 3, see the catalog below).
 
-Gather EVIDENCE for every issue: cite the exact file path and line numbers from what get_entity()/get_file() actually returned — never invent or guess a file path or line number. When you call a tool, output ONLY the JSON for that one call and nothing else — no explanation, no example result. You do not have real results until the system gives them back to you.
+Gather EVIDENCE for every issue: cite the exact file path and line numbers from what get_entity()/get_file() actually returned — never invent or guess a file path or line number. You do not have real results until the system gives them back to you.
 
-Once your investigation is complete, STOP calling tools and reply with your final answer as ONLY a single strict JSON object — no prose, no markdown fences, nothing before or after it — of this exact shape:
+Once your investigation is complete, stop calling tools and reply with your final answer as ONLY a single strict JSON object — no prose, no markdown fences, nothing before or after it — of this exact shape:
 
 {{
   "findings": [
@@ -242,9 +258,13 @@ def _parse_hunt_answer(raw: str) -> dict | None:
     Parse *raw* as the loop's final-answer JSON object contract
     (``{"findings": [...], "notes": ...}``), tolerating a markdown fence
     (:func:`services.routines.review._strip_fences`, reused) and, as a
-    fallback, prose wrapped around a single top-level ``{...}`` block
-    (mirrors ``review._parse_json_array``'s tolerance, adapted to an
-    object). Returns ``None`` if no such object could be extracted.
+    fallback, an embedded ``{"findings": ...}`` object surrounded by prose —
+    reuses :func:`services.routines.agent_loop.find_json_object_candidates`
+    (shared with the loop's own tool-call fallback parser: the model's
+    content shape turned out richer than "one bare object" for both). NOT
+    shared with ``review._parse_json_array`` (a JSON ARRAY contract, not an
+    object — a different parser, deliberately not touched by this). Returns
+    ``None`` if no such object could be extracted.
     """
     text = _strip_fences(raw)
     try:
@@ -254,14 +274,13 @@ def _parse_hunt_answer(raw: str) -> dict | None:
     except (json.JSONDecodeError, ValueError):
         pass
 
-    start, end = text.find("{"), text.rfind("}")
-    if start != -1 and end != -1 and end > start:
+    for candidate in find_json_object_candidates(text):
         try:
-            obj = json.loads(text[start : end + 1])
-            if isinstance(obj, dict) and isinstance(obj.get("findings"), list):
-                return obj
+            obj = json.loads(candidate)
         except (json.JSONDecodeError, ValueError):
-            pass
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("findings"), list):
+            return obj
     return None
 
 
@@ -305,12 +324,18 @@ async def _parse_hunt_answer_with_retry(
 
 
 def _relative_to_repo(file_path: str, repo_path: str) -> str:
-    """Best-effort repo-relative form of *file_path*, for the
-    ``path_prefix`` constraint check — tool results often echo an absolute
-    path (``_format_hit_lines`` prefers ``absolute_path``), while
-    ``path_prefix`` is naturally given repo-relative (e.g.
-    ``src/features/alarms``). Returns *file_path* unchanged when it's
-    already relative, or when it's absolute but not under *repo_path*."""
+    """Best-effort repo-relative form of *file_path* — used by
+    :func:`_validate_finding` to normalize EVERY finding's ``file_path``
+    up front (tool results often echo an absolute path, since
+    ``_format_hit_lines``/``get_file`` prefer ``absolute_path``, and the
+    model naturally copies that into its finding), so the ``path_prefix``
+    constraint check, the graph/disk lookups, anchoring
+    (:func:`_find_entity_for_line` matches relative ``path`` only), and what
+    gets stored all agree — repo-relative is what ``review`` stores and what
+    the UI renders. Returns *file_path* UNCHANGED when it's already
+    relative, or when it's absolute but not under *repo_path* (so an
+    escaping absolute path reaches the containment guard in
+    :func:`_validate_finding` untouched)."""
     if not os.path.isabs(file_path):
         return file_path
     try:
@@ -353,6 +378,14 @@ def _validate_finding(
     """
     Validate/anchor one raw finding from the agent's JSON verdict.
 
+    ``file_path`` is normalized to repo-relative up front
+    (:func:`_relative_to_repo`) before anything else uses it — including
+    what's ultimately STORED in the returned finding's ``file_path`` — since
+    tool results (``get_file``) echo the absolute path and the model
+    naturally copies that into its finding; repo-relative is what
+    ``review``'s findings store and what the UI renders, and it's required
+    for anchoring to actually match (see point 2 below).
+
     Anchoring rule (no diff to anchor against, unlike review):
 
       1. ``file_path`` must resolve to something real, checked in two
@@ -387,10 +420,20 @@ def _validate_finding(
     raw_path = raw.get("file_path")
     if not isinstance(raw_path, str) or not raw_path.strip():
         return None, ["dropped: missing file_path"]
-    file_path = raw_path.strip()
+    # Normalize to repo-relative UP FRONT, before any other use of file_path
+    # (path_prefix check, graph/disk lookups, anchoring, and what's stored):
+    # tool results (get_file) echo the ABSOLUTE path, and the model naturally
+    # copies that into its finding — repo-relative is what review stores and
+    # what the UI renders, and it's also what _find_entity_for_line's node
+    # matching (relative-only) needs to actually anchor. _relative_to_repo is
+    # a no-op for an already-relative path OR an absolute path that escapes
+    # repo_path (returns it UNCHANGED in both cases) — so the containment
+    # guard below still evaluates the untouched escaping path exactly as
+    # before; only an absolute path genuinely INSIDE repo_path is rewritten.
+    file_path = _relative_to_repo(raw_path.strip(), repo_path)
 
     if path_prefix:
-        rel_path = _normalize_path(_relative_to_repo(file_path, repo_path))
+        rel_path = _normalize_path(file_path)
         prefix_norm = _normalize_path(path_prefix).rstrip("/")
         if rel_path != prefix_norm and not rel_path.startswith(prefix_norm + "/"):
             return None, [f"dropped: file_path '{file_path}' outside path_prefix '{path_prefix}'"]
@@ -615,6 +658,54 @@ async def run_bughunt(job: Job, run_id: str, params: dict, emit: Callable[[str, 
     try:
         tools = build_tools(project, client)
         loop_result = await run_agent_loop(provider, model, system_prompt, user_prompt, tools, emit)
+
+        parsed, parse_retry_llm_calls = await _parse_hunt_answer_with_retry(
+            provider, model, loop_result["answer"], emit
+        )
+
+        # Mechanical read-before-report guard: a verdict with findings but no
+        # get_entity/get_file call anywhere in the loop is not evidence-backed
+        # (prompting alone doesn't reliably stop a small model from reporting
+        # off search snippets — see module docstring). Bounded to ONE
+        # pushback round; whatever comes back after it is accepted as-is.
+        pushback_used = False
+        tools_called = set(loop_result["tools_called"])
+        if (
+            parsed is not None
+            and parsed["findings"]
+            and not (tools_called & _READ_TOOL_NAMES)
+        ):
+            emit("hunt", "pushback: findings without code reads — demanding verification")
+            pushback_used = True
+            pushback_user_prompt = (
+                f"{user_prompt}\n\nYour previous investigation produced this verdict without "
+                f"reading the actual code:\n{loop_result['answer']}\n\n{_PUSHBACK_MESSAGE}"
+            )
+            pushback_result = await run_agent_loop(
+                provider, model, system_prompt, pushback_user_prompt, tools, emit,
+                max_rounds=PUSHBACK_MAX_ROUNDS,
+            )
+            emit(
+                "hunt",
+                f"pushback: agent re-answered after {pushback_result['rounds']} more round(s), "
+                f"{pushback_result['tool_calls_made']} more tool call(s)",
+            )
+            tools_called |= set(pushback_result["tools_called"])
+            loop_result = {
+                "answer": pushback_result["answer"],
+                "rounds": loop_result["rounds"] + pushback_result["rounds"],
+                "tool_calls_made": loop_result["tool_calls_made"] + pushback_result["tool_calls_made"],
+                "tool_payload_chars": loop_result["tool_payload_chars"] + pushback_result["tool_payload_chars"],
+                "loaded_skills": loop_result["loaded_skills"] + [
+                    s for s in pushback_result["loaded_skills"] if s not in loop_result["loaded_skills"]
+                ],
+                "tools_called": sorted(tools_called),
+            }
+            second_parsed, second_parse_retry_llm_calls = await _parse_hunt_answer_with_retry(
+                provider, model, pushback_result["answer"], emit
+            )
+            parsed = second_parsed
+            parse_retry_llm_calls += second_parse_retry_llm_calls
     finally:
         client.close()
     wall_seconds_hunt = round(time.monotonic() - hunt_started, 2)
@@ -629,16 +720,14 @@ async def run_bughunt(job: Job, run_id: str, params: dict, emit: Callable[[str, 
         "tool_calls_made": loop_result["tool_calls_made"],
         "tool_payload_chars": loop_result["tool_payload_chars"],
         "loaded_skills": loop_result["loaded_skills"],
+        "tools_called": loop_result["tools_called"],
+        "pushback_used": pushback_used,
         "model": model,
         "provider": provider_name,
         "playbooks_used": [pb["name"] for pb in playbooks],
         "wall_seconds_resolve": wall_seconds_resolve,
         "wall_seconds_hunt": wall_seconds_hunt,
     }
-
-    parsed, parse_retry_llm_calls = await _parse_hunt_answer_with_retry(
-        provider, model, loop_result["answer"], emit
-    )
 
     if parsed is None:
         # Same key-set as the success shape below (llm_calls included here

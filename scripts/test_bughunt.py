@@ -49,6 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from services import graph_store  # noqa: E402
 from services.jobs import Job  # noqa: E402
 from services.routines import bughunt  # noqa: E402
+from services.routines.agent_loop import extract_fallback_tool_call  # noqa: E402
 
 BASE_URL = os.getenv("DOKKAI_API_URL", "http://localhost:8000")
 PROJECT = "saffira_back-end"
@@ -360,6 +361,196 @@ async def test_parse_degrade_unit() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Unit case: read-before-report pushback guard (fake provider, no LLM/Weaviate/DB)
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedBughuntProvider:
+    """Returns each entry of *script* in order, one per ``chat_with_tools``
+    call; ``chat()`` (used by the JSON-reformat retry / summarize stage)
+    always returns a fixed non-JSON string — fine since none of the pushback
+    test cases below exercise the parse-retry path (every scripted answer is
+    already valid JSON)."""
+
+    provider_name = "ollama"
+
+    def __init__(self, script: list[dict]) -> None:
+        self._script = list(script)
+        self.calls: list[dict] = []
+
+    async def chat_with_tools(self, messages, *, model, tools=None, temperature=0.3, max_tokens=4096):
+        self.calls.append({"messages": [dict(m) for m in messages], "tools": tools})
+        if self._script:
+            return self._script.pop(0)
+        return {"role": "assistant", "content": '{"findings": [], "notes": "script exhausted"}'}
+
+    async def chat(self, messages, *, model, temperature=0.3, max_tokens=4096):
+        return "### Summary\n\n- ok"
+
+
+async def _run_bughunt_with_fake_provider(provider) -> tuple[dict, list[tuple[str, str]]]:
+    async def fake_stage_resolve(params, emit):
+        emit("resolve", "resolve: using fake/ollama")
+        return provider, "fake-model", "ollama"
+
+    def fake_get_client():
+        return _FakeWeaviateClient()
+
+    original_stage_resolve = bughunt._stage_resolve
+    original_get_client = bughunt.get_client
+    bughunt._stage_resolve = fake_stage_resolve
+    bughunt.get_client = fake_get_client
+    try:
+        events: list[tuple[str, str]] = []
+        job = Job(id="fake-job", repo_path="/tmp", kind="bughunt", project="fake-project")
+        result = await bughunt.run_bughunt(
+            job, "fake-run-id", {"repo_path": "/tmp", "scope": "anything"}, lambda s, m: events.append((s, m))
+        )
+    finally:
+        bughunt._stage_resolve = original_stage_resolve
+        bughunt.get_client = original_get_client
+    return result, events
+
+
+_FINDING_JSON = (
+    '{"findings": [{"file_path": "src/features/alarms/fake.ts", "start_line": 1, "end_line": 1, '
+    '"severity": "medium", "category": "bug", "title": "t", "body": "b", "suggestion": null}], '
+    '"notes": "n"}'
+)
+_NO_FINDING_JSON = '{"findings": [], "notes": "clean"}'
+
+
+async def test_pushback_findings_without_reads() -> None:
+    """A verdict with findings but zero tool calls at all (so certainly no
+    get_entity/get_file) must trigger exactly ONE pushback round, and the
+    pushback's own answer (even if it's ALSO reads-free) is accepted as
+    final — 'accept whatever comes back' (no second pushback)."""
+    provider = _ScriptedBughuntProvider(
+        [
+            {"role": "assistant", "content": _FINDING_JSON},  # round 1: findings, no tool calls at all
+            {"role": "assistant", "content": _FINDING_JSON},  # pushback round: re-answers, still no reads
+        ]
+    )
+    result, events = await _run_bughunt_with_fake_provider(provider)
+
+    check("pushback (no reads): stats.pushback_used is True", result["stats"]["pushback_used"] is True)
+    check(
+        "pushback (no reads): pushback event emitted",
+        any(msg.startswith("pushback: findings without code reads") for _, msg in events),
+    )
+    check(
+        "pushback (no reads): 'agent re-answered' event emitted",
+        any(msg.startswith("pushback: agent re-answered") for _, msg in events),
+    )
+    check(
+        "pushback (no reads): exactly 2 chat_with_tools calls made (1 + the 1 pushback round)",
+        len(provider.calls) == 2,
+    )
+    check("pushback (no reads): stats.tools_called == []", result["stats"]["tools_called"] == [])
+
+
+async def test_pushback_findings_with_reads() -> None:
+    """A verdict with findings where a get_entity call happened earlier in
+    the SAME loop (even one that errored, since the fake Weaviate client
+    can't really serve it) must NOT trigger a pushback — the mechanical
+    guard only checks whether the tool was called, not whether it
+    succeeded."""
+    provider = _ScriptedBughuntProvider(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": "get_entity", "arguments": {"qualified_name": "x.y"}}}],
+            },
+            {"role": "assistant", "content": _FINDING_JSON},  # round 2: final verdict after the read attempt
+        ]
+    )
+    result, events = await _run_bughunt_with_fake_provider(provider)
+
+    check("pushback (with reads): stats.pushback_used is False", result["stats"]["pushback_used"] is False)
+    check(
+        "pushback (with reads): no pushback event emitted",
+        not any(msg.startswith("pushback:") for _, msg in events),
+    )
+    check(
+        "pushback (with reads): stats.tools_called == ['get_entity']",
+        result["stats"]["tools_called"] == ["get_entity"],
+    )
+    check(
+        "pushback (with reads): exactly 2 chat_with_tools calls made (no pushback round)",
+        len(provider.calls) == 2,
+    )
+
+
+async def test_pushback_zero_findings() -> None:
+    """A clean (zero-finding) verdict must never trigger a pushback,
+    regardless of whether any tool was called."""
+    provider = _ScriptedBughuntProvider([{"role": "assistant", "content": _NO_FINDING_JSON}])
+    result, events = await _run_bughunt_with_fake_provider(provider)
+
+    check("pushback (zero findings): stats.pushback_used is False", result["stats"]["pushback_used"] is False)
+    check(
+        "pushback (zero findings): no pushback event emitted",
+        not any(msg.startswith("pushback:") for _, msg in events),
+    )
+    check("pushback (zero findings): exactly 1 chat_with_tools call made", len(provider.calls) == 1)
+
+
+# ---------------------------------------------------------------------------
+# Unit case: embedded-extraction shape disambiguation (approved follow-up) —
+# no LLM/Weaviate/DB, direct function calls.
+# ---------------------------------------------------------------------------
+
+
+def test_embedded_extraction_shape_disambiguation() -> None:
+    """A message containing BOTH a findings-shaped block and a tool-call-
+    shaped block (findings block placed FIRST, to prove this is shape-
+    driven, not 'just take the first candidate'): the loop's own fallback
+    tool-call parser must pick the tool-call-shaped block, and bughunt's
+    verdict parser must pick the findings-shaped block — same shared
+    ``find_json_object_candidates``, different shape predicates."""
+    content = (
+        'Here is my verdict: {"findings": [], "notes": "clean"}\n'
+        "Actually let me check one more thing first: "
+        '{"name": "get_file", "arguments": {"path": "a.ts"}}'
+    )
+
+    tool_call = extract_fallback_tool_call(content)
+    check(
+        "shape disambiguation: tool-loop picks the tool-call-shaped block",
+        tool_call == {"name": "get_file", "arguments": {"path": "a.ts"}},
+    )
+
+    verdict = bughunt._parse_hunt_answer(content)
+    check(
+        "shape disambiguation: verdict parser picks the findings-shaped block",
+        verdict == {"findings": [], "notes": "clean"},
+    )
+
+
+def test_parse_hunt_answer_embedded_extraction() -> None:
+    """``_parse_hunt_answer`` itself recovers a findings verdict embedded in
+    prose (regression for the naive first-'{'-to-last-'}' span it used to
+    use, which a leading/trailing unrelated brace could break)."""
+    pure = bughunt._parse_hunt_answer('{"findings": [], "notes": "ok"}')
+    check("parse_hunt_answer: pure object (regression)", pure == {"findings": [], "notes": "ok"})
+
+    fenced = bughunt._parse_hunt_answer('```json\n{"findings": [], "notes": "ok"}\n```')
+    check("parse_hunt_answer: fenced block (regression)", fenced == {"findings": [], "notes": "ok"})
+
+    in_prose = bughunt._parse_hunt_answer(
+        'I investigated and concluded: {"findings": [], "notes": "clean"} — that is my final answer.'
+    )
+    check("parse_hunt_answer: bare object mid-prose", in_prose == {"findings": [], "notes": "clean"})
+
+    check(
+        "parse_hunt_answer: no findings-shaped candidate -> None (degrade preserved)",
+        bughunt._parse_hunt_answer('I looked around: {"name": "get_file", "arguments": {}} but that is all.')
+        is None,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Unit case: finding anchoring rule (synthetic graph, no LLM/Weaviate/DB)
 # ---------------------------------------------------------------------------
 
@@ -413,6 +604,28 @@ def test_anchoring_unit() -> None:
             check(
                 "case A: evidence.entities cites the matched entity",
                 finding["evidence"]["entities"] == ["alarms.service.handleError"],
+            )
+            check(
+                "case A: stored file_path unchanged (already relative — regression)",
+                finding["file_path"] == "src/features/alarms/service.ts",
+            )
+
+            # --- case I: file_path given ABSOLUTE (repo_path-prefixed, as tool
+            # results/get_file echo) but pointing at the SAME entity/line as case
+            # A -> normalized to repo-relative BEFORE anchoring, so it anchors
+            # exactly like case A, AND the STORED file_path is the relative form
+            # (matches review's storage convention / what the UI renders) ---
+            raw_abs_anchored = {**raw, "file_path": "/tmp/src/features/alarms/service.ts"}
+            finding_i, notes_i = bughunt._validate_finding(raw_abs_anchored, "p", "/tmp", None, "m", "ollama")
+            check("case I: absolute in-repo path — kept", finding_i is not None)
+            check("case I: absolute in-repo path — anchored == True", finding_i["anchored"] is True)
+            check(
+                "case I: stored file_path normalized to repo-relative",
+                finding_i["file_path"] == "src/features/alarms/service.ts",
+            )
+            check(
+                "case I: evidence.entities cites the same matched entity as case A",
+                finding_i["evidence"]["entities"] == ["alarms.service.handleError"],
             )
 
             # --- case B: file in graph, start_line OUTSIDE the entity's span -> unanchored, kept ---
@@ -482,7 +695,11 @@ def test_anchoring_unit() -> None:
                 check("case D: dropped note mentions hallucinated", any("hallucinated" in n for n in notes_d))
 
                 # --- case E: absolute file_path escaping repo_path (e.g. '/etc/passwd', which
-                # DOES exist on disk) -> dropped, not treated as "exists on disk" ---
+                # DOES exist on disk) -> dropped, not treated as "exists on disk". Also verifies
+                # order of operations for the up-front repo-relative normalization:
+                # _relative_to_repo returns an escaping absolute path UNCHANGED (os.path.relpath
+                # would start with '..'), so the containment guard below still evaluates the
+                # untouched escaping path exactly as before normalization was introduced ---
                 check("precondition: /etc/passwd exists on this machine", os.path.isfile("/etc/passwd"))
                 raw_abs = {**raw_disk, "file_path": "/etc/passwd"}
                 finding_e, notes_e = bughunt._validate_finding(raw_abs, "p", repo_path, None, "m", "ollama")
@@ -504,6 +721,16 @@ async def main() -> None:
     test_anchoring_unit()
     print()
     await test_parse_degrade_unit()
+    print()
+    await test_pushback_findings_without_reads()
+    print()
+    await test_pushback_findings_with_reads()
+    print()
+    await test_pushback_zero_findings()
+    print()
+    test_embedded_extraction_shape_disambiguation()
+    print()
+    test_parse_hunt_answer_embedded_extraction()
     print()
     await test_http()
 

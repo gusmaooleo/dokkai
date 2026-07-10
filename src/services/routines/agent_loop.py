@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
@@ -70,17 +71,16 @@ EmitFn = Callable[[str, str], None]
 
 SYSTEM_PROMPT = (
     "You are answering questions about a codebase. You have no knowledge of "
-    "this code beyond what the tools return — use them. Call search(query) "
-    "ONCE to find relevant entities; if you need more detail on a specific "
-    "entity, call get_entity() or neighbors() on it. Never call the same "
-    "tool with the same arguments twice — you already have that result. As "
-    "soon as the tool results answer the question, STOP calling tools and "
-    "write your final answer as plain English text (not JSON), citing the "
-    "file paths you used. Do not answer without calling at least one tool "
-    "first. When you call a tool, output ONLY the JSON for that one call and "
-    "nothing else — no explanation, no example result. You do not have real "
-    "results until the system gives them back to you; never invent or guess "
-    "a tool's output yourself."
+    "this code beyond what the tools return — use them. Start with "
+    "search(query) to find relevant entities; run more searches with "
+    "different queries if the first one doesn't cover the question. For "
+    "detail on a specific entity, call get_entity() or neighbors() on it. "
+    "Never call the same tool with the same arguments twice — you already "
+    "have that result. As soon as the tool results answer the question, "
+    "STOP calling tools and write your final answer as plain English text "
+    "(not JSON), citing the file paths you used. Do not answer without "
+    "calling at least one tool first. You do not have real results until "
+    "the tools return them; never invent or guess a tool's output yourself."
 )
 
 _TOOL_RESULT_REMINDER = (
@@ -119,28 +119,129 @@ def build_system_prompt(base: str, skills_catalog: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 
+_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+_MAX_JSON_CANDIDATES = 20  # bounded scan — see find_json_object_candidates
+
+
+def find_json_object_candidates(text: str) -> list[str]:
+    """
+    Every plausible embedded JSON-object substring in *text*, in order of
+    appearance: first every ```-fenced block's inner text, then every
+    balanced top-level ``{...}`` span found by string-aware brace-scanning
+    over the raw text (braces inside JSON string literals are not counted,
+    so a stray ``{``/``}`` inside a quoted value doesn't desync the scan).
+
+    Models occasionally narrate around a tool call or verdict ("I'll now
+    call...\\n{...}\\nNext I'll...") instead of emitting bare JSON — this
+    recovers the embedded object(s) without requiring the whole message to
+    be JSON. Bounded to :data:`_MAX_JSON_CANDIDATES` total candidates and,
+    per candidate, a single linear scan to its matching close brace (or to
+    end-of-text if unbalanced, at which point scanning stops entirely —
+    pathological/unbalanced input costs at most one O(len(text)) pass, never
+    more). Shared by :func:`extract_fallback_tool_call` (tool-call shape)
+    and ``services.routines.bughunt._parse_hunt_answer`` (verdict shape) —
+    this function does no shape filtering itself; callers try each
+    candidate against their own predicate and take the first match.
+    """
+    candidates: list[str] = [m.group(1).strip() for m in _FENCE_RE.finditer(text)]
+
+    n = len(text)
+    i = 0
+    while i < n and len(candidates) < _MAX_JSON_CANDIDATES:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        in_string = False
+        escape = False
+        j = i
+        closed = False
+        while j < n:
+            ch = text[j]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        closed = True
+                        j += 1
+                        break
+            j += 1
+        if not closed:
+            # No matching close for this open brace before end-of-text —
+            # nothing valid can start here or later attempt to close it
+            # either; stop scanning rather than re-walking the same tail
+            # repeatedly on pathological input.
+            break
+        candidates.append(text[i:j])
+        i = j
+
+    return candidates[:_MAX_JSON_CANDIDATES]
+
+
+def _match_tool_call_shape(obj: Any) -> dict | None:
+    """``{"name": str, "arguments": dict?}`` -> normalized dict (arguments
+    defaults to ``{}`` when absent), else ``None``."""
+    if not isinstance(obj, dict) or not isinstance(obj.get("name"), str):
+        return None
+    args = obj.get("arguments", {})
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        return None
+    return {"name": obj["name"], "arguments": args}
+
+
 def extract_fallback_tool_call(content: str) -> dict | None:
     """
     Best-effort fallback for models that emit a well-formed tool-call JSON as
     plain ``content`` instead of Ollama's structured ``tool_calls`` field.
-    Strips markdown code fences / ``<tool_call>`` tags if present, then
-    parses ``{"name": ..., "arguments": {...}}``.
+
+    Tries, cheapest first: (1) the whole content (after stripping
+    ``<tool_call>`` tags / a single wrapping markdown fence) as ONE JSON
+    object — the common case; (2) every candidate from
+    :func:`find_json_object_candidates` (fenced blocks, then embedded
+    ``{...}`` spans), in order, returning the FIRST one that both parses and
+    matches the ``{"name": str, "arguments": dict?}`` tool-call shape. Prose
+    around/between candidates is ignored. One call per round is the loop's
+    model — if the model narrates several tool calls in one message, only
+    the first is taken; it gets that result and can continue next round.
     """
     text = content.strip()
     if "<tool_call>" in text:
         start = text.find("<tool_call>") + len("<tool_call>")
         end = text.find("</tool_call>")
         text = text[start : end if end != -1 else None].strip()
-    if text.startswith("```"):
-        text = text.strip("`").strip()
-        if text.startswith("json"):
-            text = text[4:].strip()
+
+    whole = text
+    if whole.startswith("```"):
+        whole = whole.strip("`").strip()
+        if whole.startswith("json"):
+            whole = whole[4:].strip()
     try:
-        obj = json.loads(text)
+        match = _match_tool_call_shape(json.loads(whole))
     except (json.JSONDecodeError, ValueError):
-        return None
-    if isinstance(obj, dict) and isinstance(obj.get("name"), str) and isinstance(obj.get("arguments"), dict):
-        return obj
+        match = None
+    if match is not None:
+        return match
+
+    for candidate in find_json_object_candidates(text):
+        try:
+            match = _match_tool_call_shape(json.loads(candidate))
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if match is not None:
+            return match
     return None
 
 
@@ -620,7 +721,11 @@ async def run_agent_loop(
     before the first round (see :func:`build_system_prompt`).
 
     Returns ``{"answer", "rounds", "tool_calls_made", "tool_payload_chars",
-    "loaded_skills"}``.
+    "loaded_skills", "tools_called"}`` — ``tools_called`` is the sorted list
+    of distinct tool NAMES actually dispatched during the run (regardless of
+    whether the handler raised), for callers that need to check whether a
+    specific tool (e.g. ``get_entity``/``get_file``) was used without
+    threading a bespoke parameter through the loop itself.
     """
     if provider.provider_name != "ollama":
         raise NotImplementedError(
@@ -643,6 +748,7 @@ async def run_agent_loop(
 
     called_signatures: set[str] = set()
     loaded_skills: list[str] = []
+    tools_called: set[str] = set()
     tool_calls_made = 0
     tool_payload_chars = 0
     budget_warned = False
@@ -672,6 +778,7 @@ async def run_agent_loop(
                 "tool_calls_made": tool_calls_made,
                 "tool_payload_chars": tool_payload_chars,
                 "loaded_skills": loaded_skills,
+                "tools_called": sorted(tools_called),
             }
 
         for tc in tool_calls:
@@ -701,6 +808,7 @@ async def run_agent_loop(
                     )
                 else:
                     called_signatures.add(signature)
+                    tools_called.add(name)
                     if name == "load_skill":
                         text = await _dispatch_load_skill(args, loaded_skills, emit)
                     else:

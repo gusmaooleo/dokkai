@@ -43,6 +43,7 @@ from services.routines.agent_loop import (  # noqa: E402
     ToolSpec,
     build_tools,
     extract_fallback_tool_call,
+    find_json_object_candidates,
     run_agent_loop,
 )
 from services.weaviate_client import get_client  # noqa: E402
@@ -219,6 +220,58 @@ def test_fallback_parser() -> None:
     check(
         "fallback parser: valid JSON, wrong shape -> None",
         extract_fallback_tool_call('{"foo": "bar"}') is None,
+    )
+
+    # --- embedded-extraction (approved follow-up): content richer than one
+    # bare object — a fenced block or a bare object surrounded by prose ---
+    fenced_in_prose = extract_fallback_tool_call(
+        'Let me look that up.\n```json\n{"name": "search", "arguments": {"query": "z"}}\n```\nDone.'
+    )
+    check(
+        "fallback parser: fenced block in prose",
+        fenced_in_prose == {"name": "search", "arguments": {"query": "z"}},
+    )
+
+    bare_in_prose = extract_fallback_tool_call(
+        'I will call:\n{"name": "get_file", "arguments": {"path": "a.ts"}}\nThat should work.'
+    )
+    check(
+        "fallback parser: bare object mid-prose",
+        bare_in_prose == {"name": "get_file", "arguments": {"path": "a.ts"}},
+    )
+
+    multiple = extract_fallback_tool_call(
+        'First:\n{"name": "search", "arguments": {"query": "first"}}\n'
+        'Then:\n{"name": "search", "arguments": {"query": "second"}}\n'
+    )
+    check(
+        "fallback parser: multiple embedded blocks — first wins",
+        multiple == {"name": "search", "arguments": {"query": "first"}},
+    )
+
+    no_args = extract_fallback_tool_call('{"name": "search"}')
+    check(
+        "fallback parser: missing 'arguments' defaults to {}",
+        no_args == {"name": "search", "arguments": {}},
+    )
+
+    check(
+        "fallback parser: no valid candidate amid unrelated JSON -> None",
+        extract_fallback_tool_call('Some notes: {"foo": "bar"} and {"baz": 1}.') is None,
+    )
+
+    # --- pathological input: must not crash or hang, bounded scan ---
+    unbalanced = extract_fallback_tool_call("{" * 5000 + "no closing brace at all")
+    check("fallback parser: unbalanced braces -> None, no crash", unbalanced is None)
+
+    many_small = "".join(f'noise {{"n": {i}}} ' for i in range(500))
+    check(
+        "fallback parser: many small non-matching objects -> None, bounded (doesn't scan past cap)",
+        extract_fallback_tool_call(many_small) is None,
+    )
+    check(
+        "find_json_object_candidates: bounded at _MAX_JSON_CANDIDATES even with 500 balanced objects",
+        len(find_json_object_candidates(many_small)) <= 20,
     )
 
 
