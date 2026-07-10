@@ -9,6 +9,13 @@ saffira corpus repo, project ``saffira_back-end``, with the real Postgres
 and Weaviate up (``docker compose up -d``). READ-ONLY on the repo (see
 ``services.git_repo``'s module docstring) — nothing is checked out/mutated.
 
+Since A5, ``run_review`` runs all four stages (diff/context/analyze/
+summarize), so a full pass here also needs a persisted LLM config (checked
+via ``services.llm_config.load_persisted_config``, same as
+``scripts/test_review_analyze.py``) — this script still focuses on the
+diff/context stages' own behavior, not the analyze/summarize output itself
+(see ``scripts/test_review_analyze.py`` for that).
+
 Covers:
   - a small real diff (``fix/center-to-box``): stages emit in order, stats
     are sane, context excerpts are line-numbered, graph entities matched.
@@ -34,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from services.db import get_pool, init_db  # noqa: E402
 from services.jobs import get_job_store  # noqa: E402
+from services.llm_config import get_config_store, load_persisted_config  # noqa: E402
 from services.routines import store  # noqa: E402
 from services.routines.engine import submit_routine  # noqa: E402
 from services.routines.review import _stage_context, _stage_diff, run_review  # noqa: E402
@@ -143,8 +151,11 @@ async def test_small_real_diff() -> None:
     )
 
     job_result = job.result or {}
-    check("job result summary is the stage-1/2 placeholder", job_result.get("summary") == "analysis stages not yet implemented")
-    check("job result findings empty", job_result.get("findings") == [])
+    # A5 implemented analyze/summarize, so the result now carries a real
+    # (model-generated) summary and a findings list — the specifics of that
+    # output are covered by scripts/test_review_analyze.py, not here.
+    check("job result summary is non-empty", bool(job_result.get("summary")))
+    check("job result findings is a list", isinstance(job_result.get("findings"), list))
 
 
 def test_stage_context_contents() -> None:
@@ -215,6 +226,15 @@ async def test_guard_empty_diff() -> None:
 
 async def main() -> None:
     await init_db()
+
+    persisted = await load_persisted_config()
+    if persisted is None:
+        raise SystemExit(
+            "no persisted LLM config found — POST to /config/llm with a local Ollama "
+            "model (e.g. qwen2.5-coder:3b) first"
+        )
+    get_config_store().set_llm_config(persisted)
+    print(f"active LLM config: {persisted.provider_name}/{persisted.model} @ {persisted.base_url}")
 
     try:
         await test_small_real_diff()
