@@ -38,7 +38,7 @@ Not sure what's missing? `dokkai doctor` checks node/docker/uv/`DOKKAI_HOME` plu
 
 | Command | Description |
 | --- | --- |
-| `dokkai up [--ui]` | `docker compose up -d` for Weaviate, wait for it to become ready, probe Ollama and the configured embed/descriptor models (warnings only), report whether the API is reachable. With `--ui`, also starts the frontend UI container (compose `ui` profile) and waits for it to become reachable |
+| `dokkai up [--full]` | `docker compose up -d` for Weaviate/Postgres/Memgraph, wait for Weaviate to become ready, probe Ollama and the configured embed/descriptor models (warnings only), report whether the API is reachable. With `--full`, brings up the whole stack instead (compose `full` profile — containerized API + frontend UI) and waits for both to become reachable |
 | `dokkai status` | Read-only health check (API, Weaviate, Ollama + model presence) and a list of ingested projects; always exits 0 |
 | `dokkai ingest <repo-path> [--recreate] [--no-describe] [--yes]` | Run the full ingestion pipeline via the API, with live stage progress (SSE, polling fallback) |
 | `dokkai graph <repo-path\|project> [--out <file>]` | Graph-only run (no LLM, no vectorization) for a directory, or a normalized graph export for an already-ingested project name |
@@ -49,7 +49,8 @@ Not sure what's missing? `dokkai doctor` checks node/docker/uv/`DOKKAI_HOME` plu
 Flags:
 
 - `--api <url>` (global) — dokkai API URL. Default `http://localhost:8000`.
-- `--ui` (`up`) — also start the frontend UI container (`docker compose --profile ui up -d`) and wait for it to become reachable at `http://localhost:3000`.
+- `--full` (`up`) — bring up the containerized API and frontend UI too (`docker compose --profile full up -d`) and wait for both to become reachable. Requires `DOKKAI_REPOS_DIR` set (parent dir of the repos you ingest/review, bind-mounted into the API container at the same absolute path) — see the [main README's One-command full stack](https://github.com/gusmaooleo/dokkai#one-command-full-stack) section for the full compose details and caveats (Ollama config rewrite, per-runtime ingested data, port 8000 exclusivity, macOS bind-mount performance).
+- `--ui` (`up`) — **deprecated alias for `--full`**, kept for backward compatibility.
 - `--recreate` (`ingest`) — drop and rebuild the **entire** Weaviate collection (all projects) before inserting. Prompts for confirmation unless `--yes` is also passed.
 - `--no-describe` (`ingest`, `watch`) — skip per-entity LLM descriptions; the `summary` vector stays empty and search quality is reduced. Skips the descriptor pre-flight the API otherwise enforces.
 - `--yes` (`ingest`) — skip the `--recreate` confirmation prompt.
@@ -57,6 +58,13 @@ Flags:
 - `--project <name>` (`srcs`, with `ollama:<name>`) — project to chat about; auto-detected if exactly one project is ingested.
 - `--agent` (`srcs`, with `ollama:<name>` only) — agentic MCP loop instead of the `/chat` REPL; requires only Weaviate + Ollama (no FastAPI). Per-call token lines + session total printed in the REPL.
 - `--debounce <seconds>` (`watch`) — seconds to wait after the last change before re-ingesting. Default `3`.
+
+**One-command full stack:**
+
+```bash
+export DOKKAI_REPOS_DIR=/Users/you/projects   # parent dir of the repos you ingest
+dokkai up --full
+```
 
 ## Environment variables
 
