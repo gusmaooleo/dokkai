@@ -21,6 +21,7 @@ import { useToast } from "@/lib/toast";
 import type { RoutineRunSummary } from "@/lib/types";
 import { LaunchCard } from "./launch-card";
 import { RunCard } from "./run-card";
+import { RoutineSectionTabs } from "./section-tabs";
 
 const RUN_POLL_INTERVAL_MS = 10_000;
 
@@ -87,6 +88,8 @@ export function RoutinesScreen() {
 
   return (
     <div className="mx-auto max-w-[860px] px-3.5 py-[18px] sm:px-6.5 sm:py-[30px]">
+      <RoutineSectionTabs active="runs" />
+
       <div className="mb-6 rounded-[10px] border border-border bg-surface-2 px-3.5 py-2.5 text-[12px] leading-[1.5] text-[color:var(--text-faint)]">
         Routines are an experimental demo — not part of the dokkai core. They may be removed or promoted depending on
         adoption.

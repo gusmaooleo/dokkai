@@ -17,6 +17,13 @@ export function relativeTime(iso: string): string {
   return `${Math.round(hours / 24)}d ago`;
 }
 
+/** `content_bytes` → `"3.2 KB"` / `"482 B"` — the Library screen's document
+ * cards (C5) and the create/edit dialog's byte counter. */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  return `${(bytes / 1024).toFixed(1)} KB`;
+}
+
 export const KIND_LABEL: Record<RoutineKind, string> = {
   review: "Review",
   bughunt: "Bug hunt",

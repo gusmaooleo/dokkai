@@ -53,6 +53,10 @@ export const ROUTE_META: Record<string, { title: string; subtitle: string }> = {
     title: "Routines",
     subtitle: "Experimental code review and bug hunt.",
   },
+  "routines/library": {
+    title: "Library",
+    subtitle: "Playbooks and skills for routine runs.",
+  },
   history: {
     title: "History",
     subtitle: "Every conversation, stored in Postgres. Resume or delete.",

@@ -9,6 +9,8 @@ import type {
   BranchesResponse,
   Conversation,
   ConversationSummary,
+  CreatePlaybookRequest,
+  CreateSkillRequest,
   CreateUserRequest,
   CreateUserResponse,
   DescribeRefreshRequest,
@@ -27,12 +29,17 @@ import type {
   Me,
   ModelsListResponse,
   NeighborhoodPayload,
+  PlaybookDTO,
   PlaybookSummary,
   ProjectGraphDTO,
   ProviderHealth,
   RoutineRunDetail,
   RoutineRunSummary,
   RunJobResponse,
+  SkillDTO,
+  SkillSummary,
+  UpdatePlaybookRequest,
+  UpdateSkillRequest,
   User,
 } from "./types";
 
@@ -252,6 +259,24 @@ export const routinesApi = {
   branches: (project: string) =>
     request<BranchesResponse>("/routines/git/branches", { query: { project } }),
   listPlaybooks: () => request<PlaybookSummary[]>("/routines/playbooks"),
+  getPlaybook: (name: string) => request<PlaybookDTO>(`/routines/playbooks/${encodeURIComponent(name)}`),
+  createPlaybook: (data: CreatePlaybookRequest) =>
+    request<PlaybookDTO>("/routines/playbooks", { method: "POST", body: data }),
+  updatePlaybook: (name: string, data: UpdatePlaybookRequest) =>
+    request<PlaybookDTO>(`/routines/playbooks/${encodeURIComponent(name)}`, { method: "PATCH", body: data }),
+  deletePlaybook: (name: string) =>
+    request<{ message: string; name: string }>(`/routines/playbooks/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    }),
+  listSkills: () => request<SkillSummary[]>("/routines/skills"),
+  getSkill: (name: string) => request<SkillDTO>(`/routines/skills/${encodeURIComponent(name)}`),
+  createSkill: (data: CreateSkillRequest) => request<SkillDTO>("/routines/skills", { method: "POST", body: data }),
+  updateSkill: (name: string, data: UpdateSkillRequest) =>
+    request<SkillDTO>(`/routines/skills/${encodeURIComponent(name)}`, { method: "PATCH", body: data }),
+  deleteSkill: (name: string) =>
+    request<{ message: string; name: string }>(`/routines/skills/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    }),
 };
 
 // -----------------------------------------------------------------------

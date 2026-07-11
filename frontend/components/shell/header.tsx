@@ -13,6 +13,17 @@ import { Menu, Plus } from "lucide-react";
 import { useProject } from "@/lib/project";
 import { ROUTE_META } from "./nav-items";
 
+/** Most routes key `ROUTE_META` by their first segment alone, but a few
+ * sub-pages (e.g. `/routines/library`) need their own title/subtitle — those
+ * are keyed by their first TWO segments and checked first. */
+function routeMetaKey(pathname: string): string {
+  const segments = pathname.split("/").filter(Boolean);
+  if (segments.length === 0) return "chat";
+  const twoSegment = segments.slice(0, 2).join("/");
+  if (twoSegment in ROUTE_META) return twoSegment;
+  return segments[0];
+}
+
 function routeSegment(pathname: string): string {
   return pathname.split("/")[1] || "chat";
 }
@@ -21,7 +32,7 @@ export function Header({ onOpenMobileNav }: { onOpenMobileNav: () => void }) {
   const pathname = usePathname();
   const { active } = useProject();
   const segment = routeSegment(pathname);
-  const meta = ROUTE_META[segment] ?? ROUTE_META.chat;
+  const meta = ROUTE_META[routeMetaKey(pathname)] ?? ROUTE_META.chat;
 
   return (
     <header className="flex h-[60px] shrink-0 items-center gap-3.5 border-b border-border bg-background px-3.5 sm:px-6">

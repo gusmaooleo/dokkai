@@ -457,6 +457,58 @@ export interface PlaybookSummary {
   updated_at: string;
 }
 
+/** GET /routines/playbooks/{name} response — full detail, content included. */
+export interface PlaybookDTO {
+  id: number;
+  name: string;
+  routines: RoutineKind[];
+  content: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreatePlaybookRequest {
+  name: string;
+  content: string;
+  routines?: RoutineKind[] | null;
+}
+
+export interface UpdatePlaybookRequest {
+  content?: string | null;
+  routines?: RoutineKind[] | null;
+}
+
+/** One entry of GET /routines/skills's listing — omits content in favor of content_bytes. */
+export interface SkillSummary {
+  id: number;
+  name: string;
+  description: string;
+  content_bytes: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** GET /routines/skills/{name} response — full detail, content included. */
+export interface SkillDTO {
+  id: number;
+  name: string;
+  description: string;
+  content: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateSkillRequest {
+  name: string;
+  description: string;
+  content: string;
+}
+
+export interface UpdateSkillRequest {
+  description?: string | null;
+  content?: string | null;
+}
+
 // -----------------------------------------------------------------------
 // Config
 // -----------------------------------------------------------------------
