@@ -23,15 +23,16 @@
  * every tool-call/skill-load event under `stage="agent"` — a label that
  * isn't in `STAGES_BY_KIND.bughunt` (that list mirrors the routine-level
  * `emit()` call sites in `bughunt.py`, not the loop's own internal ones).
- * `STAGE_ALIASES` folds `"agent"` into `"hunt"` for both current-stage
- * derivation and event bucketing, so those `"→ search(...)"`-style messages
- * render inside the Hunt row's expandable list (exactly the 9e wireframe's
- * live tool-call detail) instead of being silently dropped by the
- * `order`-membership filters below. `lastKnownStage` additionally walks
- * events backwards past ANY stage that's still unrecognized after aliasing
- * (belt and braces for a future stage name neither `STAGES_BY_KIND` nor
- * `STAGE_ALIASES` knows about) rather than only ever looking at the very
- * last event.
+ * `STAGE_ALIASES` (shared from `components/instances/format.ts`, also used
+ * by `job-card.tsx`'s Instances pills) folds `"agent"` into `"hunt"` for
+ * both current-stage derivation and event bucketing, so those
+ * `"→ search(...)"`-style messages render inside the Hunt row's expandable
+ * list (exactly the 9e wireframe's live tool-call detail) instead of being
+ * silently dropped by the `order`-membership filters below. `lastKnownStage`
+ * additionally walks events backwards past ANY stage that's still
+ * unrecognized after aliasing (belt and braces for a future stage name
+ * neither `STAGES_BY_KIND` nor `STAGE_ALIASES` knows about) rather than only
+ * ever looking at the very last event.
  *
  * Fed by the job's own bounded (200-entry) event log — either freshly via
  * the job SSE stream (`GET /instances/jobs/{job_id}/events`, while
@@ -45,21 +46,11 @@
 import { useState } from "react";
 import { ChevronDown, ChevronRight, CircleAlert, CircleCheck, LoaderCircle } from "lucide-react";
 
-import { OPTIONAL_STAGES_BY_KIND, stageLabel, stagesFor } from "@/components/instances/format";
+import { lastKnownStage, OPTIONAL_STAGES_BY_KIND, resolveStage, stageLabel, stagesFor } from "@/components/instances/format";
 import type { Job, JobEventEntry, RoutineKind, RoutineStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 type StageState = "done" | "active" | "pending" | "error";
-
-/** Raw `event.stage` values that don't correspond 1:1 to a `STAGES_BY_KIND`
- * entry — see the module docstring's STAGE ALIASING section. */
-const STAGE_ALIASES: Record<string, string> = {
-  agent: "hunt",
-};
-
-function resolveStage(stage: string): string {
-  return STAGE_ALIASES[stage] ?? stage;
-}
 
 function groupByStage(events: JobEventEntry[]): Map<string, JobEventEntry[]> {
   const map = new Map<string, JobEventEntry[]>();
@@ -70,18 +61,6 @@ function groupByStage(events: JobEventEntry[]): Map<string, JobEventEntry[]> {
     else map.set(key, [e]);
   }
   return map;
-}
-
-/** The most recent event whose (aliased) stage is actually a known step in
- * *order* — not just the very last event's stage, so a stray/unrecognized
- * stage name doesn't blank out the whole "current stage" signal when an
- * earlier event already gave us a good one. */
-function lastKnownStage(events: JobEventEntry[], order: string[]): string | null {
-  for (let i = events.length - 1; i >= 0; i--) {
-    const resolved = resolveStage(events[i].stage);
-    if (order.includes(resolved)) return resolved;
-  }
-  return null;
 }
 
 function StageRow({ stage, state, events }: { stage: string; state: StageState; events: JobEventEntry[] }) {

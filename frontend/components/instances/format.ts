@@ -5,7 +5,7 @@
  * invented `clone/graph/chunk/describe/embed` stages.
  */
 
-import type { Job, JobKind } from "@/lib/types";
+import type { Job, JobEventEntry, JobKind } from "@/lib/types";
 
 /** Mirrors `ConversationCard`'s `rel()`-derived helper — no date lib. */
 export function relativeTime(iso: string): string {
@@ -86,6 +86,36 @@ export function stagesFor(kind: JobKind): string[] {
 
 export function stageLabel(stage: string): string {
   return STAGE_LABELS[stage] ?? stage;
+}
+
+/**
+ * Raw `event.stage` values that don't correspond 1:1 to a `STAGES_BY_KIND`
+ * entry — bughunt's agentic tool loop (`services/routines/agent_loop.py`)
+ * emits every tool-call/skill-load event under `stage="agent"`, which folds
+ * into `hunt` here. Shared by `step-timeline.tsx` (live/historical timeline)
+ * and `job-card.tsx` (Instances list pills) so both derive "current stage"
+ * the same way.
+ */
+export const STAGE_ALIASES: Record<string, string> = {
+  agent: "hunt",
+};
+
+export function resolveStage(stage: string): string {
+  return STAGE_ALIASES[stage] ?? stage;
+}
+
+/**
+ * The most recent event whose (aliased) stage is actually a known step in
+ * *order* — not just the very last event's stage, so a stray/unrecognized
+ * stage name doesn't blank out the whole "current stage" signal when an
+ * earlier event already gave us a good one.
+ */
+export function lastKnownStage(events: JobEventEntry[], order: string[]): string | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const resolved = resolveStage(events[i].stage);
+    if (order.includes(resolved)) return resolved;
+  }
+  return null;
 }
 
 export const JOB_KIND_LABEL: Record<JobKind, string> = {
