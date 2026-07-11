@@ -12,6 +12,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from typing import AsyncIterator, cast
+from urllib.parse import urlsplit, urlunsplit
 
 from openai.types.chat import ChatCompletionMessageParam
 
@@ -21,6 +22,38 @@ from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam
 
 logger = logging.getLogger(__name__)
+
+
+def effective_base_url(url: str) -> str:
+    """
+    Rewrite a ``localhost``/``127.0.0.1`` host in *url* to
+    ``host.docker.internal`` when running inside the dokkai API container
+    (``DOKKAI_IN_CONTAINER=1``).
+
+    A persisted LLM config's ``base_url`` (saved e.g. via the UI while
+    running ``./dev.sh`` on the host) points at "localhost", which inside a
+    container means the container itself — not the host machine running
+    Ollama. This rewrite is applied at USE time, where the base_url is about
+    to feed an HTTP call (see ``OllamaProvider.__init__``); the persisted
+    value itself is never rewritten. URLs that already resolve correctly
+    (a non-localhost host, e.g. a remote provider or an env default of
+    ``host.docker.internal``) pass through unchanged.
+    """
+    if os.getenv("DOKKAI_IN_CONTAINER", "").lower() not in ("1", "true", "yes"):
+        return url
+
+    parsed = urlsplit(url)
+    if parsed.hostname not in ("localhost", "127.0.0.1"):
+        return url
+
+    netloc = "host.docker.internal"
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    if parsed.username:
+        userinfo = parsed.username + (f":{parsed.password}" if parsed.password else "")
+        netloc = f"{userinfo}@{netloc}"
+
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
 
 class LLMMessage:
@@ -277,7 +310,7 @@ class OllamaProvider(LLMProvider):
     provider_name = "ollama"
 
     def __init__(self, base_url: str | None = None) -> None:
-        self._base_url = (
+        self._base_url = effective_base_url(
             base_url
             or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
         )

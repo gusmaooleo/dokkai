@@ -216,6 +216,7 @@ async def getRoutineRun(run_id: str):
 
     return RoutineRunDetail(
         id=run["id"],
+        job_id=run["job_id"],
         kind=run["kind"],
         project=run["project"],
         status=run["status"],

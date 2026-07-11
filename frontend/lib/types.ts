@@ -247,12 +247,38 @@ export interface RunJobResponse {
 
 export type JobKind = "pipeline" | "refresh" | "graph" | "review" | "bughunt";
 export type JobStatus = "queued" | "running" | "succeeded" | "failed";
-export type JobStage = "" | "cgr" | "chunk" | "describe" | "upsert" | "update" | "done";
+export type JobStage =
+  | ""
+  | "cgr"
+  | "chunk"
+  | "describe"
+  | "upsert"
+  | "update"
+  | "diff"
+  | "context"
+  | "playbooks"
+  | "skills"
+  | "analyze"
+  | "summarize"
+  | "resolve"
+  | "hunt"
+  | "findings"
+  | "done";
 
 export interface StageProgress {
   stage: string;
   done: number;
   total: number;
+}
+
+/** One entry of a job's bounded step-event log (routine jobs only — see
+ * `services.jobs.add_job_event`). `seq` is monotonic even across the
+ * 200-entry trim, so a client can detect dropped history by a seq gap. */
+export interface JobEventEntry {
+  seq: number;
+  stage: string;
+  message: string;
+  ts: string;
 }
 
 export interface DescriptionStats {
@@ -314,6 +340,9 @@ export interface Job {
   stage_progress: StageProgress | null;
   result: PipelineResult | RefreshResult | GraphOnlyResult | null;
   error: string | null;
+  /** Routine (review/bughunt) step log only — null for pipeline/refresh/graph
+   * jobs, which never call `add_job_event`. */
+  events: JobEventEntry[] | null;
   created_at: string;
   updated_at: string;
 }
@@ -323,6 +352,162 @@ export interface Job {
  * in-progress updates, `done` for the terminal state (stream then closes).
  */
 export type JobSSEEvent = { type: "job"; data: Job } | { type: "done"; data: Job };
+
+// -----------------------------------------------------------------------
+// Routines (code review / bug hunt) — decision 9e
+// -----------------------------------------------------------------------
+
+export type RoutineKind = "review" | "bughunt";
+export type RoutineStatus = "queued" | "running" | "done" | "failed";
+
+export interface LaunchRoutineRequest {
+  kind: RoutineKind;
+  project: string;
+  target_ref?: string | null;
+  base_ref?: string | null;
+  scope?: string | null;
+  path_prefix?: string | null;
+  model?: string | null;
+  provider?: string | null;
+  playbooks?: string[] | null;
+}
+
+export interface LaunchRoutineResponse {
+  run_id: string;
+  job_id: string;
+}
+
+/** One entry of GET /routines/runs's listing. */
+export interface RoutineRunSummary {
+  id: string;
+  kind: RoutineKind;
+  project: string;
+  status: RoutineStatus;
+  params: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+  severity_counts: Record<string, number>;
+}
+
+/**
+ * A finding's supporting evidence — see `services.routines.review`'s /
+ * `services.routines.bughunt`'s `_validate_finding`. `hunk_excerpt` is
+ * review-only (bughunt has no diff to excerpt from); every other field is
+ * shared.
+ */
+export interface FindingEvidence {
+  hunk_excerpt?: string;
+  entities?: string[];
+  model?: string;
+  provider?: string;
+}
+
+export interface FindingDTO {
+  id: number;
+  file_path: string;
+  start_line: number | null;
+  end_line: number | null;
+  severity: string;
+  category: string;
+  title: string;
+  body: string;
+  suggestion: string | null;
+  evidence: FindingEvidence | null;
+  anchored: boolean;
+  created_at: string;
+}
+
+/** GET /routines/runs/{id} response — a run's full detail, findings included. */
+export interface RoutineRunDetail {
+  id: string;
+  /** The underlying job this run executed as — stream/poll it the same way
+   * as any other job (GET /instances/jobs/{job_id} and its /events route). */
+  job_id: string;
+  kind: RoutineKind;
+  project: string;
+  status: RoutineStatus;
+  params: Record<string, unknown>;
+  summary: string | null;
+  stats: Record<string, unknown> | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+  findings: FindingDTO[];
+}
+
+export interface BranchInfo {
+  name: string;
+  is_current: boolean;
+  last_commit_date: string;
+}
+
+/** GET /routines/git/branches response. */
+export interface BranchesResponse {
+  branches: BranchInfo[];
+  default_base: string;
+}
+
+/** One entry of GET /routines/playbooks's listing — omits content in favor of content_bytes. */
+export interface PlaybookSummary {
+  id: number;
+  name: string;
+  routines: RoutineKind[];
+  content_bytes: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** GET /routines/playbooks/{name} response — full detail, content included. */
+export interface PlaybookDTO {
+  id: number;
+  name: string;
+  routines: RoutineKind[];
+  content: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreatePlaybookRequest {
+  name: string;
+  content: string;
+  routines?: RoutineKind[] | null;
+}
+
+export interface UpdatePlaybookRequest {
+  content?: string | null;
+  routines?: RoutineKind[] | null;
+}
+
+/** One entry of GET /routines/skills's listing — omits content in favor of content_bytes. */
+export interface SkillSummary {
+  id: number;
+  name: string;
+  description: string;
+  content_bytes: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** GET /routines/skills/{name} response — full detail, content included. */
+export interface SkillDTO {
+  id: number;
+  name: string;
+  description: string;
+  content: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateSkillRequest {
+  name: string;
+  description: string;
+  content: string;
+}
+
+export interface UpdateSkillRequest {
+  description?: string | null;
+  content?: string | null;
+}
 
 // -----------------------------------------------------------------------
 // Config

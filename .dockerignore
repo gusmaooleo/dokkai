@@ -1,0 +1,16 @@
+.git
+.venv
+.claude
+.env
+node_modules
+frontend
+cli
+data
+ingested
+dokkai_agent
+docs
+md
+scripts
+commits.md
+*.pyc
+__pycache__

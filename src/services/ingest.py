@@ -1,9 +1,23 @@
 import subprocess
 import os
 import tempfile
+import threading
 from datetime import datetime, timezone
 
 from services.vectorize import graph_json_candidates
+
+# Global mutex around the cgr subprocess. All ingestion paths that touch the
+# graph (pipeline and graph-only jobs) call ingestByLocalRepository, so this
+# is the single seam every cgr run passes through. cgr's `--clean` wipes the
+# whole graph at the start of a run, and every run — ephemeral-container or
+# connect-mode — shares one Memgraph instance across ports; two cgr runs in
+# flight at once would --clean each other mid-run. Today that's masked by an
+# incidental failure (both ephemeral containers fight over host port 7687);
+# this lock makes the limitation explicit instead of relying on that
+# collision. A second job simply WAITS for the lock rather than failing fast:
+# jobs already run async in background worker threads, so the wait is
+# invisible to the polling client.
+_cgr_lock = threading.Lock()
 
 
 async def ingestByLocalRepository(repo_path: str) -> dict:
@@ -37,12 +51,13 @@ async def ingestByLocalRepository(repo_path: str) -> dict:
     # .env (COLLECTION_NAME, WEAVIATE_*, EMBED_MODEL, ...). Inherited env vars
     # are fine: the settings source ignores ones that aren't its fields.
     with tempfile.TemporaryDirectory() as cgr_cwd:
-        result = subprocess.run(
-            [script_path, repo_path, output_json],
-            capture_output=True,
-            text=True,
-            cwd=cgr_cwd,
-        )
+        with _cgr_lock:
+            result = subprocess.run(
+                [script_path, repo_path, output_json],
+                capture_output=True,
+                text=True,
+                cwd=cgr_cwd,
+            )
 
     if result.returncode != 0:
         raise RuntimeError(result.stderr or result.stdout)

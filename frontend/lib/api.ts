@@ -6,8 +6,11 @@
 
 import type {
   AuthStatus,
+  BranchesResponse,
   Conversation,
   ConversationSummary,
+  CreatePlaybookRequest,
+  CreateSkillRequest,
   CreateUserRequest,
   CreateUserResponse,
   DescribeRefreshRequest,
@@ -18,15 +21,25 @@ import type {
   HealthResponse,
   IngestRequest,
   Job,
+  LaunchRoutineRequest,
+  LaunchRoutineResponse,
   LLMConfig,
   LLMConfigRequest,
   LoginResponse,
   Me,
   ModelsListResponse,
   NeighborhoodPayload,
+  PlaybookDTO,
+  PlaybookSummary,
   ProjectGraphDTO,
   ProviderHealth,
+  RoutineRunDetail,
+  RoutineRunSummary,
   RunJobResponse,
+  SkillDTO,
+  SkillSummary,
+  UpdatePlaybookRequest,
+  UpdateSkillRequest,
   User,
 } from "./types";
 
@@ -225,6 +238,45 @@ export const instancesApi = {
     }),
   listJobs: () => request<Job[]>("/instances/jobs"),
   getJob: (jobId: string) => request<Job>(`/instances/jobs/${jobId}`),
+};
+
+// -----------------------------------------------------------------------
+// Routines (code review / bug hunt)
+// -----------------------------------------------------------------------
+
+export const routinesApi = {
+  launch: (data: LaunchRoutineRequest) =>
+    request<LaunchRoutineResponse>("/routines/runs", { method: "POST", body: data }),
+  listRuns: (opts?: { project?: string; kind?: string; limit?: number }) =>
+    request<RoutineRunSummary[]>("/routines/runs", {
+      query: { project: opts?.project, kind: opts?.kind, limit: opts?.limit },
+    }),
+  getRun: (runId: string) => request<RoutineRunDetail>(`/routines/runs/${encodeURIComponent(runId)}`),
+  deleteRun: (runId: string) =>
+    request<{ message: string; run_id: string }>(`/routines/runs/${encodeURIComponent(runId)}`, {
+      method: "DELETE",
+    }),
+  branches: (project: string) =>
+    request<BranchesResponse>("/routines/git/branches", { query: { project } }),
+  listPlaybooks: () => request<PlaybookSummary[]>("/routines/playbooks"),
+  getPlaybook: (name: string) => request<PlaybookDTO>(`/routines/playbooks/${encodeURIComponent(name)}`),
+  createPlaybook: (data: CreatePlaybookRequest) =>
+    request<PlaybookDTO>("/routines/playbooks", { method: "POST", body: data }),
+  updatePlaybook: (name: string, data: UpdatePlaybookRequest) =>
+    request<PlaybookDTO>(`/routines/playbooks/${encodeURIComponent(name)}`, { method: "PATCH", body: data }),
+  deletePlaybook: (name: string) =>
+    request<{ message: string; name: string }>(`/routines/playbooks/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    }),
+  listSkills: () => request<SkillSummary[]>("/routines/skills"),
+  getSkill: (name: string) => request<SkillDTO>(`/routines/skills/${encodeURIComponent(name)}`),
+  createSkill: (data: CreateSkillRequest) => request<SkillDTO>("/routines/skills", { method: "POST", body: data }),
+  updateSkill: (name: string, data: UpdateSkillRequest) =>
+    request<SkillDTO>(`/routines/skills/${encodeURIComponent(name)}`, { method: "PATCH", body: data }),
+  deleteSkill: (name: string) =>
+    request<{ message: string; name: string }>(`/routines/skills/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    }),
 };
 
 // -----------------------------------------------------------------------

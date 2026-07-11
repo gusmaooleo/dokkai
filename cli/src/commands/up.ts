@@ -10,6 +10,8 @@ const WEAVIATE_POLL_INTERVAL_MS = 1_000;
 const OLLAMA_PROBE_TIMEOUT_MS = 5_000;
 const UI_READY_TIMEOUT_MS = 20_000;
 const UI_POLL_INTERVAL_MS = 1_000;
+const API_READY_TIMEOUT_MS = 30_000;
+const API_POLL_INTERVAL_MS = 1_000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -71,6 +73,20 @@ async function waitForUiReady(url: string): Promise<boolean> {
   return false;
 }
 
+async function waitForApiReady(url: string): Promise<boolean> {
+  const deadline = Date.now() + API_READY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetchWithTimeout(url, 3_000);
+      if (response.ok) return true;
+    } catch {
+      // not ready yet — keep polling (image build/Postgres migrations take a beat)
+    }
+    await sleep(API_POLL_INTERVAL_MS);
+  }
+  return false;
+}
+
 async function checkOllama(
   baseUrl: string,
   embedModel: string,
@@ -102,12 +118,19 @@ async function checkOllama(
   }
 }
 
-export async function runUp(flags: { api?: string; ui?: boolean }): Promise<void> {
+export async function runUp(
+  flags: { api?: string; ui?: boolean; full?: boolean },
+): Promise<void> {
   const home = resolveDokkaiHome();
 
+  if (flags.ui) {
+    console.log(chalk.yellow("note: --ui is deprecated, use --full"));
+  }
+  const full = Boolean(flags.full || flags.ui);
+
   console.log(chalk.bold(`Starting docker compose services in ${home}...`));
-  const composeArgs = flags.ui
-    ? ["compose", "--profile", "ui", "up", "-d"]
+  const composeArgs = full
+    ? ["compose", "--profile", "full", "up", "-d"]
     : ["compose", "up", "-d"];
   const exitCode = await runCommand("docker", composeArgs, home);
   if (exitCode !== 0) {
@@ -135,18 +158,30 @@ export async function runUp(flags: { api?: string; ui?: boolean }): Promise<void
   await checkOllama(ollamaBaseUrl, embedModel, descModel);
 
   const apiUrl = resolveApiUrl(flags);
-  try {
-    await getJson(`${apiUrl}/`);
-    console.log(chalk.green(`dokkai API is reachable at ${apiUrl}`));
-  } catch {
-    console.log(
-      chalk.cyan(
-        `dokkai API is not running — start it with ./dev.sh (from ${home})`,
-      ),
-    );
+  if (full) {
+    const apiSpinner = ora(`Waiting for the dokkai API at ${apiUrl}...`).start();
+    const apiReady = await waitForApiReady(apiUrl);
+    if (apiReady) {
+      apiSpinner.succeed(chalk.green(`dokkai API is reachable at ${apiUrl}`));
+    } else {
+      apiSpinner.fail(
+        `dokkai API did not become reachable at ${apiUrl} within 30s`,
+      );
+    }
+  } else {
+    try {
+      await getJson(`${apiUrl}/`);
+      console.log(chalk.green(`dokkai API is reachable at ${apiUrl}`));
+    } catch {
+      console.log(
+        chalk.cyan(
+          `dokkai API is not running — start it with ./dev.sh (from ${home})`,
+        ),
+      );
+    }
   }
 
-  if (flags.ui) {
+  if (full) {
     const uiUrl = "http://localhost:3000";
     const uiSpinner = ora(`Waiting for the frontend UI at ${uiUrl}...`).start();
     const uiReady = await waitForUiReady(uiUrl);

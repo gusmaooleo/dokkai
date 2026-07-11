@@ -77,6 +77,7 @@ class FindingDTO(BaseModel):
 
 class RoutineRunDetail(BaseModel):
     id: str
+    job_id: str
     kind: str
     project: str
     status: str

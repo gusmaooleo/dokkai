@@ -6,20 +6,33 @@
  *
  * Stage pills use the REAL vocabulary per job kind (decision 12r) — see
  * `format.ts`'s `STAGES_BY_KIND` — not the prototype's invented stages.
+ *
+ * review/bughunt jobs have no `job.stage` signal (routines only append to
+ * `job.events` — see `step-timeline.tsx`'s docstring), so `pillState` falls
+ * back to the same `lastKnownStage` alias+walk derivation the run-detail
+ * step timeline uses, applied to `job.events` here instead of `job.stage`.
  */
 
+import Link from "next/link";
 import { CircleAlert, CircleCheck } from "lucide-react";
 
 import type { Job } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { JOB_KIND_LABEL, relativeTime, resultSummary, stageLabel, stagesFor } from "./format";
+import { JOB_KIND_LABEL, lastKnownStage, relativeTime, resultSummary, stageLabel, stagesFor } from "./format";
 
 type PillState = "done" | "active" | "todo";
+
+const ROUTINE_KINDS = new Set(["review", "bughunt"]);
 
 function pillState(job: Job, stage: string, index: number): PillState {
   if (job.status === "succeeded" || job.stage === "done") return "done";
   const stages = stagesFor(job.kind);
-  const currentIndex = stages.indexOf(job.stage);
+  const currentIndex = ROUTINE_KINDS.has(job.kind)
+    ? (() => {
+        const resolved = lastKnownStage(job.events ?? [], stages);
+        return resolved ? stages.indexOf(resolved) : -1;
+      })()
+    : stages.indexOf(job.stage);
   if (currentIndex === -1) return "todo";
   if (index < currentIndex) return "done";
   if (index === currentIndex) return "active";
@@ -45,6 +58,11 @@ export function JobCard({ job }: { job: Job }) {
           {JOB_KIND_LABEL[job.kind] ?? job.kind}
         </span>
         <span className="flex-1" />
+        {ROUTINE_KINDS.has(job.kind) && (
+          <Link href="/routines" className="font-mono text-[11px] text-accent hover:underline">
+            View in Routines →
+          </Link>
+        )}
         <span className="font-mono text-[11px] text-[color:var(--text-faint)]">
           {job.status === "queued" ? "queued" : relativeTime(job.created_at)}
         </span>

@@ -16,9 +16,11 @@ Everything runs **100% locally** — Weaviate for vectors, Ollama for both embed
 - [MCP server](#mcp-server)
 - [CLI](#cli)
 - [Frontend UI](#frontend-ui)
+- [One-command full stack](#one-command-full-stack)
 - [Code review routines](#code-review-routines)
   - [Bug hunt](#bug-hunt)
   - [Playbooks & skills](#playbooks--skills)
+  - [Routines UI](#routines-ui)
 - [How it works](#how-it-works)
 - [Descriptions (Tier 2)](#descriptions-tier-2)
 - [Features](#features)
@@ -158,7 +160,7 @@ Something not working? `dokkai doctor` complements `up`/`status`: it checks the 
 
 | Command | Description |
 | --- | --- |
-| `dokkai up [--ui]` | `docker compose up -d` for Weaviate, wait for it to become ready, probe Ollama and the configured embed/descriptor models (warnings only, non-fatal), report whether the API is reachable. With `--ui`, also brings up the frontend UI container (`docker compose --profile ui up -d`) and waits for it to become reachable. Exits 1 only on a `docker compose`/Weaviate failure (or when the dokkai repo root cannot be resolved). |
+| `dokkai up [--full]` | `docker compose up -d` for Weaviate/Postgres/Memgraph, wait for Weaviate to become ready, probe Ollama and the configured embed/descriptor models (warnings only, non-fatal), report whether the API is reachable. With `--full`, brings up the **whole stack** instead (`docker compose --profile full up -d`) — the containerized API and frontend UI — and waits for both to become reachable. Exits 1 only on a `docker compose`/Weaviate failure (or when the dokkai repo root cannot be resolved). |
 | `dokkai status` | Read-only health check (API, Weaviate, Ollama + model presence) plus a list of ingested projects. Always exits 0. |
 | `dokkai ingest <repo-path> [--recreate] [--no-describe] [--yes]` | Validates the path, confirms `--recreate` interactively (or via `--yes`), calls `POST /instances/pipeline`, and streams live stage progress (SSE with a polling fallback) to a result summary. |
 | `dokkai graph <repo-path\|project> [--out <file>]` | Graph-only run: a **directory** argument enqueues `POST /instances/graph` (cgr only, no LLM/Weaviate) and prints the canonical graph JSON path (with `--out`, also exports the normalized graph); a **project name** argument fetches and prints/writes its normalized structural graph (`GET /graph/{project}?include=structural`) — stdout output pipes cleanly when `--out` is omitted. |
@@ -168,7 +170,7 @@ Something not working? `dokkai doctor` complements `up`/`status`: it checks the 
 
 Global flag: `--api <url>` — dokkai API URL (default `http://localhost:8000`).
 
-`up`-only flag: `--ui` — also start the frontend UI container (compose `ui` profile) and wait for it to become reachable at `http://localhost:3000`.
+`up`-only flags: `--full` — bring up the containerized API and frontend UI too (compose `full` profile) and wait for both to become reachable (see [One-command full stack](#one-command-full-stack)); `--ui` — **deprecated alias for `--full`**, kept for backward compatibility.
 
 `ingest`-only flags:
 
@@ -188,6 +190,26 @@ Global flag: `--api <url>` — dokkai API URL (default `http://localhost:8000`).
 ### Environment (CLI-side)
 
 `DOKKAI_API_URL` and `DOKKAI_HOME` (see [Configuration](#configuration) below) are resolved by the CLI itself, not the API — set them in your shell, or rely on the dokkai repo's `.env` as a fallback. Precedence: `--api` flag > `DOKKAI_API_URL` env var > repo `.env` > default.
+
+### What is SRCS?
+
+**SRCS** ("Semantic Retrieval Codebase System") is how you plug dokkai's
+retrieval into the coding agent you already use, in one command:
+`dokkai srcs`. With `--model claude` or `--model codex` it registers dokkai
+as an **MCP server** for Claude Code / Codex, so that agent gets dokkai's
+search/graph tools ([MCP server](#mcp-server)) alongside its own, and
+launches it interactively. With `--model ollama:<name>` it instead runs a
+**terminal chat/agentic loop against a local Ollama model** over that same
+retrieval — either a `/chat`-backed REPL (needs the API), or, with
+`--agent`, a fully local MCP tool-loop that needs only Weaviate + Ollama
+(no FastAPI). Same underlying retrieval, three different front ends —
+pick whichever fits how you already work.
+
+| I want to... | Use |
+| --- | --- |
+| Keep using Claude Code / Codex, with dokkai as one more tool it can call | `dokkai srcs --model claude` (or `codex`) |
+| Chat about a codebase from a terminal, no coding-agent CLI installed | `dokkai srcs --model ollama:<name> --project <name>` |
+| Run a fully local agentic loop with no API server at all | `dokkai srcs --model ollama:<name> --project <name> --agent` |
 
 ### SRCS recipes
 
@@ -236,19 +258,8 @@ npm install
 npm run dev         # http://localhost:3000
 ```
 
-**Or, one command via Docker** (builds and runs the production frontend in a
-container alongside Weaviate/Postgres — the API itself still runs via
-`./dev.sh`, see [Current limitations](#current-limitations)):
-
-```bash
-dokkai up --ui
-# equivalent: docker compose --profile ui up -d
-```
-
-`docker compose up -d` (no profile) is unchanged — the `ui` service only
-starts when the `ui` profile is requested. `NEXT_PUBLIC_API_URL` is inlined
-into the frontend bundle at **build time**; if you change it, rebuild the
-image (`docker compose --profile ui build ui`).
+**Or, one command for the whole stack** — see
+[One-command full stack](#one-command-full-stack) below.
 
 First login is `admin`/`admin` (or your `DOKKAI_ROOT_USER`/`DOKKAI_ROOT_PASSWORD` — see [Authentication](#authentication)).
 
@@ -282,7 +293,77 @@ See [`frontend/README.md`](frontend/README.md) for the stack, folder layout and 
 
 ---
 
+## One-command full stack
+
+```bash
+dokkai up --full
+# equivalent: docker compose --profile full up -d
+```
+
+`docker compose up -d` (no profile) is unchanged — it stays infra-only
+(Weaviate, Postgres, a resident Memgraph). The `full` profile additionally
+builds and runs the **API** (`Dockerfile`) and the **frontend UI**
+containers, so `dokkai up --full` alone reproduces the whole system with no
+`./dev.sh`. `--ui` is a **deprecated alias for `--full`**, kept for
+backward compatibility.
+
+**Repo access (`DOKKAI_REPOS_DIR`, required for the containerized API):**
+the container needs read/write access to the repos you ingest/review. Set
+`DOKKAI_REPOS_DIR` to the **parent directory** of those repos — it's
+bind-mounted into the API container at the exact same absolute path, so
+`repo_path` values (stored at ingest time) resolve identically whether the
+API runs in the container or via `./dev.sh` on the host:
+
+```bash
+# .env — repos live under /Users/you/projects/*
+DOKKAI_REPOS_DIR=/Users/you/projects
+```
+
+Only repos under that mounted root are reachable from the containerized
+API. The mount is read-write — routines' git operations and `cgr`'s
+`.cgr-hash-cache.json` both write into the repo.
+
+**Ollama config just works.** If you saved an LLM config pointing at
+`http://localhost:11434` (e.g. from a host `./dev.sh` run, sharing the same
+Postgres), the containerized API rewrites `localhost`/`127.0.0.1` to
+`host.docker.internal` **at request time only** — never persisted to
+storage — so the same saved config works from both a host run and the
+container.
+
+**Ingested data is per-runtime — important caveat.** The containerized API
+stores `ingested/` (graph JSON) and its description cache (`data/`) in
+**named Docker volumes**, separate from the host's `ingested/`/`data/`
+directories. A project ingested via `./dev.sh` on the host is **not**
+visible to the containerized API, and vice versa — ingest again against
+whichever runtime you're actually using.
+
+**Port 8000 is exclusive.** The containerized API and `./dev.sh` both bind
+`:8000` — run one or the other, not both, at a time.
+
+**Memgraph is now a resident compose service** (not an ephemeral
+per-ingest container): ingestion is slightly faster (no ~5s container boot
+per run), and `shell/run_cgr.sh` connects to it via `MEMGRAPH_HOST` — set
+by default in the `full` profile and in `dev.sh`. Unset `MEMGRAPH_HOST` to
+fall back to the legacy ephemeral-container flow. Because the resident
+instance is shared, ingestion/review/graph runs across **all** projects are
+now globally serialized (a process-wide lock around the `cgr` subprocess)
+rather than merely colliding on port 7687 as before.
+
+**macOS bind-mount performance.** Docker Desktop's bind-mount filesystem
+sharing on macOS is noticeably slower than a native filesystem for
+large ingests (many files/large repos) — expect ingestion under `--full` to
+take longer than the same repo via `./dev.sh` on macOS. Linux (native bind
+mounts) isn't affected.
+
+---
+
 ## Code review routines
+
+> **Routines are an experimental demo — not part of the dokkai core.**
+> Core = the retrieval pipeline, MCP server, chat and graph. Code review,
+> bug hunt and the playbooks/skills library below are all routines; they
+> may be removed in a future release, or promoted to core, depending on
+> adoption.
 
 Dokkai can review a git branch against a base branch using the same graph-aware
 context as chat: it diffs the two refs, pulls in the graph entities and
@@ -291,11 +372,13 @@ configured LLM for per-file findings (severity, category, an anchored line
 range when the model's `start_line` falls inside a changed range, and an
 optional fix suggestion), then writes a markdown summary of the whole run.
 
-This is **sub-part B** of the feature (of 3): sub-part A shipped the review
-routine backend; this part adds the bug-hunt routine
+This feature shipped in three sub-parts: sub-part A shipped the review
+routine backend; sub-part B added the bug-hunt routine
 ([Bug hunt](#bug-hunt)) and project-specific playbooks/skills
-([Playbooks & skills](#playbooks--skills)). A dedicated UI screen for all of
-this is sub-part C, still to come.
+([Playbooks & skills](#playbooks--skills)); sub-part C added the
+[Routines UI](#routines-ui) (launch, live progress, findings/diff browser,
+history, playbooks/skills library) and the containerized full-stack compose
+profile ([One-command full stack](#one-command-full-stack)).
 
 **Run it** (review runs as a background job on the same shared job system as
 ingestion — see [API reference](#api-reference)):
@@ -376,6 +459,11 @@ that project returns `409 another job is running for project '<project>'`.
 `viewer`.
 
 ### Bug hunt
+
+> **Demo.** In addition to the routines-wide disclaimer above, bug hunt
+> specifically is marked experimental in the UI — results improve with more
+> capable models (we recommend `qwen2.5-coder:14b` or larger; see the
+> quality note below).
 
 `kind: "bughunt"` runs a free-text investigation over the **whole** ingested
 project (not a diff): a bounded in-process agentic tool loop (≤12 rounds)
@@ -501,6 +589,21 @@ must not contain `/`, `\`, or control characters (it's a REST path segment).
 A duplicate `name` on create returns `409`; an unknown `name` on get/patch/
 delete returns `404`.
 
+### Routines UI
+
+The [Frontend UI](#frontend-ui) has a dedicated `/routines` screen (nav
+item carries a **beta** badge) for everything above — no screenshots here,
+see the demo disclaimer at the top of this section:
+
+- **Runs tab** — a launch card (review or bug hunt, project-scoped) and a
+  run history list with severity pills.
+- **Run detail** — a live step timeline over the same job-events SSE stream
+  as ingestion, a findings browser with a hand-rolled diff view per finding,
+  and a summary tab with the run's markdown summary.
+- **Library tab** — create/edit/upload dialogs for playbooks and skills.
+- The [Instances](#frontend-ui) screen also shows event-derived routine
+  pills on job cards, with a "View in Routines →" link back here.
+
 ---
 
 ## How it works
@@ -592,7 +695,8 @@ Full pipeline run on `saffira_back-end` (medium TS/Python backend), local Ollama
 - ✅ **Graph-only ingestion** (`POST /instances/graph`, `dokkai graph`) — run just `cgr` with no LLM/Weaviate involved
 - ✅ **Authentication** — always-on, Grafana-style bearer-token auth with 3 roles (admin/user/viewer), a default `admin`/`admin` seed overridable via env, and CLI auto-login (see [Authentication](#authentication))
 - ✅ **Frontend UI** — Next.js web app: streaming chat with sources, interactive dependency graph, conversation history, ingestion/job monitoring, LLM config and user administration, role-gated (see [Frontend UI](#frontend-ui))
-- 🚧 **Code review & bug-hunt routines** — branch-vs-base review and free-text bug-hunt investigations (agentic tool loop, Ollama-native), both with graph-anchored findings, pushable playbooks and model-pulled skills, run as background jobs over the shared job system (sub-parts A+B; dedicated UI still to come — see [Code review routines](#code-review-routines))
+- ✅ **Code review & bug-hunt routines** _(experimental demo, not part of dokkai core — see disclaimer)_ — branch-vs-base review and free-text bug-hunt investigations (agentic tool loop, Ollama-native), both with graph-anchored findings, pushable playbooks and model-pulled skills, run as background jobs over the shared job system with a dedicated UI (see [Code review routines](#code-review-routines))
+- ✅ **One-command full stack** — `dokkai up --full` / `docker compose --profile full up -d` containerizes the API and frontend UI alongside Weaviate/Postgres/Memgraph (see [One-command full stack](#one-command-full-stack))
 
 ---
 
@@ -777,6 +881,8 @@ All configuration is via environment variables (loaded from `.env` at startup).
 | `DOKKAI_RECREATE_COLLECTION` | _(unset)_ | If truthy: recreate the Weaviate collection instead of failing on schema mismatch |
 | `DOKKAI_MCP_PROFILE` | _(unset)_ | MCP server only. `small-model` swaps the server's instructions for a more directive, anti-loop variant tuned for small local models — see [Instructions profile](#instructions-profile) |
 | `MEMGRAPH_IMAGE` | `memgraph/memgraph:latest` | Image used by `cgr` for graph extraction |
+| `MEMGRAPH_HOST` | `localhost` (`dev.sh` default) | When set, `shell/run_cgr.sh` connects to this resident Memgraph instead of starting an ephemeral container per run (the `full` profile sets it to `memgraph`, the compose service). Unset to fall back to the legacy ephemeral-container flow — see [One-command full stack](#one-command-full-stack) |
+| `DOKKAI_REPOS_DIR` | _(unset — defaults to a harmless path outside `full`)_ | **Containerized API only** (`full` profile / `dokkai up --full`). Parent directory of the repos you ingest/review, bind-mounted into the API container at the same absolute path — see [One-command full stack](#one-command-full-stack) |
 | `DOKKAI_API_URL` | `http://localhost:8000` | **CLI-side only** (not read by the API). dokkai API URL for the `dokkai` CLI; overridden by `--api`, falls back to this repo's `.env` — see [CLI](#cli) |
 | `DOKKAI_HOME` | _(auto-detected)_ | **CLI-side only.** Path to this repo, used by `dokkai up`/`dokkai status` to run `docker compose` and read `.env`. Auto-detected by walking up from the cwd for `docker-compose.yml` + `src/mcp_server.py` — see [CLI](#cli) |
 
@@ -936,7 +1042,7 @@ These are known and tracked in the [Roadmap](#roadmap):
 - Chat history is persisted in Postgres (see [Configuration](#configuration)); if Postgres is unreachable, the conversation endpoints and `/chat` degrade gracefully (503 / SSE `error` event) instead of crashing the API — though in practice, since [auth](#authentication) also requires Postgres to resolve a session, a fully unreachable Postgres now 503s every protected route at the auth layer regardless.
 - **Single repository at a time** per collection.
 - **Retrieval bias toward tests** — for "how does X work?" queries, test files often out‑rank the real implementation (test descriptions read like specs). End‑to‑end tests are also decoupled from implementation by the HTTP boundary, so graph expansion can't bridge them.
-- **The API is not yet containerized** — only Weaviate runs in `docker compose`; the API runs via `dev.sh`.
+- **Containerized (`--full`) and host (`./dev.sh`) runs don't share ingested data** — the API container stores `ingested/`/`data/` in named Docker volumes, separate from the host directories; a project ingested one way isn't visible from the other. See [One-command full stack](#one-command-full-stack).
 - **Anonymous functions** (e.g. test closures) have weak graph edges and unstable identifiers.
 - **Absolute paths are denormalized per chunk at ingest time, not re‑derived.** If a repo moves on disk (or is cloned to a new location), re‑ingest it — there's no project‑root registry that keeps paths correct automatically. Re‑ingesting is cheap: deterministic UUIDs upsert unchanged entities in place, and their descriptions come from the source‑hash cache instead of a fresh LLM call — only the changed paths/content cost anything.
 
@@ -955,12 +1061,11 @@ These are known and tracked in the [Roadmap](#roadmap):
 | 05 | Postgres conversation history | ✅ done (pending merge) |
 | 06 | Basic auth (root user via env) | ✅ done (pending merge) |
 | 07 | Frontend UI (chat + graph + config) | ✅ done (pending merge) |
-| 08 | PDF ingestion — local NotebookLM | planned |
-| 09 | Code review & bug‑hunt routines | 🚧 in progress (sub-parts A+B of 3 merged — review + bug-hunt routine backends, playbooks & skills; UI still to come, sub-part C) |
-| 10 | Documentation site (en/pt/zh/es) | planned |
-| 11 | Post‑01 polish (live provider model catalogs, stage‑level job progress, describe refresh endpoint) | ✅ done |
-| 12 | MCP polish (`grep_project` tool, small-model instructions profile, session watchdog) | ✅ done (pending merge) |
-| 13 | CLI polish (agentic `srcs --agent` MCP loop, `watch` incremental re-ingestion, `doctor` diagnostics) | ✅ done (pending merge) |
+| 08 | Code review & bug‑hunt routines _(experimental demo, not core — see [disclaimer](#code-review-routines))_ | ✅ done (2026-07-11, pending merge) |
+| 09 | Documentation site (en/pt/zh/es) | planned |
+| 10 | Post‑01 polish (live provider model catalogs, stage‑level job progress, describe refresh endpoint) | ✅ done |
+| 11 | MCP polish (`grep_project` tool, small-model instructions profile, session watchdog) | ✅ done (pending merge) |
+| 12 | CLI polish (agentic `srcs --agent` MCP loop, `watch` incremental re-ingestion, `doctor` diagnostics) | ✅ done (pending merge) |
 
 ### Retrieval quality
 
@@ -984,7 +1089,7 @@ These are known and tracked in the [Roadmap](#roadmap):
 - [x] Model configuration UI (LLM provider/model + health check). Full environment/API-key management from the UI is a separate, still-planned item — see "Remote environment configuration" below.
 
 ### One‑command infrastructure
-- [ ] Containerize the API (fill in the `Dockerfile`) and add the API + frontend to `docker-compose.yml`, so `docker compose up` brings up the **entire** stack.
+- [x] Containerize the API (fill in the `Dockerfile`) and add the API + frontend to `docker-compose.yml`, gated behind the `full` profile so `docker compose --profile full up -d` (or `dokkai up --full`) brings up the **entire** stack — see [One-command full stack](#one-command-full-stack).
 
 ### Persistence & multi‑environment
 - [x] Move chat/conversation history to a database (Postgres) — see [feature 05](#feature-roadmap).

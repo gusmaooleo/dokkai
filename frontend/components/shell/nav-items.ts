@@ -5,7 +5,15 @@
  */
 
 import type { LucideIcon } from "lucide-react";
-import { Boxes, History, MessageCircle, Network, ShieldUser, SlidersHorizontal } from "lucide-react";
+import {
+  Boxes,
+  History,
+  MessageCircle,
+  Network,
+  SearchCode,
+  ShieldUser,
+  SlidersHorizontal,
+} from "lucide-react";
 
 export interface NavItem {
   href: string;
@@ -15,11 +23,14 @@ export interface NavItem {
   adminOnly?: boolean;
   /** Instances — shows the running-job pulse badge. */
   showJobBadge?: boolean;
+  /** Experimental/demo feature — shows a subtle "beta" chip (decision 14c). */
+  beta?: boolean;
 }
 
 export const PRIMARY_NAV: NavItem[] = [
   { href: "/chat", label: "Chat", icon: MessageCircle },
   { href: "/graph", label: "Graph", icon: Network },
+  { href: "/routines", label: "Routines", icon: SearchCode, beta: true },
   { href: "/history", label: "History", icon: History },
 ];
 
@@ -37,6 +48,14 @@ export const ROUTE_META: Record<string, { title: string; subtitle: string }> = {
   graph: {
     title: "Graph",
     subtitle: "Explore the dependency graph. Drag to arrange, scroll to zoom, click a node for its source.",
+  },
+  routines: {
+    title: "Routines",
+    subtitle: "Experimental code review and bug hunt.",
+  },
+  "routines/library": {
+    title: "Library",
+    subtitle: "Playbooks and skills for routine runs.",
   },
   history: {
     title: "History",

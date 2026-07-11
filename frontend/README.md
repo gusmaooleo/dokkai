@@ -57,8 +57,9 @@ npm run lint      # eslint
 
 `Dockerfile` builds a standalone production image (`output: "standalone"` in
 `next.config.ts`) for local one-command orchestration — see the root
-README's [Frontend UI](../README.md#frontend-ui) section for `dokkai up
---ui` / `docker compose --profile ui up -d`. `NEXT_PUBLIC_API_URL` is a
+README's [One-command full stack](../README.md#one-command-full-stack)
+section for `dokkai up --full` / `docker compose --profile full up -d`
+(`--ui` is a deprecated alias for `--full`). `NEXT_PUBLIC_API_URL` is a
 build arg, inlined at image build time.
 
 ## Folder layout
