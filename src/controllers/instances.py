@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -25,6 +26,28 @@ router = APIRouter(prefix="/instances", dependencies=[Depends(require_auth)])
 require_write = require_role("admin", "user")
 
 
+# Only OS cruft in a folder still counts as "empty".
+_IGNORABLE_ENTRIES = {".DS_Store", "Thumbs.db", ".localized"}
+
+
+def _require_ingestable_dir(repo_path: str) -> None:
+    """400 if repo_path is blank, missing, not a directory, or empty — before
+    any job is created. The message surfaces via the New ingestion dialog's
+    existing error toast; the browser can't stat the server's filesystem, so
+    this check must live server-side."""
+    path = (repo_path or "").strip()
+    try:
+        entries = os.listdir(path) if path and os.path.isdir(path) else None
+    except OSError:
+        entries = None
+    if entries is None or not any(e not in _IGNORABLE_ENTRIES for e in entries):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Repository path is empty or does not exist on the server: "
+            f"'{path}'. Check the path and try again.",
+        )
+
+
 @router.post("/pipeline", dependencies=[Depends(require_write)])
 async def runPipeline(data: IngestRequest):
     """
@@ -37,6 +60,7 @@ async def runPipeline(data: IngestRequest):
     immediately with no job created. Set ``describe: false`` to opt out and
     skip that pre-flight — the pipeline then runs without descriptions.
     """
+    _require_ingestable_dir(data.repo_path)
     if data.describe:
         try:
             await ensure_descriptor_available()
@@ -61,6 +85,7 @@ async def runGraphOnly(data: GraphOnlyRequest):
     promotion (timestamped output → ``ingested/<project>.json``) already
     happens inside ``ingestByLocalRepository``.
     """
+    _require_ingestable_dir(data.repo_path)
     try:
         job = await submit_graph_only(data.repo_path)
     except ProjectJobConflict as e:
