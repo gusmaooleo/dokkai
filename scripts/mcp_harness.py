@@ -15,7 +15,7 @@ Usage
 -----
     uv run python scripts/mcp_harness.py \
         [--question "how does the alarm flow work?"] \
-        [--project saffira_back-end] \
+        [--project sample_back-end] \
         [--model qwen2.5-coder:3b] \
         [--base-url http://localhost:11434] \
         [--budget 5000] \
@@ -241,7 +241,7 @@ async def run(args: argparse.Namespace) -> bool:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--question", default=CANONICAL_QUESTION, help="Question to ask the model")
-    parser.add_argument("--project", default="saffira_back-end", help="Project name to pass to the tools")
+    parser.add_argument("--project", default="sample_back-end", help="Project name to pass to the tools")
     parser.add_argument("--model", default="qwen2.5-coder:3b", help="Ollama model to use")
     parser.add_argument("--base-url", default="http://localhost:11434", help="Ollama base URL")
     parser.add_argument("--budget", type=int, default=5000, help="Total tool-payload token budget")

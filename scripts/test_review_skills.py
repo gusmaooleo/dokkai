@@ -7,7 +7,7 @@ yet, so this is a plain assert-and-print script, mirroring
 ``scripts/test_review_playbooks.py``.
 
 Talks to the REAL running API (``./dev.sh``, port 8000 by default unless
-``DOKKAI_API_URL`` is set) with the REAL saffira corpus repo/project (branch
+``DOKKAI_API_URL`` is set) with the REAL sample corpus repo/project (branch
 ``fix/center-to-box`` — a TypeScript-only diff), real Postgres/Weaviate/
 Ollama up, and qwen2.5-coder:3b already persisted via ``POST /config/llm``
 (no model seeded by this script — same precondition as
@@ -60,7 +60,7 @@ from services.routines.review import (  # noqa: E402
 )
 
 BASE_URL = os.getenv("DOKKAI_API_URL", "http://localhost:8000")
-PROJECT = "saffira_back-end"
+PROJECT = "sample_back-end"
 TARGET_REF = "fix/center-to-box"
 ADMIN_USERNAME = os.getenv("DOKKAI_ROOT_USER", "admin")
 ADMIN_PASSWORD = os.getenv("DOKKAI_ROOT_PASSWORD", "admin")

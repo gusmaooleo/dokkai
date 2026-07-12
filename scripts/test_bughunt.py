@@ -9,8 +9,8 @@ Two kinds of coverage:
 
   - HTTP-level MECHANICS (not judged on finding quality — a 3b model may or
     may not report anything real for a given scope): talks to the REAL
-    running API (``./dev.sh``), the REAL saffira corpus (project
-    ``saffira_back-end``, already ingested), real Postgres/Weaviate, and
+    running API (``./dev.sh``), the REAL sample corpus (project
+    ``sample_back-end``, already ingested), real Postgres/Weaviate, and
     Ollama running ``qwen2.5-coder:3b`` (already persisted via
     ``POST /config/llm`` — same precondition as ``test_review_analyze.py``).
     Launches one bughunt run with a playbook + path_prefix attached and
@@ -52,7 +52,7 @@ from services.routines import bughunt  # noqa: E402
 from services.routines.agent_loop import extract_fallback_tool_call  # noqa: E402
 
 BASE_URL = os.getenv("DOKKAI_API_URL", "http://localhost:8000")
-PROJECT = "saffira_back-end"
+PROJECT = "sample_back-end"
 SCOPE = "error handling in the alarms services"
 PATH_PREFIX = "src/features/alarms"
 ADMIN_USERNAME = os.getenv("DOKKAI_ROOT_USER", "admin")

@@ -6,7 +6,7 @@ pytest dependency.
 
 Covers the unified-diff parser against embedded fixture diffs (simple
 modify, new file, deleted file, rename+edit, binary, multiple hunks,
-no-newline marker), plus a live READ-ONLY smoke test against the saffira
+no-newline marker), plus a live READ-ONLY smoke test against the sample
 corpus repo (skipped gracefully if that path doesn't exist on this machine).
 
 Usage
@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from services import git_repo  # noqa: E402
 
-SAFFIRA_REPO = "/Users/leonardo/saffira/saffira_back-end"
+SAMPLE_REPO = "/Users/username/projects/sample_back-end"
 
 _passed = 0
 
@@ -293,37 +293,37 @@ def test_multi_file_diff() -> None:
     )
 
 
-def test_live_saffira_smoke() -> None:
-    if not Path(SAFFIRA_REPO).is_dir():
-        print(f"SKIP: live saffira smoke test — '{SAFFIRA_REPO}' not found on this machine")
+def test_live_smoke() -> None:
+    if not Path(SAMPLE_REPO).is_dir():
+        print(f"SKIP: live sample smoke test — '{SAMPLE_REPO}' not found on this machine")
         return
 
-    check("live: is_git_repo", git_repo.is_git_repo(SAFFIRA_REPO))
+    check("live: is_git_repo", git_repo.is_git_repo(SAMPLE_REPO))
 
-    branches = git_repo.list_branches(SAFFIRA_REPO)
+    branches = git_repo.list_branches(SAMPLE_REPO)
     check("live: has branches", len(branches) > 0)
     current = [b for b in branches if b["is_current"]]
     check("live: exactly one current branch", len(current) == 1)
     check("live: current branch listed first", branches[0]["is_current"])
 
-    base = git_repo.default_base(SAFFIRA_REPO)
+    base = git_repo.default_base(SAMPLE_REPO)
     print(f"  live: default_base = {base!r}")
     check("live: default_base resolves to a branch name", isinstance(base, str) and base)
 
     target = "fix/center-to-box"
     branch_names = {b["name"] for b in branches}
     if target not in branch_names:
-        print(f"SKIP: live diff smoke test — branch '{target}' not found in {SAFFIRA_REPO}")
+        print(f"SKIP: live diff smoke test — branch '{target}' not found in {SAMPLE_REPO}")
         return
 
-    mb = git_repo.merge_base(SAFFIRA_REPO, base, target)
+    mb = git_repo.merge_base(SAMPLE_REPO, base, target)
     print(f"  live: merge_base({base}, {target}) = {mb}")
     check("live: merge_base returns a sha", len(mb) == 40)
 
-    stat = git_repo.diff_stat(SAFFIRA_REPO, base, target)
+    stat = git_repo.diff_stat(SAMPLE_REPO, base, target)
     print(f"  live: diff_stat = {stat}")
 
-    diff_text = git_repo.diff(SAFFIRA_REPO, base, target)
+    diff_text = git_repo.diff(SAMPLE_REPO, base, target)
     check("live: diff produced output", len(diff_text) > 0)
 
     file_diffs = git_repo.parse_unified_diff(diff_text)
@@ -343,17 +343,17 @@ def test_live_saffira_smoke() -> None:
         for start, end in fd.changed_line_ranges:
             check(f"live: range sane in {fd.path}", start >= 0 and end >= start)
 
-    sha = git_repo.resolve_ref(SAFFIRA_REPO, target)
+    sha = git_repo.resolve_ref(SAMPLE_REPO, target)
     check("live: resolve_ref returns a sha", len(sha) == 40)
 
     try:
-        git_repo.resolve_ref(SAFFIRA_REPO, "-not-a-real-flag")
+        git_repo.resolve_ref(SAMPLE_REPO, "-not-a-real-flag")
         check("live: resolve_ref rejects leading-dash ref", False)
     except git_repo.GitError:
         check("live: resolve_ref rejects leading-dash ref", True)
 
     try:
-        git_repo.resolve_ref(SAFFIRA_REPO, "this-branch-does-not-exist-xyz")
+        git_repo.resolve_ref(SAMPLE_REPO, "this-branch-does-not-exist-xyz")
         check("live: resolve_ref rejects unknown ref", False)
     except git_repo.GitError:
         check("live: resolve_ref rejects unknown ref", True)
@@ -371,7 +371,7 @@ def main() -> None:
     test_diff_argv_pins_prefixes_quotepath_and_renames()
     test_diff_stat_argv_pins_renames()
     test_multi_file_diff()
-    test_live_saffira_smoke()
+    test_live_smoke()
     print(f"\n{_passed} checks PASSED")
 
 

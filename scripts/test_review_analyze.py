@@ -5,7 +5,7 @@ stages (A5) — this repo has no test framework yet, so this is a plain
 assert-and-print script, mirroring ``scripts/test_review_stages.py``.
 
 Runs the FULL review routine (via ``submit_routine``) against the REAL
-saffira corpus repo, project ``saffira_back-end``, branch
+sample corpus repo, project ``sample_back-end``, branch
 ``fix/center-to-box`` (2 reviewable files — cheap even on a 3b model), with
 the real Postgres + Weaviate up (``docker compose up -d``) and Ollama
 running the model already persisted via ``POST /config/llm`` (checked
@@ -43,8 +43,8 @@ from services.routines import store  # noqa: E402
 from services.routines.engine import submit_routine  # noqa: E402
 from services.routines.review import _stage_diff, run_review  # noqa: E402
 
-SAFFIRA_REPO = "/Users/leonardo/saffira/saffira_back-end"
-PROJECT = "saffira_back-end"
+SAMPLE_REPO = "/Users/username/projects/sample_back-end"
+PROJECT = "sample_back-end"
 TARGET_REF = "fix/center-to-box"
 
 _VALID_SEVERITIES = {"critical", "high", "medium", "low", "info"}
@@ -90,7 +90,7 @@ async def cleanup() -> None:
     """
     Best-effort teardown of exactly the run/job rows this script created
     (tracked in ``_created``) — ``project`` here is the real
-    ``saffira_back-end`` name, so cleanup must never wildcard-delete by
+    ``sample_back-end`` name, so cleanup must never wildcard-delete by
     project the way the scratch-project tests do.
     """
     if not _created:
@@ -113,10 +113,10 @@ async def cleanup() -> None:
 
 
 async def test_full_review() -> None:
-    params = {"repo_path": SAFFIRA_REPO, "target_ref": TARGET_REF}
+    params = {"repo_path": SAMPLE_REPO, "target_ref": TARGET_REF}
 
     started = time.monotonic()
-    result = await submit_routine("review", PROJECT, SAFFIRA_REPO, params, run_review)
+    result = await submit_routine("review", PROJECT, SAMPLE_REPO, params, run_review)
     _created.append((result["run_id"], result["job_id"]))
 
     job = await poll_job(result["job_id"])
@@ -172,7 +172,7 @@ async def test_full_review() -> None:
     # _stage_diff call) to cross-check every finding's `anchored` flag
     # rather than trusting the routine's own bookkeeping.
     _base, _target, reviewable, _diff_stats = _stage_diff(
-        SAFFIRA_REPO, None, TARGET_REF, lambda *_: None
+        SAMPLE_REPO, None, TARGET_REF, lambda *_: None
     )
     ranges_by_file = {fd.path: fd.changed_line_ranges for fd in reviewable}
 

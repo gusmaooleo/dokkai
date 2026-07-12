@@ -8,7 +8,7 @@ this is a plain assert-and-print script, mirroring
 Deterministic guards (max-rounds forcing, dedupe, load_skill cap-3, fallback
 parser, non-ollama rejection) are exercised against a FAKE provider — no
 model quirks in the loop's own control flow. Exactly ONE live smoke talks to
-the REAL stack: Weaviate (project ``saffira_back-end``, already ingested)
+the REAL stack: Weaviate (project ``sample_back-end``, already ingested)
 and Ollama running ``qwen2.5-coder:3b`` (already pulled) — fine for
 MECHANICS (does it call tools, emit events, produce a non-empty answer),
 not judged for correctness of the answer's content.
@@ -48,7 +48,7 @@ from services.routines.agent_loop import (  # noqa: E402
 )
 from services.weaviate_client import get_client  # noqa: E402
 
-PROJECT = "saffira_back-end"
+PROJECT = "sample_back-end"
 MODEL = "qwen2.5-coder:3b"
 
 SKILL_1 = "test-agent-loop-scratch-skill-1"

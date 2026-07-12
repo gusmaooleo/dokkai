@@ -85,12 +85,12 @@ The server always tracks per-tool call counts and response sizes for the running
 ```bash
 uv run python scripts/mcp_harness.py \
   [--question "how does the alarm flow work?"] \
-  [--project saffira_back-end] \
+  [--project sample_back-end] \
   [--model qwen2.5-coder:3b] \
   [--budget 5000]
 ```
 
-Measured on `saffira_back-end` with the local `qwen2.5-coder:3b` model:
+Measured on `sample_back-end` with the local `qwen2.5-coder:3b` model:
 
 | Question | Tool calls used | Payload | Budget | Result |
 | --- | --- | --- | --- | --- |
@@ -110,7 +110,7 @@ Remove: `claude mcp remove dokkai`
 
 > Verified live: `claude mcp list` reports `dokkai ... ✔ Connected`, and a real call to `list_projects` (via `claude -p "Using only dokkai MCP tools, call list_projects and report the raw output" --allowedTools "mcp__dokkai__*"`) returned:
 > ```
-> saffira_back-end — chunks: 2770, nodes: 4760, edges: 8959, generated_at: 2026-07-08T22:43:50.164048+00:00
+> sample_back-end — chunks: 2770, nodes: 4760, edges: 8959, generated_at: 2026-07-08T22:43:50.164048+00:00
 > ```
 
 **Codex:**
@@ -667,7 +667,7 @@ Every describable entity (not a test, has source, not a one‑liner) gets a one�
 
 ### Ingestion cost (measured)
 
-Full pipeline run on `saffira_back-end` (medium TS/Python backend), local Ollama, `qwen2.5-coder:3b`, `DESC_CONCURRENCY=4`, cold description cache:
+Full pipeline run on `sample_back-end` (medium TS/Python backend), local Ollama, `qwen2.5-coder:3b`, `DESC_CONCURRENCY=4`, cold description cache:
 
 | Metric | Value |
 | --- | --- |

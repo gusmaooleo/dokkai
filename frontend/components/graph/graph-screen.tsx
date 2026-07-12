@@ -259,7 +259,7 @@ export function GraphScreen() {
   const truncated = mode === "entities" && !!entityData?.stats.truncated;
 
   return (
-    <div className="flex h-full min-h-0">
+    <div className="flex h-full min-h-0 overflow-hidden">
       <div className="relative min-w-0 flex-1">
         {noProject && (
           <div className="grid h-full place-items-center p-6 text-center">

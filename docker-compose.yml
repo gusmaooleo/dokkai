@@ -70,6 +70,8 @@ services:
       # Ollama runs on the host, not in compose — reach it the same way
       # Weaviate does (see OLLAMA_EMBED_ENDPOINT above).
       OLLAMA_BASE_URL: http://host.docker.internal:11434
+      OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL}
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE}
       # Rewrite seam (services/llm_provider.effective_base_url): a persisted
       # LLM config saved with base_url=localhost:11434 (e.g. from a host
       # ./dev.sh run, sharing this same Postgres) is rewritten to
@@ -80,6 +82,14 @@ services:
       # (http://host.docker.internal:11434) is already correct from
       # Weaviate's perspective. DOKKAI_CORS_ORIGINS default already covers
       # http://localhost:3000, where the ui container publishes.
+      DESC_MODEL: ${DESC_MODEL}
+      DESC_PROVIDER: ${DESC_PROVIDER:-ollama}
+      DESC_CONCURRENCY: ${DESC_CONCURRENCY:-4}
+      # Default values: when the users start by runnuing docker compose --profile full up -d
+      # the backend cannot see folders outside the container, so we need to set a default value for DOKKAI_REPOS_DIR
+      # or clone the repo inside the container. The default value is `/tmp/dokkai-repos` 
+      DOKKAI_CORS_ORIGINS: ${DOKKAI_CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      DOKKAI_REPOS_DIR: ${DOKKAI_REPOS_DIR:-/tmp/dokkai-repos}
     volumes:
       # Bind-mount the host's repos parent dir at the SAME path inside the
       # container, so routines (git ops via shell/run_cgr.sh, GET

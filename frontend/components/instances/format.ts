@@ -17,7 +17,6 @@ export function relativeTime(iso: string): string {
   return `${Math.round(hours / 24)}d ago`;
 }
 
-/** `/Users/leonardo/projects/foo/bar` -> `/Users/leonardo/…/bar` around a target length. */
 export function truncateMiddle(text: string, maxLength = 46): string {
   if (text.length <= maxLength) return text;
   const keep = Math.floor((maxLength - 1) / 2);

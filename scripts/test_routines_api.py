@@ -5,7 +5,7 @@ repo has no test framework yet, so this is a plain assert-and-print script,
 mirroring ``scripts/test_review_analyze.py``.
 
 Talks to the REAL running API (``./dev.sh``, port 8000 by default unless
-``DOKKAI_API_URL`` is set) with the REAL saffira corpus repo/project (branch
+``DOKKAI_API_URL`` is set) with the REAL sample corpus repo/project (branch
 ``fix/center-to-box``), real Postgres/Weaviate/Ollama up, and the model
 already persisted via ``POST /config/llm`` (no model seeded by this script —
 same precondition as ``test_review_analyze.py``). Exercises auth (admin
@@ -27,7 +27,7 @@ import time
 import httpx
 
 BASE_URL = os.getenv("DOKKAI_API_URL", "http://localhost:8000")
-PROJECT = "saffira_back-end"
+PROJECT = "sample_back-end"
 TARGET_REF = "fix/center-to-box"
 ADMIN_USERNAME = os.getenv("DOKKAI_ROOT_USER", "admin")
 ADMIN_PASSWORD = os.getenv("DOKKAI_ROOT_PASSWORD", "admin")

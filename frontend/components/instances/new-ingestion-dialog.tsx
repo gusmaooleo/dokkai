@@ -123,7 +123,7 @@ export function NewIngestionDialog({
                 id="repo-path"
                 value={repoPath}
                 onChange={(e) => setRepoPath(e.target.value)}
-                placeholder="/Users/leonardo/projects/…"
+                placeholder="/Users/username/projects/…"
                 className="h-[42px] rounded-[10px] border-border-strong bg-background px-3 font-mono text-[13.5px]"
               />
               <p className="mt-1.5 text-[11.5px] text-muted-foreground">Absolute path, on the server running dokkai.</p>

@@ -201,6 +201,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
 
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let resizeRaf: number | null = null;
     onLayoutStateChangeRef.current(true);
 
     const graph = new Graph<NodeAttrs, EdgeAttrs>({ type: "directed", multi: true, allowSelfLoops: true });
@@ -301,7 +302,21 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       sigmaRef.current = sigma;
       sigma.on("clickNode", ({ node }) => onSelectNodeRef.current(node));
       sigma.on("clickStage", () => onSelectNodeRef.current(null));
-      const observer = new ResizeObserver(() => sigma.resize());
+      // Coalesce ResizeObserver callbacks into a single `sigma.resize()` on
+      // the next animation frame. Calling `resize()` synchronously inside the
+      // observer forces a reflow *during* RO delivery — under the page's
+      // `overflow-auto` container that can toggle a scrollbar and re-fire the
+      // observer every frame ("ResizeObserver loop … undelivered
+      // notifications"), which is the visible "trembling". Deferring to rAF
+      // breaks the cycle; the `resizeRaf` guard collapses a burst of
+      // callbacks into one resize per frame.
+      const observer = new ResizeObserver(() => {
+        if (resizeRaf != null) return;
+        resizeRaf = window.requestAnimationFrame(() => {
+          resizeRaf = null;
+          sigmaRef.current?.resize();
+        });
+      });
       observer.observe(container);
       resizeObserverRef.current = observer;
       onLayoutStateChangeRef.current(false);
@@ -349,6 +364,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
+      if (resizeRaf != null) cancelAnimationFrame(resizeRaf);
       supervisorRef.current?.kill();
       supervisorRef.current = null;
       killSigma();

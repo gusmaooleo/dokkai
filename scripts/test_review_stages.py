@@ -5,7 +5,7 @@ Smoke test for ``services.routines.review.run_review``'s first two stages
 assert-and-print script, mirroring ``scripts/test_routine_engine.py``.
 
 Runs the REAL review routine (via ``submit_routine``) against the REAL
-saffira corpus repo, project ``saffira_back-end``, with the real Postgres
+sample corpus repo, project ``sample_back-end``, with the real Postgres
 and Weaviate up (``docker compose up -d``). READ-ONLY on the repo (see
 ``services.git_repo``'s module docstring) — nothing is checked out/mutated.
 
@@ -46,12 +46,12 @@ from services.routines import store  # noqa: E402
 from services.routines.engine import submit_routine  # noqa: E402
 from services.routines.review import _stage_context, _stage_diff, run_review  # noqa: E402
 
-SAFFIRA_REPO = "/Users/leonardo/saffira/saffira_back-end"
-# Project name MUST match the ingested graph ("ingested/saffira_back-end.json")
+SAMPLE_REPO = "/Users/username/projects/sample_back-end"
+# Project name MUST match the ingested graph ("ingested/sample_back-end.json")
 # for the context stage to find graph entities — this is a real project name,
 # not a scratch one, so cleanup below deletes only the specific run/job rows
 # this script creates (tracked in _created), never a project-wide wipe.
-PROJECT = "saffira_back-end"
+PROJECT = "sample_back-end"
 
 _created: list[tuple[str, str]] = []  # (run_id, job_id) pairs to clean up
 _passed = 0
@@ -92,7 +92,7 @@ async def cleanup() -> None:
     """
     Best-effort teardown of exactly the run/job rows this script created
     (tracked in ``_created``) — ``project`` here is the real
-    ``saffira_back-end`` name, so cleanup must never wildcard-delete by
+    ``sample_back-end`` name, so cleanup must never wildcard-delete by
     project the way the scratch-project tests do.
     """
     if not _created:
@@ -115,8 +115,8 @@ async def cleanup() -> None:
 
 
 async def test_small_real_diff() -> None:
-    params = {"repo_path": SAFFIRA_REPO, "target_ref": "fix/center-to-box"}
-    result = await submit_routine("review", PROJECT, SAFFIRA_REPO, params, run_review)
+    params = {"repo_path": SAMPLE_REPO, "target_ref": "fix/center-to-box"}
+    result = await submit_routine("review", PROJECT, SAMPLE_REPO, params, run_review)
     _created.append((result["run_id"], result["job_id"]))
     job = await poll_job(result["job_id"])
     check("small-diff job status == succeeded", job.status == "succeeded")
@@ -168,12 +168,12 @@ def test_stage_context_contents() -> None:
     emit = lambda stage, message: events.append((stage, message))  # noqa: E731
 
     _base, target, reviewable, diff_stats = _stage_diff(
-        SAFFIRA_REPO, None, "fix/center-to-box", emit
+        SAMPLE_REPO, None, "fix/center-to-box", emit
     )
     check("diff stage found the 2 reviewable files", len(reviewable) == 2)
 
     contexts, context_chars_total, entities_matched = _stage_context(
-        SAFFIRA_REPO, target, reviewable, PROJECT, emit
+        SAMPLE_REPO, target, reviewable, PROJECT, emit
     )
     check("context stage returned one context per reviewable file", len(contexts) == len(reviewable))
 
@@ -199,8 +199,8 @@ def test_stage_context_contents() -> None:
 
 
 async def test_guard_too_many_files() -> None:
-    params = {"repo_path": SAFFIRA_REPO, "target_ref": "feat/cross-detection"}
-    result = await submit_routine("review", PROJECT, SAFFIRA_REPO, params, run_review)
+    params = {"repo_path": SAMPLE_REPO, "target_ref": "feat/cross-detection"}
+    result = await submit_routine("review", PROJECT, SAMPLE_REPO, params, run_review)
     _created.append((result["run_id"], result["job_id"]))
     job = await poll_job(result["job_id"])
     check("too-many-files job status == failed", job.status == "failed")
@@ -212,8 +212,8 @@ async def test_guard_too_many_files() -> None:
 
 
 async def test_guard_empty_diff() -> None:
-    params = {"repo_path": SAFFIRA_REPO, "base_ref": "master", "target_ref": "master"}
-    result = await submit_routine("review", PROJECT, SAFFIRA_REPO, params, run_review)
+    params = {"repo_path": SAMPLE_REPO, "base_ref": "master", "target_ref": "master"}
+    result = await submit_routine("review", PROJECT, SAMPLE_REPO, params, run_review)
     _created.append((result["run_id"], result["job_id"]))
     job = await poll_job(result["job_id"])
     check("empty-diff job status == failed", job.status == "failed")
