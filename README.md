@@ -1066,6 +1066,13 @@ These are known and tracked in the [Roadmap](#roadmap):
 | 10 | Post‑01 polish (live provider model catalogs, stage‑level job progress, describe refresh endpoint) | ✅ done |
 | 11 | MCP polish (`grep_project` tool, small-model instructions profile, session watchdog) | ✅ done (pending merge) |
 | 12 | CLI polish (agentic `srcs --agent` MCP loop, `watch` incremental re-ingestion, `doctor` diagnostics) | ✅ done (pending merge) |
+| 13 | Multi-codebase association (multiple labeled codebases per project, domain-tagged, for end-to-end system understanding) | planned |
+| 14 | Answer guardrails (grounding check to detect unanswerable/out-of-scope questions) | backlog |
+| 15 | Retrieval router (question-aware choice of retrieval strategy) | backlog |
+| 16 | Native ingestion engine (in-house parsing, no external ingestion dependency, broader language coverage) | backlog |
+| 17 | Chat UI improvements (visualization/navigation of long conversations) | backlog |
+
+Items 13–17 are registered for planning purposes only — none of them is scheduled or in progress.
 
 ### Retrieval quality
 
