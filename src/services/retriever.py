@@ -118,7 +118,7 @@ class Retriever:
         entity_type: str | None = None,
         top_k: int = 10,
         alpha: float = 0.7,
-        target_vector: str = VECTOR_SUMMARY,
+        target_vector: str | list[str] = VECTOR_SUMMARY,
     ) -> list[RetrievedChunk]:
         """
         Run a hybrid search (vector + keyword) against the collection.
@@ -136,9 +136,10 @@ class Retriever:
         alpha : float
             Balance between vector (1.0) and keyword (0.0) search. Default
             0.7 leans towards semantic similarity.
-        target_vector : str
-            Which named vector to search — ``summary`` (natural-language intent,
-            default) or ``code`` (literal source). The collection has both.
+        target_vector : str | list[str]
+            Which named vector(s) to search — ``summary`` (natural-language
+            intent, default) or ``code`` (literal source), or both at once
+            (a single multi-target hybrid call; see ``search_seeds``).
 
         Returns
         -------
@@ -156,6 +157,20 @@ class Retriever:
             fusion_type=HybridFusion.RELATIVE_SCORE,
             filters=filters,
             target_vector=target_vector,
+            # Scope the BM25 keyword lane to the fields that carry a chunk's
+            # OWN identity/content. Without this, `query.hybrid()` matches
+            # keywords against every searchable TEXT/TEXT_ARRAY prop — the
+            # `calls`/`called_by` arrays (short fields, so BM25 length
+            # normalization inflates their hits), `description`, `file_path`,
+            # `module_name`, … Residual: `chunk_text` itself still embeds
+            # `Calls:`/`Called by:`/`Terms:` lines (chunker.build_text), so
+            # hub keyword attraction is reduced here, not closed — capping
+            # those embedded lists is a separate planned chunker change.
+            # Dropping `description`/`file_path` from the keyword lane is
+            # deliberate: both stay reachable through the vector lane. No
+            # per-field boosts: tuning weights without an eval harness is
+            # guesswork.
+            query_properties=["chunk_text", "name", "qualified_name"],
             return_metadata=MetadataQuery(score=True),
         )
 
@@ -176,23 +191,34 @@ class Retriever:
         alpha: float = 0.7,
     ) -> list[RetrievedChunk]:
         """
-        Hybrid-search for seed chunks on BOTH named vectors, merged: the
+        Hybrid-search for seed chunks across BOTH named vectors at once: the
         summary vector catches conceptual matches, the code vector catches
         literal ones (and undescribed entities that have no summary vector).
+
+        A single multi-target ``hybrid()`` call, rather than one query per
+        vector unioned client-side: two separate calls each get their scores
+        RELATIVE_SCORE-normalized *per response*, so the raw numbers aren't
+        comparable across them and picking "the higher score" per
+        qualified_name is not a valid merge. The guarantee here is one
+        response ⇒ one fusion pass ⇒ scores comparable within the result
+        set — NOT cross-target normalization: with a plain list the server
+        applies its default join (``minimum`` over the raw per-vector
+        distances) before fusion, so undescribed entities compete through
+        their uncalibrated code-vector distance alone. A
+        ``TargetVectors.relative_score`` join changes their standing
+        noticeably (measured live) — a knob to evaluate on a real corpus
+        before adopting. Confirmed live against Weaviate 1.28.4: entities
+        with no ``summary`` vector (empty description) are returned, not
+        dropped and not erroring.
 
         Returns
         -------
         list[RetrievedChunk]
         """
-        summary_seeds = self.search(
+        return self.search(
             query, project_name=project_name, top_k=top_k, alpha=alpha,
-            target_vector=VECTOR_SUMMARY,
+            target_vector=[VECTOR_SUMMARY, VECTOR_CODE],
         )
-        code_seeds = self.search(
-            query, project_name=project_name, top_k=top_k, alpha=alpha,
-            target_vector=VECTOR_CODE,
-        )
-        return self._merge_seeds(summary_seeds, code_seeds, top_k)
 
     def search_bm25(
         self,
@@ -211,14 +237,29 @@ class Retriever:
         list[RetrievedChunk]
         """
         filters = self._build_filters(project_name, None)
+
+        # Over-fetch so down-weighted test chunks don't crowd real
+        # implementation out of the candidate window before we re-rank —
+        # same pattern as search().
+        fetch_limit = top_k * _SEARCH_OVERFETCH if _TEST_PENALTY < 1.0 else top_k
         response = self.collection.query.bm25(
             query=query,
             query_properties=["chunk_text"],
             filters=filters,
-            limit=top_k,
+            limit=fetch_limit,
             return_metadata=MetadataQuery(score=True),
         )
-        return [self._to_chunk(obj) for obj in response.objects]
+        chunks = [self._to_chunk(obj) for obj in response.objects]
+        # BM25 never applied the test-file down-weight that search() does,
+        # so a test whose name/body happens to match the keyword out-ranked
+        # the real implementation. BM25 scores are positive floats, so the
+        # same multiply-and-re-sort applies unchanged.
+        if _TEST_PENALTY < 1.0:
+            for c in chunks:
+                if c.score is not None and _is_test_path(c.file_path):
+                    c.score *= _TEST_PENALTY
+            chunks.sort(key=lambda c: -(c.score or 0.0))
+        return chunks[:top_k]
 
     def get_by_qualified_name(
         self, qualified_name: str, project_name: str
@@ -429,20 +470,6 @@ class Retriever:
             description=str(props.get("description", "")),
             score=obj.metadata.score if obj.metadata else None,
         )
-
-    @staticmethod
-    def _merge_seeds(
-        summary_seeds: list[RetrievedChunk],
-        code_seeds: list[RetrievedChunk],
-        limit: int,
-    ) -> list[RetrievedChunk]:
-        """Union two seed lists by qualified_name, keeping the higher score."""
-        best: dict[str, RetrievedChunk] = {}
-        for chunk in (*summary_seeds, *code_seeds):
-            existing = best.get(chunk.qualified_name)
-            if existing is None or (chunk.score or 0.0) > (existing.score or 0.0):
-                best[chunk.qualified_name] = chunk
-        return sorted(best.values(), key=lambda c: -(c.score or 0.0))[:limit]
 
     def _fetch_by_qnames(
         self, qnames: list[str], project_name: str

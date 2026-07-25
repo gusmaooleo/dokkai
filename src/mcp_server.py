@@ -201,7 +201,8 @@ def search(query: str, project: str | None = None, k: int = 8) -> str:
 @_watchdog
 def grep_project(pattern: str, project: str | None = None, k: int = 10) -> str:
     """Literal keyword search (BM25 over code text, NOT regex) for a known
-    identifier. Returns ranked hits with qname, location and BM25 score."""
+    identifier. Returns ranked hits with qname, location and BM25 score.
+    Test-file hits are down-weighted like in search()."""
     if k < 1:
         raise ValueError("k must be >= 1")
     resolved = _resolve_project(project)
