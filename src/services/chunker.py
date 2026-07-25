@@ -28,6 +28,16 @@ _MAX_SOURCE_CHARS = 6_000
 # Hard cap on the extracted docstring / leading comment surfaced per chunk.
 _MAX_DOC_CHARS = 600
 
+# Hard cap on each relation list (Methods/Inherits/Implements/Overrides/
+# Calls/Called by) EMBEDDED in chunk_text — same spirit as the Terms cap
+# below (_keyword_terms' max_terms). Without this, a hub entity with e.g.
+# 200 callers packs 200 foreign identifiers into the `code` vector, pulling
+# it toward every one of those callers instead of its own semantics. The
+# STORED array properties (CodeChunk.calls/called_by/... and the matching
+# Weaviate TEXT_ARRAY props) keep the FULL, uncapped lists — this cap only
+# affects the rendered text that gets embedded/keyword-indexed.
+_MAX_RELATION_ITEMS = 16
+
 _CALLS = "CALLS"
 _DEFINES = "DEFINES"
 _DEFINES_METHOD = "DEFINES_METHOD"
@@ -90,6 +100,18 @@ def _keyword_terms(chunk: "CodeChunk", *, max_terms: int = 24) -> str:
             break
         add(callee, require_phrase=True)  # callees only add NL signal when they decompose
     return ", ".join(out[:max_terms])
+
+
+def _capped_list(items: list[str], *, max_items: int = _MAX_RELATION_ITEMS) -> str:
+    """Render a relation list as ``"a, b, c"``, capped at ``max_items`` with a
+    trailing ``"(+N more)"`` marker when truncated. Render-time only — the
+    caller's own list (e.g. ``CodeChunk.calls``) is never mutated."""
+    shown = items[:max_items]
+    text = ", ".join(shown)
+    remaining = len(items) - len(shown)
+    if remaining > 0:
+        text += f" (+{remaining} more)"
+    return text
 
 
 def _is_comment_line(line: str) -> bool:
@@ -226,19 +248,25 @@ class CodeChunk:
         if self.decorators:
             header.append(f"Decorators: {', '.join(self.decorators)}")
 
+        # Each list below is capped at _MAX_RELATION_ITEMS for the EMBEDDED
+        # text only (hub pollution guard, see the constant's comment); the
+        # full lists still land in the stored array properties untouched.
+        # NOTE: this changes chunk_text's bytes — an existing corpus needs
+        # re-ingestion for the cap to take effect (the deterministic-UUID
+        # upsert re-embeds any chunk whose chunk_text changed, naturally).
         rels: list[str] = []
         if self.defined_methods:
-            rels.append(f"Methods: {', '.join(self.defined_methods)}")
+            rels.append(f"Methods: {_capped_list(self.defined_methods)}")
         if self.inherits:
-            rels.append(f"Inherits: {', '.join(self.inherits)}")
+            rels.append(f"Inherits: {_capped_list(self.inherits)}")
         if self.implements:
-            rels.append(f"Implements: {', '.join(self.implements)}")
+            rels.append(f"Implements: {_capped_list(self.implements)}")
         if self.overrides:
-            rels.append(f"Overrides: {', '.join(self.overrides)}")
+            rels.append(f"Overrides: {_capped_list(self.overrides)}")
         if self.calls:
-            rels.append(f"Calls: {', '.join(self.calls)}")
+            rels.append(f"Calls: {_capped_list(self.calls)}")
         if self.called_by:
-            rels.append(f"Called by: {', '.join(self.called_by)}")
+            rels.append(f"Called by: {_capped_list(self.called_by)}")
         if rels:
             header.append(" | ".join(rels))
 

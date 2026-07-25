@@ -111,6 +111,10 @@ class RetrievedChunk:
     implements: list[str] = field(default_factory=list)
     overrides: list[str] = field(default_factory=list)
     defined_methods: list[str] = field(default_factory=list)
+    # Stored, round-tripped, but not yet consumed by expansion/edges — that's
+    # future feature 19 (import-graph expansion / `path`). This step only
+    # makes the data reachable.
+    imports: list[str] = field(default_factory=list)
     description: str = ""  # Tier 2: LLM micro-description (summary-vector source)
     score: float | None = None
     hop: int = 0          # 0 = seed (matched query), 1 = direct neighbor, ...
@@ -189,8 +193,10 @@ class Retriever:
             # normalization inflates their hits), `description`, `file_path`,
             # `module_name`, … Residual: `chunk_text` itself still embeds
             # `Calls:`/`Called by:`/`Terms:` lines (chunker.build_text), so
-            # hub keyword attraction is reduced here, not closed — capping
-            # those embedded lists is a separate planned chunker change.
+            # hub keyword attraction is reduced here, not closed — the
+            # embedded lists are capped at _MAX_RELATION_ITEMS since the
+            # chunker change (chunker.py), which bounds but does not
+            # eliminate this residual.
             # Dropping `description`/`file_path` from the keyword lane is
             # deliberate: both stay reachable through the vector lane. No
             # per-field boosts: tuning weights without an eval harness is
@@ -617,12 +623,18 @@ class Retriever:
             module_name=str(props.get("module_name", "")),
             parent_class=str(props.get("parent_class", "")),
             chunk_text=str(props.get("chunk_text", "")),
-            calls=list(props.get("calls", [])),  # type: ignore[arg-type]
-            called_by=list(props.get("called_by", [])),  # type: ignore[arg-type]
-            inherits=list(props.get("inherits", [])),  # type: ignore[arg-type]
-            implements=list(props.get("implements", [])),  # type: ignore[arg-type]
-            overrides=list(props.get("overrides", [])),  # type: ignore[arg-type]
-            defined_methods=list(props.get("defined_methods", [])),  # type: ignore[arg-type]
+            # ``or []`` on every array, not a plain default: a property added
+            # AFTER an object was written (the imports migration) reads back
+            # as key-present-with-None, so ``props.get(..., [])`` never fires
+            # its default and ``list(None)`` would raise on every pre-existing
+            # object — an outage, not a fallback.
+            calls=list(props.get("calls") or []),  # type: ignore[arg-type]
+            called_by=list(props.get("called_by") or []),  # type: ignore[arg-type]
+            inherits=list(props.get("inherits") or []),  # type: ignore[arg-type]
+            implements=list(props.get("implements") or []),  # type: ignore[arg-type]
+            overrides=list(props.get("overrides") or []),  # type: ignore[arg-type]
+            defined_methods=list(props.get("defined_methods") or []),  # type: ignore[arg-type]
+            imports=list(props.get("imports") or []),  # type: ignore[arg-type]
             description=str(props.get("description", "")),
             score=obj.metadata.score if obj.metadata else None,
         )
