@@ -21,6 +21,7 @@ COHERE_API_KEY         - required when VECTORIZER_PROVIDER=cohere
 
 from __future__ import annotations
 
+import logging
 import os
 import weaviate
 from weaviate.classes.config import Configure, Property, DataType
@@ -28,6 +29,8 @@ from weaviate.classes.query import Filter
 from weaviate.util import generate_uuid5
 
 from services.chunker import CodeChunk
+
+logger = logging.getLogger(__name__)
 
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "CodeEntity")
 
@@ -128,6 +131,7 @@ _PROPERTIES = [
     Property(name="implements",      data_type=DataType.TEXT_ARRAY, skip_vectorization=True),
     Property(name="overrides",       data_type=DataType.TEXT_ARRAY, skip_vectorization=True),
     Property(name="defined_methods", data_type=DataType.TEXT_ARRAY, skip_vectorization=True),
+    Property(name="imports",         data_type=DataType.TEXT_ARRAY, skip_vectorization=True),
     Property(name="ingestion_id",    data_type=DataType.TEXT,       skip_vectorization=True),
 ]
 
@@ -159,6 +163,7 @@ def ensure_collection(client: weaviate.WeaviateClient, *, recreate: bool = False
 
     if exists:
         _assert_named_vectors(client)
+        _ensure_imports_property(client)
         return
 
     client.collections.create(
@@ -166,6 +171,34 @@ def ensure_collection(client: weaviate.WeaviateClient, *, recreate: bool = False
         vectorizer_config=_named_vectors(),
         properties=_PROPERTIES,
     )
+
+
+def _ensure_imports_property(client: weaviate.WeaviateClient) -> None:
+    """
+    Additive migration for pre-existing collections created before the
+    ``imports`` property existed: an early-return on ``exists`` above would
+    otherwise leave a deployed collection without it forever. No recreation,
+    no data loss — just adds the missing property (existing objects simply
+    read back an empty ``imports`` list until re-ingested).
+    """
+    collection = client.collections.get(COLLECTION_NAME)
+    existing_names = {p.name for p in collection.config.get().properties}
+    if "imports" in existing_names:
+        return
+    try:
+        collection.config.add_property(
+            Property(name="imports", data_type=DataType.TEXT_ARRAY, skip_vectorization=True)
+        )
+    except weaviate.exceptions.WeaviateInvalidInputError:
+        # Check-then-add races with a concurrent ingest of ANOTHER project
+        # (jobs are serialized per project only): the loser's add_property
+        # raises "already exists". The operation is idempotent — verify and
+        # move on rather than killing that ingest job.
+        current = {p.name for p in collection.config.get().properties}
+        if "imports" not in current:
+            raise
+        return
+    logger.info("Added missing 'imports' property to collection '%s'", COLLECTION_NAME)
 
 def delete_project_chunks(client: weaviate.WeaviateClient, project_name: str) -> int:
     collection = client.collections.get(COLLECTION_NAME)
@@ -249,6 +282,13 @@ def upsert_chunks(
     chunks: list[CodeChunk],
     ingestion_id: str,
 ) -> int:
+    # NOTE: chunker.CodeChunk.build_text now caps the relation lists it
+    # embeds into chunk_text (_MAX_RELATION_ITEMS) — an already-ingested
+    # corpus keeps its OLD (uncapped) chunk_text/vector until it goes
+    # through this upsert again: the deterministic UUID (uuid_for_entity)
+    # means a re-ingest overwrites the SAME object with the new chunk_text,
+    # which re-triggers vectorization naturally — no separate migration path
+    # needed here, just a re-ingestion of the project.
     collection = client.collections.get(COLLECTION_NAME)
     if not chunks:
         return 0
@@ -281,6 +321,7 @@ def upsert_chunks(
                 "implements":      chunk.implements,
                 "overrides":       chunk.overrides,
                 "defined_methods": chunk.defined_methods,
+                "imports":         chunk.imports,
                 "ingestion_id":    ingestion_id,
             }
             object_id = uuid_for_entity(chunk.project_name, chunk.qualified_name)
