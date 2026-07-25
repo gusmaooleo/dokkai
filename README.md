@@ -633,7 +633,7 @@ see the demo disclaimer at the top of this section:
 
 **Retrieval** (`search_graph`):
 
-1. **Seeds** — hybrid search (vector + BM25) finds the entry points.
+1. **Seeds** — hybrid search (vector + BM25) finds the entry points. Identifier-shaped queries (e.g. `validate_token`) short-circuit this to an exact qualified-name lookup plus a keyword scan, falling back to hybrid search when nothing matches.
 2. **Graph expansion** — a breadth‑first walk over the stored `qualified_name` edges pulls in callers/callees/definitions, scored with per‑hop decay and edge weights, with hub‑node protection so a popular utility doesn't flood the context.
 3. **Context assembly** — results are ranked and formatted with provenance (`SEED` vs `hop 1 · calls ← X`) so the model understands the structure.
 
@@ -1068,7 +1068,7 @@ These are known and tracked in the [Roadmap](#roadmap):
 | 12 | CLI polish (agentic `srcs --agent` MCP loop, `watch` incremental re-ingestion, `doctor` diagnostics) | ✅ done (pending merge) |
 | 13 | Multi-codebase association (multiple labeled codebases per project, domain-tagged, for end-to-end system understanding) | planned |
 | 14 | Answer guardrails (grounding check to detect unanswerable/out-of-scope questions) | backlog |
-| 15 | Retrieval router (question-aware choice of retrieval strategy) | backlog |
+| 15 | Retrieval router (question-aware choice of retrieval strategy; a first identifier-shape heuristic already ships in the retriever) | backlog |
 | 16 | Native ingestion engine (in-house parsing, no external ingestion dependency, broader language coverage) | backlog |
 | 17 | Chat UI improvements (visualization/navigation of long conversations) | backlog |
 

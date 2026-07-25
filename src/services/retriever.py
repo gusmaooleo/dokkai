@@ -8,6 +8,7 @@ Performs combined vector (semantic) + BM25 (keyword) search on the
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -42,6 +43,30 @@ _SEARCH_OVERFETCH = 3  # fetch Nx candidates before penalizing, so demoted
                        # tests don't crowd implementation out of the window
 _TEST_DIR_SEGMENTS = {"test", "tests", "__tests__", "spec", "specs", "e2e"}
 _TEST_FILE_MARKERS = (".test.", ".spec.", ".e2e.")
+
+# --- identifier fast path ---------------------------------------------------
+# "validate_token", "TokenService.authenticate" are literal identifiers, not
+# natural language — a deterministic lookup (exact qualified_name) plus a
+# keyword scan beats semantic hybrid search for precision and cost. Only
+# fires on a STRONG signal so a plain word like "login" (better served by
+# semantic search) still takes the hybrid path.
+_IDENTIFIER_SHAPE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:]*$")
+_CAMEL_CASE_HUMP = re.compile(r"[a-z][A-Z]")
+
+
+def _looks_like_identifier(query: str) -> bool:
+    """
+    True only when ``query`` is a single whitespace-free token that reads as
+    a code identifier: matches the identifier character shape AND carries at
+    least one of ``_``, ``.``, ``::``, or an internal camelCase hump — a bare
+    lowercase word ("login") returns False on purpose.
+    """
+    token = query.strip()
+    if len(token) < 3 or " " in token or "\t" in token:
+        return False
+    if not _IDENTIFIER_SHAPE.match(token):
+        return False
+    return "_" in token or "." in token or "::" in token or bool(_CAMEL_CASE_HUMP.search(token))
 
 
 def _is_test_path(file_path: str) -> bool:
@@ -211,10 +236,33 @@ class Retriever:
         with no ``summary`` vector (empty description) are returned, not
         dropped and not erroring.
 
+        Identifier fast path: when ``query`` reads as a literal code
+        identifier (``_looks_like_identifier`` — e.g. "validate_token",
+        "TokenService.authenticate"), the hybrid call above is SKIPPED
+        entirely in favor of deterministic lookups: an exact qualified_name
+        match, then BM25 hits filtered to ones that look like the entity's
+        OWN definition rather than a mention (e.g. a caller whose body
+        repeats the name). Deterministic-first because for a literal token
+        there is a right answer to find, not a similarity to rank — precise
+        when it hits; the hybrid path stays as a fallback (at the cost of an
+        extra round trip) rather than a first choice. Fallback guarantee: if
+        the fast path finds nothing definition-ish, this falls straight
+        through to the hybrid call below, so results can never regress
+        relative to the pre-fast-path behavior.
+
         Returns
         -------
         list[RetrievedChunk]
         """
+        # Strip once, here, so the gate (_looks_like_identifier) and the
+        # executor (_identifier_seeds) see the exact same token — a trailing
+        # newline from an MCP client must not silently disable the fast path.
+        query = query.strip()
+        if _looks_like_identifier(query):
+            fast_seeds = self._identifier_seeds(query, project_name=project_name, top_k=top_k)
+            if fast_seeds:
+                return fast_seeds
+
         return self.search(
             query, project_name=project_name, top_k=top_k, alpha=alpha,
             target_vector=[VECTOR_SUMMARY, VECTOR_CODE],
@@ -470,6 +518,71 @@ class Retriever:
             description=str(props.get("description", "")),
             score=obj.metadata.score if obj.metadata else None,
         )
+
+    def _identifier_seeds(
+        self, query: str, *, project_name: str | None, top_k: int
+    ) -> list[RetrievedChunk]:
+        """
+        Deterministic-first seeds for a literal identifier query (called from
+        ``search_seeds`` when ``_looks_like_identifier`` is True): an exact
+        qualified_name lookup, then BM25 hits that look like the entity's OWN
+        definition — ``name`` equals the token's last segment, or
+        ``qualified_name`` equals the query or ends with it at a ``.`` / ``::``
+        boundary (case-insensitive) — ranked ahead of hits that merely MENTION
+        the identifier (e.g. a caller whose body repeats it, which can
+        out-score the definition on raw BM25 term frequency). Returns ``[]``
+        when nothing definition-ish turns up, so the caller falls back to the
+        hybrid path.
+        """
+        last_segment = re.split(r"[.:]+", query)[-1].lower()
+        query_lower = query.lower()
+
+        # project_name is required to derive the deterministic UUID; without
+        # it we can only rely on the BM25 pass below.
+        exact = self.get_by_qualified_name(query, project_name) if project_name else None
+
+        bm25_hits = self.search_bm25(query, project_name=project_name, top_k=top_k * _SEARCH_OVERFETCH)
+
+        def _is_definition(c: RetrievedChunk) -> bool:
+            qn = c.qualified_name.lower()
+            # Boundary-checked: a plain `.endswith(query_lower)` would also
+            # admit `queue.helpers._send_notification` for query
+            # "send_notification" — same trailing characters, different
+            # identifier. Requiring a `.`/`::` separator (or full equality)
+            # before the match rules that out.
+            return (
+                c.name.lower() == last_segment
+                or qn == query_lower
+                or qn.endswith("." + query_lower)
+                or qn.endswith("::" + query_lower)
+            )
+
+        definition_hits = [c for c in bm25_hits if _is_definition(c)]
+        if exact is not None:
+            definition_hits = [c for c in definition_hits if c.qualified_name != exact.qualified_name]
+
+        if exact is None and not definition_hits:
+            return []
+
+        # Normalize into 0..1: downstream consumers assume that range —
+        # the frontend source card renders `score * 100`%, and graph
+        # expansion's `parent.score * weight * decay` only stays bounded if
+        # the parent score is. Raw BM25 floats (can exceed 1.0) would break
+        # both, so scale by the strongest BM25 hit in this response, mirroring
+        # Weaviate's own RELATIVE_SCORE convention (top of the CANDIDATE set
+        # ≈ 1.0, rest relative to it — a surviving definition can score below
+        # 1.0 when a stronger raw keyword candidate was deliberately filtered
+        # out, which is honest). Order is preserved (monotonic transform).
+        best_bm25 = max((c.score or 0.0) for c in bm25_hits) if bm25_hits else 0.0
+        for c in definition_hits:
+            c.score = (c.score / best_bm25) if best_bm25 > 0 and c.score is not None else 0.0
+
+        seeds: list[RetrievedChunk] = []
+        if exact is not None:
+            exact.score = 1.0  # deterministic match: always the top seed
+            seeds.append(exact)
+        seeds.extend(definition_hits)
+        return seeds[:top_k]
 
     def _fetch_by_qnames(
         self, qnames: list[str], project_name: str

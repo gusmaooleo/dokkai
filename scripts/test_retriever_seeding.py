@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Smoke test for the C1 retriever seeding fixes (``services.retriever``) —
+Smoke test for the C1+C2 retriever seeding fixes (``services.retriever``) —
 this repo has no test framework yet, so this is a plain assert-and-print
 script, mirroring ``scripts/test_review_analyze.py``. Runs against the REAL
 Weaviate 1.28.4 (``docker compose up -d``).
@@ -30,6 +30,26 @@ Covers:
      ABOVE it with ``RETRIEVAL_TEST_PENALTY=1.0`` (penalty disabled) but
      BELOW it with the default penalty — checked via two subprocess
      invocations, since the env var is read at import time.
+  5. ``_looks_like_identifier`` (C2): the strong-signal heuristic returns
+     True/False on a set of literal-identifier vs. natural-language probes.
+  6. Identifier fast path (C2), mention exclusion: a mention-heavy CALLER
+     whose body repeats an identifier more often than the identifier's own
+     definition chunk must NOT out-rank — or even appear alongside — the
+     definition.
+  7. Identifier fast path (C2), separator-boundary guard: a differently
+     -named entity whose qualified_name merely ENDS WITH the query as a raw
+     substring (``queue.helpers._send_notification`` for query
+     "send_notification") must NOT be admitted as a definition match.
+  8. Identifier fast path (C2), score normalization: fast-path scores stay
+     in 0..1 like every other path (the frontend source card renders
+     ``score * 100``%; graph expansion assumes a bounded parent score) —
+     checked across the fast, hybrid, and fallback paths.
+  9. A natural-language query still takes the (unchanged) hybrid path.
+  10. Fallback correctness (C2): an identifier-shaped query matching nothing
+      definition-ish still returns real hybrid results on this corpus (not
+      a vacuous "didn't crash" check).
+  11. Strip idempotency (C2): a trailing newline (as an MCP client might
+      send) must not silently disable the fast path.
 
 Cleanup: deletes every chunk this script inserts (via
 ``delete_project_chunks``), even on failure.
@@ -60,7 +80,7 @@ from dotenv import load_dotenv  # noqa: E402
 load_dotenv()
 
 from services.chunker import CodeChunk  # noqa: E402
-from services.retriever import Retriever  # noqa: E402
+from services.retriever import Retriever, _looks_like_identifier  # noqa: E402
 from services.weaviate_client import (  # noqa: E402
     delete_project_chunks,
     ensure_collection,
@@ -68,7 +88,7 @@ from services.weaviate_client import (  # noqa: E402
     upsert_chunks,
 )
 
-PROJECT = "_retriever_c1_probe"
+PROJECT = "_retriever_seeding_probe"
 
 _passed = 0
 
@@ -163,7 +183,73 @@ def build_seed_chunks() -> list[CodeChunk]:
             start_line=1, end_line=3, module_name="cache",
             chunk_text="[Function] get_value\ndef get_value(key):\n    return CACHE.get(key)",
         ),
+        # --- C2 identifier fast-path probe ---------------------------------
+        # The DEFINITION: mentions its own identifier only twice (header +
+        # signature).
+        _chunk(
+            node_id=7, entity_type="Function", name="send_notification",
+            qualified_name="notifications.sender.send_notification",
+            file_path="src/services/notification_sender.py",
+            absolute_path="/repo/src/services/notification_sender.py",
+            start_line=1, end_line=4, module_name="notification_sender",
+            called_by=["notifications.batch.notify_all"],
+            chunk_text="[Function] send_notification\n"
+                        "def send_notification(msg):\n"
+                        "    return DISPATCH.send(msg)",
+        ),
+        # A CALLER whose body repeats the identifier MORE OFTEN than the
+        # definition itself — the raw BM25 term-frequency winner, but not a
+        # definition, so the fast-path filter must exclude it.
+        _chunk(
+            node_id=8, entity_type="Function", name="notify_all",
+            qualified_name="notifications.batch.notify_all",
+            file_path="src/services/notification_batch.py",
+            absolute_path="/repo/src/services/notification_batch.py",
+            start_line=1, end_line=8, module_name="notification_batch",
+            calls=["notifications.sender.send_notification"],
+            chunk_text="[Function] notify_all\n"
+                        "def notify_all(msgs):\n"
+                        "    # send_notification send_notification send_notification"
+                        " send_notification\n"
+                        "    for msg in msgs:\n"
+                        "        send_notification(msg)\n"
+                        "    return len(msgs)",
+        ),
+        # A DIFFERENTLY-NAMED wrapper whose qualified_name merely ENDS WITH
+        # the query as a raw substring — "queue.helpers._send_notification"
+        # ends with "send_notification" character-for-character, so a naive
+        # `.endswith(query_lower)` (no separator boundary) wrongly admits it.
+        # Its body also repeats the bare term 3x, so it would win on raw BM25
+        # term frequency too if not excluded structurally.
+        _chunk(
+            node_id=9, entity_type="Function", name="_send_notification",
+            qualified_name="queue.helpers._send_notification",
+            file_path="src/services/queue_helpers.py",
+            absolute_path="/repo/src/services/queue_helpers.py",
+            start_line=1, end_line=6, module_name="queue_helpers",
+            chunk_text="[Function] _send_notification\n"
+                        "def _send_notification(msg):\n"
+                        "    # send_notification send_notification send_notification\n"
+                        "    return QUEUE.push(msg)",
+        ),
     ]
+
+
+def check_looks_like_identifier() -> None:
+    """No live server needed — pure heuristic, checked up front."""
+    print("\n_looks_like_identifier probes:")
+    for token, expected in [
+        ("validate_token", True),
+        ("TokenService.authenticate", True),
+        ("camelCaseName", True),
+        ("login", False),                # plain lowercase word -> semantic search
+        ("how does auth work", False),    # natural language, has spaces
+        ("a_b", True),                    # len 3 with underscore -> strong signal
+        ("how_does auth", False),         # contains whitespace, disqualified
+    ]:
+        got = _looks_like_identifier(token)
+        print(f"  {token!r:30} -> {got}")
+        check(f"_looks_like_identifier({token!r}) == {expected}", got == expected)
 
 
 def run_bm25_subprocess(penalty_env: str | None) -> list[list]:
@@ -198,11 +284,13 @@ finally:
 
 
 def main() -> None:
+    check_looks_like_identifier()
+
     client = get_client()
     try:
         ensure_collection(client)
         chunks = build_seed_chunks()
-        inserted = upsert_chunks(client, chunks, ingestion_id="c1-probe-1")
+        inserted = upsert_chunks(client, chunks, ingestion_id="retriever-seeding-probe-1")
         print(f"seeded {inserted} synthetic chunk(s) under project={PROJECT!r}")
         check("all seed chunks inserted", inserted == len(chunks))
 
@@ -308,6 +396,100 @@ def main() -> None:
         check(
             "default penalty measurably lowered the test chunk's score",
             default_test_score < disabled_test_score,
+        )
+
+        # --- 6) C2 identifier fast path: definition beats mention-heavy caller,
+        # AND a same-suffix-but-different entity (separator-boundary guard)
+        DEFINITION_QN = "notifications.sender.send_notification"
+        CALLER_QN = "notifications.batch.notify_all"
+        BOUNDARY_TRAP_QN = "queue.helpers._send_notification"
+        fastpath_results = retriever.search_seeds(
+            "send_notification", project_name=PROJECT, top_k=5,
+        )
+        print(f"\nfast-path seeds for 'send_notification' ({len(fastpath_results)}):")
+        for c in fastpath_results:
+            print(f"  score={c.score!r}  {c.qualified_name}")
+        fastpath_qnames = [c.qualified_name for c in fastpath_results]
+        check("fast path returns results", len(fastpath_results) > 0)
+        check(
+            "fast path ranks the DEFINITION first, not the mention-heavy caller",
+            fastpath_qnames[0] == DEFINITION_QN,
+        )
+        check(
+            "fast path excludes the mention-only caller entirely",
+            CALLER_QN not in fastpath_qnames,
+        )
+
+        # --- 7) C2 separator-boundary guard: reviewer repro ------------------
+        check(
+            "fast path excludes the same-suffix-but-different entity "
+            "(queue.helpers._send_notification)",
+            BOUNDARY_TRAP_QN not in fastpath_qnames,
+        )
+
+        # --- 8) C2 score normalization: every path stays in 0..1 -------------
+        # (hybrid_results / fallback_results computed in sections 9 / 10
+        # below; checked together with fastpath_results once all three exist)
+
+        # --- 9) C2 natural-language query still takes the hybrid path -------
+        hybrid_results = retriever.search_seeds(
+            "how does a user log in", project_name=PROJECT, top_k=3,
+        )
+        print(f"\nhybrid-path seeds for 'how does a user log in' ({len(hybrid_results)}):")
+        for c in hybrid_results:
+            print(f"  score={c.score!r}  {c.qualified_name}")
+        check(
+            "'how does a user log in' is NOT identifier-shaped",
+            not _looks_like_identifier("how does a user log in"),
+        )
+        check("hybrid-path seeds non-empty", len(hybrid_results) > 0)
+        check("hybrid-path seeds all carry a score", all(c.score is not None for c in hybrid_results))
+
+        # --- 10) C2 fallback: identifier-shaped query, nothing definition-ish
+        check(
+            "'zz_nonexistent_zz' IS identifier-shaped",
+            _looks_like_identifier("zz_nonexistent_zz"),
+        )
+        fallback_results = retriever.search_seeds(
+            "zz_nonexistent_zz", project_name=PROJECT, top_k=3,
+        )
+        print(f"\nfallback seeds for 'zz_nonexistent_zz' ({len(fallback_results)}):")
+        for c in fallback_results:
+            print(f"  score={c.score!r}  {c.qualified_name}")
+        check(
+            "no-match identifier query falls back to hybrid and returns real results "
+            "(not a vacuous isinstance check)",
+            len(fallback_results) > 0,
+        )
+
+        # --- 8, continued) score normalization, now that all three exist ----
+        all_scored = fastpath_results + hybrid_results + fallback_results
+        check(
+            "every returned seed score (fast path, hybrid, fallback) is <= 1.0",
+            all((c.score or 0.0) <= 1.0 + 1e-9 for c in all_scored),
+        )
+
+        # --- 11) C2 strip idempotency: trailing newline == stripped query ---
+        newline_query = "validate_token\n"
+        check(
+            "'validate_token\\n' is still identifier-shaped after stripping",
+            _looks_like_identifier(newline_query),
+        )
+        newline_results = retriever.search_seeds(
+            newline_query, project_name=PROJECT, top_k=3,
+        )
+        plain_results = retriever.search_seeds(
+            "validate_token", project_name=PROJECT, top_k=3,
+        )
+        print(
+            f"\n'validate_token\\n' seeds: "
+            f"{[c.qualified_name for c in newline_results]}"
+        )
+        check(
+            "trailing-newline query takes the identical fast path as the "
+            "stripped query",
+            [c.qualified_name for c in newline_results]
+            == [c.qualified_name for c in plain_results],
         )
 
     finally:
