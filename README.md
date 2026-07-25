@@ -970,7 +970,7 @@ curl -X DELETE localhost:8000/auth/users/2 -H "Authorization: Bearer $TOKEN"
 | `POST` | `/routines/skills` | admin, user | Create a skill |
 | `PATCH` | `/routines/skills/{name}` | admin, user | Update a skill's `description`/`content` |
 | `DELETE` | `/routines/skills/{name}` | admin, user | Delete a skill |
-| `POST` | `/chat` | admin, user | Chat over the codebase (SSE: `sources` → `token` → `done`) |
+| `POST` | `/chat` | admin, user | Chat over the codebase (SSE: `sources` → `token` → `done`; if no LLM provider is configured, the stream instead emits a single `error` event with no `sources` and the user message is not persisted — no orphan conversation) |
 | `GET` | `/chat/conversations` | any | List conversations (persisted in Postgres; 503 if Postgres is unreachable) |
 | `GET` | `/chat/conversations/{id}` | any | Get a conversation's history (503 if Postgres is unreachable) |
 | `DELETE` | `/chat/conversations/{id}` | admin, user | Delete a conversation (503 if Postgres is unreachable) |

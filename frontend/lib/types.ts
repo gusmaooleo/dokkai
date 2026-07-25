@@ -115,7 +115,9 @@ export interface Conversation {
 
 /**
  * `POST /chat`'s SSE event stream, in order: one `sources`, many `token`,
- * then either one `done` or one `error` (terminal).
+ * then either one `done` or one `error` (terminal). Exception: if no LLM
+ * provider is configured, the stream instead emits a single `error` event
+ * first, with no `sources` event at all.
  */
 export type ChatSSEEvent =
   | { type: "sources"; data: SourceChunk[] }
