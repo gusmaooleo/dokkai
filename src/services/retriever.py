@@ -395,70 +395,6 @@ class Retriever:
         ranked = sorted(selected.values(), key=lambda c: -(c.score or 0.0))
         return ranked[:max_nodes]
 
-    def build_context(
-        self,
-        chunks: list[RetrievedChunk],
-        *,
-        max_chars: int = 12_000,
-    ) -> str:
-        """
-        Format retrieved chunks into a single context string suitable for
-        injection into an LLM prompt.
-
-        Parameters
-        ----------
-        chunks : list[RetrievedChunk]
-            Ranked search results from ``search()``.
-        max_chars : int
-            Truncate the context to at most this many characters.
-
-        Returns
-        -------
-        str
-            A formatted context block.
-        """
-        if not chunks:
-            return "(No relevant code found in the codebase.)"
-
-        sections: list[str] = []
-        total = 0
-
-        for i, chunk in enumerate(chunks, 1):
-            header = f"--- Source {i}: [{chunk.entity_type}] {chunk.qualified_name} ---"
-            location = f"File: {chunk.absolute_path or chunk.file_path}"
-            if chunk.start_line is not None and chunk.end_line is not None:
-                location += f" (lines {chunk.start_line}-{chunk.end_line})"
-
-            relations: list[str] = []
-            if chunk.calls:
-                relations.append(f"Calls: {', '.join(chunk.calls)}")
-            if chunk.called_by:
-                relations.append(f"Called by: {', '.join(chunk.called_by)}")
-            if chunk.inherits:
-                relations.append(f"Inherits: {', '.join(chunk.inherits)}")
-            if chunk.implements:
-                relations.append(f"Implements: {', '.join(chunk.implements)}")
-            if chunk.defined_methods:
-                relations.append(f"Methods: {', '.join(chunk.defined_methods)}")
-
-            section_lines = [header, location]
-            if relations:
-                section_lines.append(" | ".join(relations))
-            section_lines.append(chunk.chunk_text)
-
-            section = "\n".join(section_lines)
-
-            if total + len(section) > max_chars:
-                remaining = max_chars - total
-                if remaining > 200:
-                    sections.append(section[:remaining] + "\n[truncated]")
-                break
-
-            sections.append(section)
-            total += len(section) + 2  # account for double newline separator
-
-        return "\n\n".join(sections)
-
     def build_graph_context(
         self,
         chunks: list[RetrievedChunk],
@@ -473,25 +409,197 @@ class Retriever:
         if not chunks:
             return "(No relevant code found in the codebase.)"
 
+        # A class chunk embeds the full source of its methods, which are ALSO
+        # their own chunks — without this, the same lines could occupy two
+        # context slots. Drop whichever one is redundant before packing.
+        chunks = self._drop_contained(chunks)
+
         sections: list[str] = []
         total = 0
-        for i, chunk in enumerate(chunks, 1):
-            tag = "SEED · matched query" if chunk.hop == 0 else f"hop {chunk.hop} · {chunk.via}"
-            location = f"File: {chunk.absolute_path or chunk.file_path}"
-            if chunk.start_line is not None and chunk.end_line is not None:
-                location += f" (lines {chunk.start_line}-{chunk.end_line})"
-            summary = f"Summary: {chunk.description}\n" if chunk.description else ""
-            section = f"--- Source {i} [{tag}] ---\n{location}\n{summary}{chunk.chunk_text}"
-            if sections and total + len(section) > max_chars:
-                break
+        for chunk in chunks:
+            # Number by position among KEPT sections, not the position in
+            # ``chunks`` — packing below can skip a chunk, and renumbering
+            # around the gap keeps "Source N" contiguous (a gap would read
+            # as meaningful to the model when it is just an artifact of
+            # skipping).
+            index = len(sections) + 1
+            section = self._format_graph_section(index, chunk)
+
+            if not sections:
+                # The top-scored section is never skipped — an empty context
+                # defeats the point of retrieval — but it still must respect
+                # the budget: truncate at a line boundary, mirroring the
+                # ``_MAX_SOURCE_CHARS`` idiom in chunker.py.
+                if len(section) > max_chars:
+                    marker = "\n… [truncated]"
+                    if max_chars <= len(marker):
+                        # Budget too small to even fit the marker — a plain
+                        # hard cut is the only option that still respects it.
+                        section = section[:max_chars]
+                    else:
+                        budget = max_chars - len(marker)
+                        section = section[:budget].rsplit("\n", 1)[0] + marker
+                sections.append(section)
+                total = len(section)
+                continue
+
+            # Pack the rest in score order, but SKIP (rather than stop at) a
+            # section that doesn't fit: a big section skipped here shouldn't
+            # block a smaller, later one from still making the cut. ``+ 2``
+            # accounts for the "\n\n" separator the final join adds, so
+            # ``total`` tracks the real assembled length.
+            added = len(section) + 2
+            if total + added > max_chars:
+                continue
             sections.append(section)
-            total += len(section)
+            total += added
 
         return "\n\n".join(sections)
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_graph_section(index: int, chunk: RetrievedChunk) -> str:
+        """
+        Render one ``build_graph_context`` section. The header carries BOTH
+        the provenance tag (seed vs. hop) and the entity's own identity
+        (``[entity_type] qualified_name``) — chat.py explicitly asks the
+        model to reference classes/functions by name, so that identity has
+        to survive into the prompt even though the body below has its own
+        copy of it stripped.
+
+        ``chunk_text`` (``chunker.CodeChunk.build_text``) repeats its own
+        ``[type] qualified_name`` / ``File:`` / relations / ``Terms:`` /
+        ``Doc:`` prelude before the fenced source block; this section's own
+        header/location already cover the identity/location ground, so only
+        the fenced block (plus, see below, a bare ``Doc:``) is kept from
+        chunk_text — see ``_split_chunk_text`` for how the real fence is
+        located. Never mutates the stored ``chunk_text``.
+
+        When ``description`` is empty, chunk_text's own ``Doc:`` line (a
+        leading comment / docstring — ``chunker._extract_doc`` — which for
+        non-Python source lives ABOVE ``start_line`` and so is never inside
+        the fenced source either) is re-surfaced here, since nothing else in
+        the section would carry it otherwise. When ``description`` IS
+        present, ``Summary:`` already covers that role, so ``Doc:`` is
+        skipped rather than shown twice.
+        """
+        tag = "SEED · matched query" if chunk.hop == 0 else f"hop {chunk.hop} · {chunk.via}"
+        header = f"--- Source {index} [{tag}] [{chunk.entity_type}] {chunk.qualified_name} ---"
+        location = f"File: {chunk.absolute_path or chunk.file_path}"
+        if chunk.start_line is not None and chunk.end_line is not None:
+            location += f" (lines {chunk.start_line}-{chunk.end_line})"
+
+        doc, body = Retriever._split_chunk_text(chunk.chunk_text)
+        doc_line = f"Doc: {doc}\n" if not chunk.description and doc else ""
+        summary = f"Summary: {chunk.description}\n" if chunk.description else ""
+
+        return f"{header}\n{location}\n{doc_line}{summary}{body}"
+
+    @staticmethod
+    def _split_chunk_text(chunk_text: str) -> tuple[str, str]:
+        """
+        Split a chunker-built ``chunk_text`` into its optional ``Doc: ...``
+        paragraph and everything from the real source fence onward.
+        ``build_text`` always joins its parts with ``"\\n\\n"``, and the
+        source part (when present) always starts ``"```\\n"`` — so the
+        boundary ``"\\n\\n```\\n"`` finds the REAL fence even when the Doc
+        paragraph itself embeds a fenced example (e.g. a JSDoc
+        ``@example``), which a bare ``find("```")`` (the ``mcp_server.
+        get_entity`` idiom) would stop at instead. Falls back to that looser
+        ``find("```")`` when the tight boundary isn't present (still correct
+        when there's no Doc paragraph ahead of the source), then returns the
+        raw text untouched when no fence exists at all — in that case
+        ``Doc:`` extraction is skipped too, since nothing is actually being
+        stripped.
+        """
+        tight_idx = chunk_text.find("\n\n```\n")
+        if tight_idx != -1:
+            prelude_end = tight_idx
+            body_start = tight_idx + 2  # keep "```..." — drop only the blank line
+        else:
+            loose_idx = chunk_text.find("```")
+            if loose_idx == -1:
+                return "", chunk_text
+            prelude_end = loose_idx
+            body_start = loose_idx
+
+        body = chunk_text[body_start:]
+        marker = "\n\nDoc: "
+        doc_idx = chunk_text.find(marker, 0, prelude_end)
+        doc = chunk_text[doc_idx + len(marker):prelude_end] if doc_idx != -1 else ""
+        return doc, body
+
+    @staticmethod
+    def _drop_contained(chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
+        """
+        Drop a chunk whose ``(file_path, start_line..end_line)`` range is
+        FULLY CONTAINED by another selected chunk's range — e.g. a class
+        chunk embeds the full source of a method that is ALSO its own chunk,
+        so the same lines would otherwise occupy two context slots. The
+        higher-scored chunk keeps its slot: when the container scores
+        higher, the contained chunk is dropped — UNLESS the container's own
+        ``chunk_text`` was itself truncated by chunker's
+        ``_MAX_SOURCE_CHARS`` cap (source capped at ingest time, but
+        ``end_line`` still records the real, uncapped range — see
+        ``chunker.py``'s ``_read_source``), in which case the contained
+        chunk's code is not guaranteed to actually be present in the
+        container's text, so dropping it could silently remove real code
+        from the prompt — both are kept instead. When the contained chunk
+        scores higher, the container is dropped instead, unconditionally
+        (precision-first — the specific match wins over the big class body;
+        the container's non-overlapping lines do leave the prompt, an
+        accepted tradeoff). Equal scores also keep the smaller (more
+        specific) range. Only compares chunks that both have a
+        ``file_path`` and a line range; IDENTICAL ranges are NOT containment
+        and both are kept (distinct entities over the same lines — e.g.
+        decorator wrappers — are unlikely but possible).
+        """
+        def _range(c: RetrievedChunk) -> tuple[str, int, int] | None:
+            if not c.file_path or c.start_line is None or c.end_line is None:
+                return None
+            return (c.file_path, c.start_line, c.end_line)
+
+        ranges = [_range(c) for c in chunks]
+        dropped: set[int] = set()
+        for i, ri in enumerate(ranges):
+            if ri is None or i in dropped:
+                continue
+            for j, rj in enumerate(ranges):
+                if i == j or rj is None or j in dropped or ri[0] != rj[0] or ri == rj:
+                    continue
+                if not (ri[1] <= rj[1] and rj[2] <= ri[2]):
+                    continue  # i does not contain j
+                score_i, score_j = chunks[i].score or 0.0, chunks[j].score or 0.0
+                if score_i > score_j:
+                    if not Retriever._is_source_truncated(chunks[i].chunk_text):
+                        dropped.add(j)
+                    # else: container's embedded source was cut short — its
+                    # text may not actually cover chunk j's lines, so keep
+                    # both rather than risk deleting real code from the
+                    # prompt.
+                else:
+                    # score_j > score_i, or a tie — either way the container
+                    # loses its slot: the specific match wins (precision
+                    # -first), and on ties the smaller range is the keeper.
+                    # Containment with distinct ranges makes i strictly the
+                    # larger span, so i is always the container here.
+                    dropped.add(i)
+                    break
+        return [c for idx, c in enumerate(chunks) if idx not in dropped]
+
+    @staticmethod
+    def _is_source_truncated(chunk_text: str) -> bool:
+        """
+        True when chunk_text's embedded source was cut short by chunker's
+        ``_MAX_SOURCE_CHARS`` cap (``chunker.py``'s ``_read_source``) — the
+        fenced block ends with the truncation marker instead of the entity's
+        real closing lines, even though the recorded ``end_line`` is the
+        real (uncapped) one.
+        """
+        return chunk_text.rstrip().endswith("… [truncated]\n```")
 
     @staticmethod
     def _to_chunk(obj: Any) -> RetrievedChunk:
