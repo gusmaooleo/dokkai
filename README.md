@@ -24,6 +24,7 @@ Everything runs **100% locally** — Weaviate for vectors, Ollama for both embed
 - [How it works](#how-it-works)
 - [Descriptions (Tier 2)](#descriptions-tier-2)
 - [Retrieval eval harness](#retrieval-eval-harness)
+- [Path connectivity eval](#path-connectivity-eval)
 - [Features](#features)
 - [Tech stack](#tech-stack)
 - [Prerequisites](#prerequisites)
@@ -61,18 +62,23 @@ Dokkai's core deliverable is a **stdio MCP server** (`dokkai`, `src/mcp_server.p
 | Tool | Parameters | Returns | Typical size |
 | --- | --- | --- | --- |
 | `list_projects` | – | Ingested projects with chunk counts, node/edge counts, `generated_at` | ~105 chars |
-| `search` | `query`, `project?`, `k=8` | Ranked hits — qualified_name, entity type, absolute `path:lines`, score, truncated description | ~2.7k chars (~680 tok) at `k=8` |
+| `search` | `query`, `project?`, `k=8` | Ranked hits — qualified_name, entity type, absolute `path:lines`, score, description cut at a sentence boundary | ~2.7k chars (~680 tok) at `k=8` |
 | `grep_project` | `pattern`, `project?`, `k=10` | Literal keyword search — BM25 over stored code text (tokenized, **not regex**) for a known identifier; ranked hits with qualified_name, entity type, absolute `path:lines`, BM25 score; clean "no matches" string on a blank pattern or no hits | ~800 chars (~200 tok) at `k=10` |
 | `get_entity` | `qualified_name`, `project?` | One entity's relations (calls/called_by/inherits/implements/overrides/methods), summary and full source | ~0.5–1.6k chars |
-| `neighbors` | `qualified_name`, `project?`, `direction=both`, `depth=1`, `limit=30` | Graph neighborhood (calls/inherits/implements/overrides/defines) as a node list + edge list, BFS up to `depth` hops | ~0.6k chars |
+| `neighbors` | `qualified_name`, `project?`, `direction=both`, `depth=1`, `limit=30` | Graph neighborhood (calls/inherits/implements/overrides/defines) as a node list + edge list, BFS up to `depth` hops, each node with a 1-line summary when one is available | scales with `limit` (30 by default) — one line per node, plus a summary line where one exists |
 | `context` | `query`, `project?`, `k=8` | One-shot seed + graph-expanded context bundle, ready to use as LLM context, capped at 10,000 chars | ≤10k chars (~2.5k tok) |
+| `tree` | `path?`, `depth=2`, `project?` | Repo structure map: directories with aggregate file/entity counts, files with per-kind entity counts (e.g. "2 Class, 5 Method"); `path` accepts a relative or absolute directory path; when the requested `depth` would overflow the budget it degrades to the deepest depth that fits and says so in the header | ≤10k chars |
+| `outline` | `file`, `project?` | Per-file entity map: every entity's kind, line range, a disk-derived signature line and a 1-line summary when a description exists, methods nested under their class — the narrowing step before `get_file(path, start_line, end_line)` | ≤10k chars |
+| `path` | `source`, `target`, `max_depth=10`, `project?` | Shortest structural route between two entities, each hop rendered with its true edge type and direction; third-party external modules are never used as pass-through hubs when an app-level route exists within `max_depth` — an external-only connection is still returned, flagged with a weak-coupling note. The result is the shortest *structural* connection, not necessarily the runtime call narrative | ≤4k chars |
 | `get_file` | `path`, `project?`, `start_line?`, `end_line?` | Raw file content, optionally a 1-indexed inclusive line range; capped at 2,000 lines / 100 KB per call (with a truncation note) | file-dependent |
+
+**Narrowing flow:** orient with `tree()` for the repo's shape, narrow with `outline(file)` to map a file's entities or `search(query)` for named/conceptual seeds, then read only the chosen range via `get_file(path, start_line, end_line)` — never fetch a whole file when a range will do. Use `path(source, target)` for end-to-end "how does X reach Y" wiring questions. Both instructions profiles below teach this flow.
 
 ### Instructions profile
 
 The server's `instructions` string (sent to the MCP client, shaping how the model uses the tools) has two variants, selected by the `DOKKAI_MCP_PROFILE` env var — the tool contracts (names, parameters, return shapes) are **identical** in both:
 
-- **Unset (default)** — the original, concise instructions.
+- **Unset (default)** — the concise variant: the narrowing flow above, stated once.
 - **`small-model`** — a more directive, anti-loop variant aimed at 3B‑class local models, which the harness (`scripts/mcp_harness.py`) showed can otherwise loop or re-call tools with the same arguments; it explicitly points at `grep_project` for known identifiers and tells the model to stop calling tools once it has enough information. Set this when wiring a small local model through the harness or a future SRCS integration (roadmap feature 04).
 
 ### Session watchdog
@@ -760,6 +766,29 @@ share the aggregate tables (not the full `--json`) in a PR.
 
 ---
 
+## Path connectivity eval
+
+`scripts/eval_path.py` is a separate, fully offline (graph-only, no Weaviate)
+harness that measures what the MCP `path()` tool delivers on a golden
+dataset's **flow** questions: for each one, the first and last `expect`
+targets are taken as endpoints and `navigation.get_path` is run between
+them, reporting per-question connectivity and hop count plus aggregate
+stats. Middle `expect` targets are reported as a **mid-target coverage
+diagnostic, not a score** — the shortest structural route is not expected
+to pass through every intermediate step a question's author had in mind.
+Datasets with no flow questions, or whose project has no ingested
+graph, are skipped with an explicit message rather than silently scored.
+
+```bash
+uv run python scripts/eval_path.py \
+  [--dataset PATH ...] [--max-depth N] [--json FILE] [--out FILE.md]
+```
+
+`--out` is aggregate-only; `--json` carries per-question rows (and
+qualified names) — share the former in a PR, not the latter.
+
+---
+
 ## Features
 
 - ✅ Full repo → dependency graph → vectorized chunks pipeline
@@ -771,7 +800,7 @@ share the aggregate tables (not the full `--json`) in a PR.
 - ✅ 100% local: Weaviate + Ollama (embeddings **and** generation)
 - ✅ Pluggable providers — LLM: Ollama / OpenAI / Anthropic · embeddings: Ollama / OpenAI / Cohere
 - ✅ Auto‑configure + warm the chat model on startup (no cold starts)
-- ✅ **MCP server** — 7 tools (search, literal grep, graph navigation, entity/file lookup) for Claude Code, Codex and any stdio MCP client, with a small-model instructions profile and a session usage watchdog (see [MCP server](#mcp-server))
+- ✅ **MCP server** — 10 tools (search, literal grep, graph navigation, entity/file lookup, repo/file structure maps, entity-to-entity paths) for Claude Code, Codex and any stdio MCP client, with a small-model instructions profile and a session usage watchdog (see [MCP server](#mcp-server))
 - ✅ **npm CLI** (`dokkai`) — `up`/`status`/`ingest`/`graph`/`srcs`/`watch`/`doctor` commands: live job progress, one-command SRCS sessions (Claude Code, Codex, a local Ollama REPL, or an agentic local-model MCP loop), debounced incremental re-ingestion on save, and environment diagnostics (see [CLI](#cli))
 - ✅ **Graph-only ingestion** (`POST /instances/graph`, `dokkai graph`) — run just `cgr` with no LLM/Weaviate involved
 - ✅ **Authentication** — always-on, Grafana-style bearer-token auth with 3 roles (admin/user/viewer), a default `admin`/`admin` seed overridable via env, and CLI auto-login (see [Authentication](#authentication))
@@ -779,6 +808,7 @@ share the aggregate tables (not the full `--json`) in a PR.
 - ✅ **Code review & bug-hunt routines** _(experimental demo, not part of dokkai core — see disclaimer)_ — branch-vs-base review and free-text bug-hunt investigations (agentic tool loop, Ollama-native), both with graph-anchored findings, pushable playbooks and model-pulled skills, run as background jobs over the shared job system with a dedicated UI (see [Code review routines](#code-review-routines))
 - ✅ **One-command full stack** — `dokkai up --full` / `docker compose --profile full up -d` containerizes the API and frontend UI alongside Weaviate/Postgres/Memgraph (see [One-command full stack](#one-command-full-stack))
 - ✅ **Retrieval eval harness** (`scripts/eval_retrieval.py`) — deterministic, LLM-free rank-based quality metrics (hit@k, MRR, coverage, abstention, token cost) across 5 retrieval variants, with a self-seeded synthetic fixture, a stale-target drift detector, and `--compare` baseline deltas (see [Retrieval eval harness](#retrieval-eval-harness))
+- ✅ **Path connectivity eval** (`scripts/eval_path.py`) — offline, graph-only measurement of what the MCP `path()` tool delivers on a golden dataset's flow questions (see [Path connectivity eval](#path-connectivity-eval))
 
 ---
 
