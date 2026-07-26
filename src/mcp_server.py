@@ -29,7 +29,7 @@ _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(m
 logger.addHandler(_handler)
 logger.propagate = False
 
-from services import graph_store
+from services import graph_store, navigation
 from services.graph_store import resolve_file
 from services.retriever import Retriever
 from services.weaviate_client import count_chunks_by_project, get_client
@@ -331,6 +331,88 @@ def context(query: str, project: str | None = None, k: int = 8) -> str:
         return retriever.build_graph_context(chunks, max_chars=10_000)
     finally:
         client.close()
+
+
+_TREE_BUDGET = 10_000
+
+
+def _count_label(n: int, singular: str, plural: str) -> str:
+    return f"{n} {singular if n == 1 else plural}"
+
+
+def _format_tree_entry(entry: dict) -> str:
+    indent = "  " * entry["depth"]
+    if entry["type"] == "dir":
+        files = _count_label(entry["files"], "file", "files")
+        entities = _count_label(entry["entities"], "entity", "entities")
+        return f"{indent}{entry['name']}/ ({files}, {entities})"
+    kinds = ", ".join(f"{v} {k}" for k, v in entry["entities"].items())
+    return f"{indent}{entry['name']}" + (f" ({kinds})" if kinds else "")
+
+
+def _tree_header(payload: dict, requested_depth: int | None = None) -> str:
+    root_label = payload["root"] or "(repo root)"
+    depth_label = f"depth {payload['depth']}"
+    if requested_depth is not None and requested_depth != payload["depth"]:
+        depth_label = (
+            f"depth {payload['depth']} of {requested_depth} requested — "
+            f"{_TREE_BUDGET:,} char budget"
+        )
+    files = _count_label(payload["files"], "file", "files")
+    entities = _count_label(payload["entities"], "entity", "entities")
+    return f"{payload['project']} — {root_label} ({depth_label}): {files}, {entities}"
+
+
+def _render_tree(payload: dict, requested_depth: int | None = None) -> str:
+    lines = [_tree_header(payload, requested_depth)]
+    lines.extend(_format_tree_entry(entry) for entry in payload["entries"])
+    return "\n".join(lines)
+
+
+def _truncate_tree_entries(payload: dict, budget: int, requested_depth: int | None = None) -> str:
+    """Last-resort fallback when even depth=1 overflows budget: keep as many
+    entries as fit (in order), then a single deterministic '(+N more)' line
+    — never a mid-line cut."""
+    lines = [_tree_header(payload, requested_depth)]
+    entries = payload["entries"]
+    marker_reserve = len(f"(+{len(entries)} more)")
+    kept = 0
+    for entry in entries:
+        line = _format_tree_entry(entry)
+        projected_len = sum(len(l) + 1 for l in lines) + len(line) + marker_reserve + 1
+        if projected_len > budget:
+            break
+        lines.append(line)
+        kept += 1
+    remaining = len(entries) - kept
+    if remaining:
+        lines.append(f"(+{remaining} more)")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+@_watchdog
+def tree(path: str | None = None, depth: int = 2, project: str | None = None) -> str:
+    """Directory structure map of the repo: directories with aggregate file/
+    entity counts, files with per-kind entity counts (e.g. "2 Class, 5
+    Method"). Cheap, deterministic overview to orient before diving in — use
+    outline(file) next to see inside a file. `path` is a repo-relative
+    DIRECTORY path (e.g. "src/features"); absolute paths and file paths are
+    not accepted."""
+    if depth < 1:
+        raise ValueError("depth must be >= 1")
+    if depth > 10:
+        raise ValueError("depth must be <= 10")
+    resolved = _resolve_project(project)
+
+    payload = None
+    text = ""
+    for try_depth in range(depth, 0, -1):
+        payload = navigation.get_tree(resolved, path=path, depth=try_depth)
+        text = _render_tree(payload, requested_depth=depth)
+        if len(text) <= _TREE_BUDGET:
+            return text
+    return _truncate_tree_entries(payload, _TREE_BUDGET, requested_depth=depth)
 
 
 _MAX_FILE_LINES = 2_000
