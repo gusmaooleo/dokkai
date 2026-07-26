@@ -1,18 +1,25 @@
 """
 Navigation service — deterministic repo-structure maps computed straight
-from a project's ingested graph JSON (see :mod:`services.graph_store`).
+from a project's ingested graph JSON (see :mod:`services.graph_store`), plus
+per-file entity outlines that add a light Weaviate assist (1-line summaries)
+on top of the same graph-derived structure.
 
-Gives a coding agent the SHAPE of a repo in one cheap call: directories with
-aggregate (file, entity) counts, files with per-kind entity counts. No
-file-level summaries (that's a later feature) — zero LLM, zero Weaviate.
+Gives a coding agent the SHAPE of a repo (``get_tree``) or of a single file
+(``get_outline``) in one cheap call.
 """
 
 from __future__ import annotations
 
+import logging
+import re
 from typing import Any
 
 from services.chunker import CODE_ENTITY_LABELS
-from services.graph_store import Graph, get_graph
+from services.graph_store import Graph, get_graph, resolve_file
+from services.retriever import Retriever
+from services.weaviate_client import get_client
+
+logger = logging.getLogger(__name__)
 
 # In-memory directory tree node: "dirs" maps component name -> child node,
 # "files" maps filename -> {entity_kind: count} (empty dict = no entities).
@@ -174,4 +181,184 @@ def get_tree(project: str, path: str | None = None, depth: int = 2) -> dict[str,
         "files": files,
         "entities": entities,
         "entries": _render_entries(subtree, 1, depth),
+    }
+
+
+# ---------------------------------------------------------------------------
+# outline — per-file entity map
+# ---------------------------------------------------------------------------
+
+_SIGNATURE_MAX_CHARS = 120
+_SUMMARY_MAX_CHARS = 140
+_SENTENCE_END_RE = re.compile(r"[.!?](\s|$)")
+
+
+def _read_lines(absolute_path: str | None) -> list[str] | None:
+    """Read *absolute_path* into lines, or ``None`` if it can't be read —
+    signature lines are a best-effort disk read, never an error."""
+    if not absolute_path:
+        return None
+    try:
+        with open(absolute_path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.readlines()
+    except OSError:
+        return None
+
+
+def _signature_line(lines: list[str] | None, start_line: int | None) -> str | None:
+    """
+    An entity's first source line (disk-derived), stripped and capped at
+    ``_SIGNATURE_MAX_CHARS``. ``None`` (never an error) when *lines* is
+    unavailable (unreadable/missing file), *start_line* is missing/out of
+    range, or the line is blank after stripping.
+    """
+    if not lines or not start_line or start_line < 1 or start_line > len(lines):
+        return None
+    line = lines[start_line - 1].strip()
+    if not line:
+        return None
+    if len(line) > _SIGNATURE_MAX_CHARS:
+        # -1 so the ellipsis fits INSIDE the cap (the stated max is the max).
+        line = line[: _SIGNATURE_MAX_CHARS - 1].rstrip() + "…"
+    return line
+
+
+def _first_sentence(text: str, max_chars: int = _SUMMARY_MAX_CHARS) -> str:
+    """
+    First sentence of *text* (up to the first ``.``/``!``/``?`` followed by
+    whitespace or end-of-string), capped at *max_chars*. When the sentence
+    itself exceeds the cap, cuts at the last whole word inside it — never
+    mid-word (unlike ``search()``'s plain ``[:140]`` slice).
+    """
+    text = text.strip()
+    if not text:
+        return ""
+    match = _SENTENCE_END_RE.search(text)
+    sentence = text[: match.end()].strip() if match else text
+    if len(sentence) <= max_chars:
+        return sentence
+    truncated = sentence[: max_chars - 1]
+    last_space = truncated.rfind(" ")
+    if last_space > 0:
+        truncated = truncated[:last_space]
+    return truncated.rstrip() + "…"
+
+
+def _fetch_summaries(project: str, qualified_names: list[str]) -> tuple[dict[str, str], bool]:
+    """
+    Batch-fetch entity descriptions for *qualified_names* from Weaviate in
+    ONE round trip (see :meth:`services.retriever.Retriever._fetch_by_qnames`
+    — deterministic UUID lookup, the same pattern
+    :func:`services.graph_store._fetch_chunk_fields` uses for a single
+    entity). Degrades to ``({}, False)`` — logged, never raised — when
+    Weaviate is unreachable or the fetch itself fails; ``get_outline`` must
+    always succeed regardless of Weaviate's availability.
+    """
+    if not qualified_names:
+        return {}, True
+    try:
+        client = get_client()
+    except Exception as e:
+        logger.warning("outline: Weaviate unreachable, omitting summaries: %s", e)
+        return {}, False
+    try:
+        fetched = Retriever(client)._fetch_by_qnames(qualified_names, project)
+    except Exception as e:
+        logger.warning("outline: failed to fetch summaries for '%s': %s", project, e)
+        return {}, False
+    finally:
+        client.close()
+    return {qn: c.description for qn, c in fetched.items() if c.description}, True
+
+
+def get_outline(project: str, file: str) -> dict[str, Any]:
+    """
+    Assemble the per-file entity outline for *file* in *project*.
+
+    Resolves *file* through the same traversal-guarded mechanism as the MCP
+    ``get_file`` tool (:func:`services.graph_store.resolve_file` — relative
+    or absolute path), then collects the file's code-entity nodes
+    (Function/Method/Class/Interface/Type/Enum, matched by their own
+    ``path``), sorted by ``start_line``, with Methods nested under their
+    Class via ``DEFINES_METHOD`` edges (a Method whose Class isn't in this
+    file — not expected, but handled defensively — stays top-level).
+
+    Each entity carries a disk-derived ``signature`` (see
+    :func:`_signature_line`) and a Weaviate-derived one-line ``summary``
+    (see :func:`_first_sentence`), both ``None`` when unavailable —
+    ``summaries_available`` tells the caller whether that's because Weaviate
+    was unreachable or because the entity simply had no description.
+
+    A non-code file (e.g. a config or markdown file) is a valid outline with
+    an empty entity list — not an error.
+
+    Raises :class:`ValueError` (mirroring ``get_file``'s message) when
+    *file* doesn't resolve to a node in the project's graph.
+    """
+    node = resolve_file(project, file)
+    if node is None:
+        raise ValueError(
+            f"file '{file}' not found in project '{project}' graph — paths must match "
+            "the ingested tree (relative like src/a/b.ts or absolute)"
+        )
+
+    graph = get_graph(project)
+    file_path = node["path"]
+    entity_nodes = [
+        n
+        for n in graph.nodes
+        if n["labels"][0] in CODE_ENTITY_LABELS
+        and n.get("properties", {}).get("path") == file_path
+    ]
+    entity_ids = {n["node_id"] for n in entity_nodes}
+
+    parent_of: dict[int, int] = {}
+    for n in entity_nodes:
+        if n["labels"][0] != "Class":
+            continue
+        for rtype, target_id in graph.outgoing.get(n["node_id"], []):
+            if rtype == "DEFINES_METHOD" and target_id in entity_ids:
+                parent_of[target_id] = n["node_id"]
+
+    lines = _read_lines(node["absolute_path"] or node["path"])
+
+    qualified_names = [
+        n["properties"]["qualified_name"]
+        for n in entity_nodes
+        if n["properties"].get("qualified_name")
+    ]
+    summaries, summaries_available = _fetch_summaries(project, qualified_names)
+
+    def _to_entry(n: dict[str, Any]) -> dict[str, Any]:
+        props = n["properties"]
+        start_line = props.get("start_line")
+        qualified_name = props.get("qualified_name")
+        description = summaries.get(qualified_name) if qualified_name else None
+        return {
+            "kind": n["labels"][0],
+            "name": props.get("name"),
+            "qualified_name": qualified_name,
+            "start_line": start_line,
+            "end_line": props.get("end_line"),
+            "signature": _signature_line(lines, start_line),
+            "summary": _first_sentence(description) if description else None,
+            "methods": [],
+        }
+
+    entries_by_id = {n["node_id"]: _to_entry(n) for n in entity_nodes}
+
+    top_level: list[dict[str, Any]] = []
+    for n in sorted(entity_nodes, key=lambda n: n["properties"].get("start_line") or 0):
+        entry = entries_by_id[n["node_id"]]
+        parent_id = parent_of.get(n["node_id"])
+        if parent_id is not None:
+            entries_by_id[parent_id]["methods"].append(entry)
+        else:
+            top_level.append(entry)
+
+    return {
+        "project": project,
+        "file": file_path,
+        "entities": top_level,
+        "summaries_available": summaries_available,
     }

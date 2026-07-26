@@ -415,6 +415,68 @@ def tree(path: str | None = None, depth: int = 2, project: str | None = None) ->
     return _truncate_tree_entries(payload, _TREE_BUDGET, requested_depth=depth)
 
 
+_OUTLINE_BUDGET = 10_000
+
+
+def _render_outline_entity(entry: dict, indent: str = "") -> list[str]:
+    if entry["start_line"] and entry["end_line"]:
+        loc = f"lines {entry['start_line']}-{entry['end_line']}"
+    else:
+        loc = "location unknown"
+    lines = [f"{indent}[{entry['kind']}] {entry['name']} — {loc}"]
+    if entry["signature"]:
+        lines.append(f"{indent}  {entry['signature']}")
+    if entry["summary"]:
+        lines.append(f"{indent}  {entry['summary']}")
+    for method in entry["methods"]:
+        lines.extend(_render_outline_entity(method, indent + "  "))
+    return lines
+
+
+def _outline_entity_total(payload: dict) -> int:
+    """Total entities in the outline, nested methods included — must agree
+    with tree()'s per-file counts for the same file."""
+    return len(payload["entities"]) + sum(len(e["methods"]) for e in payload["entities"])
+
+
+def _outline_header(payload: dict) -> str:
+    note = "" if payload["summaries_available"] else " (Weaviate unreachable — no summaries)"
+    total = _count_label(_outline_entity_total(payload), "entity", "entities")
+    return f"{payload['project']} — {payload['file']} ({total}){note}"
+
+
+@mcp.tool()
+@_watchdog
+def outline(file: str, project: str | None = None) -> str:
+    """Per-file entity map: every Class/Function/Method/etc in a file, with
+    line ranges, a disk-derived signature line and a 1-line summary where
+    available (methods nested under their class). Pick the exact line range
+    you need here, then get_file(file, start_line, end_line) to read it.
+    `file` accepts a relative or absolute path (same resolution as
+    get_file)."""
+    resolved = _resolve_project(project)
+    payload = navigation.get_outline(resolved, file)
+
+    lines = [_outline_header(payload)]
+    entries = payload["entities"]
+    blocks = [_render_outline_entity(entry) for entry in entries]
+    marker_reserve = len(f"(+{_outline_entity_total(payload)} more entities)")
+    kept = 0
+    for block in blocks:
+        block_len = sum(len(l) + 1 for l in block)
+        projected = sum(len(l) + 1 for l in lines) + block_len + marker_reserve + 1
+        if projected > _OUTLINE_BUDGET:
+            break
+        lines.extend(block)
+        kept += 1
+    # The marker reports omitted ENTITIES (blocks plus their nested
+    # methods), matching the header's unit — not omitted render blocks.
+    remaining = sum(1 + len(e["methods"]) for e in entries[kept:])
+    if remaining:
+        lines.append(f"(+{_count_label(remaining, 'more entity', 'more entities')})")
+    return "\n".join(lines)
+
+
 _MAX_FILE_LINES = 2_000
 _MAX_FILE_BYTES = 100_000
 
