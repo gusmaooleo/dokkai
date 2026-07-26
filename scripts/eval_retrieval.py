@@ -16,6 +16,20 @@ Weaviate hybrid scores are RELATIVE_SCORE-normalized per response, so they
 are never comparable across queries or variants — every metric here is
 rank-based (hit@k, MRR, coverage), not score-based.
 
+Deterministic GIVEN an identical corpus + index state — NOT deterministic on
+score alone: exact score ties are common (``graph`` gives hop-N neighbours
+of the same parent IDENTICAL inherited scores), and a tie spanning the
+rank-10/11 boundary would otherwise flip hit@10 between two runs that
+retrieved the exact same set of chunks in a different, equally-valid order.
+Every variant's full result list is tie-broken ONCE, immediately after
+retrieval (``_stable_sort`` — key ``(-(score), qualified_name)``), before
+ANYTHING downstream reads it — ranks/hit@k/MRR/coverage, the W=10 window,
+raw_tokens10, and ``build_graph_context`` (context packing is order
+-dependent too, so tie-breaking only the window would leave context_tokens
+exposed to the same arbitrariness). This only reorders chunks whose scores
+are EXACTLY equal, where the pipeline's own order was always arbitrary —
+never changes which chunks are retrieved, only resolves ties consistently.
+
 A ``fixture: true`` dataset (e.g. ``scripts/eval_dataset_fixture.json``) is
 self-seeding: its synthetic corpus (``scripts/eval_fixture.py``) is upserted
 into the live collection under the dataset's ``project`` right before the
@@ -23,10 +37,21 @@ resolution pass, and removed again once the dataset finishes (``finally`` —
 survives a crash mid-run). Pass ``--keep-fixture`` to leave it seeded for
 manual inspection.
 
+``--json FILE`` writes the full machine-readable results (aggregates AND
+per-question rows — the private full report; stdout/``--out`` stay
+aggregate-only). ``--out FILE.md`` writes the same aggregate tables as
+stdout, as markdown. ``--compare BASELINE.json`` loads a previous ``--json``
+file and prints a delta view against the current run (informational only —
+never affects the exit code); anything present on only one side (a variant,
+category, or dataset) is listed under "not comparable", never silently
+dropped, and a changed stale-question set prints a loud warning banner
+before its deltas.
+
 Usage
 -----
     uv run python scripts/eval_retrieval.py \
-        [--dataset PATH ...] [--variants seeds,bm25,...] [--verbose] [--keep-fixture]
+        [--dataset PATH ...] [--variants seeds,bm25,...] [--verbose] [--keep-fixture] \
+        [--json FILE] [--out FILE.md] [--compare BASELINE.json]
 """
 
 from __future__ import annotations
@@ -41,7 +66,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-SRC = Path(__file__).resolve().parent.parent / "src"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+SRC = _REPO_ROOT / "src"
 sys.path.insert(0, str(SRC))
 
 # Load .env BEFORE importing services — same convention as
@@ -70,6 +96,20 @@ HIT_KS = (1, 3, 5, 10)
 EVAL_WINDOW = 10  # W=10 -- ranks beyond this don't score, even for graph
                   # variants that may return up to 30 results.
 DEFAULT_DATASET_GLOB = str(Path(__file__).resolve().parent / "eval_dataset_*.json")
+
+# --json output schema version — bump on any breaking structural change, so
+# --compare (or any external consumer) can detect an incompatible baseline
+# instead of silently misreading it.
+SCHEMA_VERSION = 1
+
+# Metrics compared numerically by --compare. Deliberately excludes "n"
+# (sample size) — a changed scored-question count is already surfaced by the
+# stale-set-changed warning, not a metric delta.
+COMPARE_METRICS = (
+    [f"entity_hit@{k}" for k in HIT_KS] + [f"file_hit@{k}" for k in HIT_KS]
+    + ["mrr_entity10", "mrr_file10", "coverage10", "abstention_rate", "waste_tokens",
+       "context_tokens", "raw_tokens10"]
+)
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +403,19 @@ VARIANTS: dict[str, Callable[[Retriever, str, str], list[RetrievedChunk]]] = {
 # Metrics
 # ---------------------------------------------------------------------------
 
+def _stable_sort(results: list[RetrievedChunk]) -> list[RetrievedChunk]:
+    """
+    MED-1: deterministic tie-break, applied ONCE to a variant's FULL result
+    list, immediately after retrieval — see the module docstring for why
+    (boundary ties at rank 10/11 are common, especially for ``graph``'s
+    hop-inherited scores, and were flipping hit@10 between otherwise
+    -identical runs; confirmed pre-existing since C2). Every downstream
+    consumer (ranks, the W=10 window, raw_tokens10, build_graph_context)
+    must read THIS list, never the raw retriever output.
+    """
+    return sorted(results, key=lambda c: (-(c.score or 0.0), c.qualified_name))
+
+
 def _match_ranks(
     results: list[RetrievedChunk], targets: list[Target], index: ProjectIndex, mode: str,
 ) -> list[int]:
@@ -390,7 +443,9 @@ def evaluate(
     question: Question, results: list[RetrievedChunk], index: ProjectIndex, retriever: Retriever,
 ) -> dict[str, Any]:
     """Per-(question, variant) record. ``results`` is the variant's full
-    ranked output (up to 30 for graph variants); rank-based metrics are
+    ranked output (up to 30 for graph variants), already tie-broken by the
+    caller (``_stable_sort`` — MUST be applied before calling this; ranks
+    below assume list order is authoritative); rank-based metrics are
     windowed to EVAL_WINDOW, token metrics use the full list except
     raw_tokens@10 which is explicitly top-10 only.
 
@@ -493,6 +548,41 @@ def _fmt(v: float | None, digits: int = 2) -> str:
     return "-" if v is None else f"{v:.{digits}f}"
 
 
+def _display_path(path: str) -> str:
+    """
+    Path as recorded in --json/--out output: relative to the REPO ROOT
+    (never cwd — cwd could be ``/``, which would resolve a relative input
+    through the *home directory* on some shells and leak the username; more
+    realistically, cwd varies by invocation and breaks --compare's dataset
+    keying across machines/directories). A dataset outside the repo (a
+    private dataset — the realistic case) falls back to ``Path(path).name``
+    (just the filename) — never the raw absolute string, which would leak
+    the full local path. This also makes a --json file portable: the same
+    dataset always keys identically regardless of where it was run from.
+
+    Never used for the console "Dataset: {path}" header — that keeps
+    printing the raw path exactly as before, unchanged from C1/C2.
+    """
+    try:
+        return str(Path(path).resolve().relative_to(_REPO_ROOT))
+    except ValueError:
+        return Path(path).name
+
+
+def _json_record(record: dict[str, Any]) -> dict[str, Any]:
+    """
+    JSON-safe copy of an ``evaluate()`` record: ``entity_hits``/``file_hits``
+    are ``{int: 0|1}`` dicts, and ``json.dump`` would silently stringify
+    those keys anyway — done explicitly here so the in-memory structure and
+    the round-tripped (loaded-from-disk) one always agree on key type.
+    """
+    out = dict(record)
+    for key in ("entity_hits", "file_hits"):
+        if key in out:
+            out[key] = {str(k): v for k, v in out[key].items()}
+    return out
+
+
 def _print_category_table(
     category: str, variant_names: list[str], rows: dict[str, dict], applicability: dict[str, int],
 ) -> None:
@@ -576,7 +666,13 @@ def _seed_fixture(client) -> tuple[int, str]:
 def run_dataset(
     path: str, client, retriever: Retriever, variant_names: list[str], *,
     verbose: bool, keep_fixture: bool = False,
-) -> None:
+) -> dict[str, Any] | None:
+    """
+    Runs one dataset, printing the exact same console report as before
+    (C1/C2 — unchanged, regardless of --json/--out/--compare). Additionally
+    returns a JSON-serializable result dict (None for an aborted/skipped
+    dataset — nothing meaningful to record) consumed by --json/--out.
+    """
     print(f"\n{'=' * 72}\nDataset: {path}")
     try:
         dataset = load_dataset(path)
@@ -587,7 +683,7 @@ def run_dataset(
         # (ImportError, from the lazy import in the fixture gate) must all
         # abort ONLY this dataset — never the whole run.
         print(f"  SCHEMA/LOAD ERROR — dataset aborted: {e}")
-        return
+        return None
 
     fixture_seeded = False
     try:
@@ -606,7 +702,7 @@ def run_dataset(
         print(f"  project: {dataset.project} ({index.object_count} objects)")
         if index.object_count == 0:
             print("  SKIPPED — project has 0 objects in Weaviate")
-            return
+            return None
 
         mark_stale(dataset, index)
         stale = [q for q in dataset.questions if q.stale]
@@ -618,12 +714,17 @@ def run_dataset(
 
         # records[category][variant] = list of per-question record dicts
         records: dict[str, dict[str, list[dict]]] = {c: {v: [] for v in variant_names} for c in CATEGORIES}
+        # --json's "questions" section (private full report — per-question
+        # rows never appear in stdout/--out, aggregate-only there).
+        questions_json: list[dict[str, Any]] = []
 
         for q in scored_questions:
+            variants_json: dict[str, Any] = {}
             for vname in variant_names:
-                results = VARIANTS[vname](retriever, q.query, dataset.project)
+                results = _stable_sort(VARIANTS[vname](retriever, q.query, dataset.project))
                 record = evaluate(q, results, index, retriever)
                 records[q.category][vname].append(record)
+                variants_json[vname] = _json_record(record)
                 if verbose:
                     bits = [f"[{q.id}] {q.category} variant={vname}"]
                     if q.category == "negation":
@@ -638,7 +739,11 @@ def run_dataset(
                         bits.append(f"described={record['all_described']}")
                     bits.append(f"tok={record['context_tokens']}/{record['raw_tokens10']}")
                     print("  " + " ".join(bits))
+            questions_json.append(
+                {"id": q.id, "category": q.category, "query": q.query, "variants": variants_json}
+            )
 
+        categories_json: dict[str, Any] = {}
         for category in CATEGORIES:
             cat_questions = [q for q in scored_questions if q.category == category]
             if not cat_questions:
@@ -651,6 +756,21 @@ def run_dataset(
                 "negation": len(cat_questions) if category == "negation" else 0,
             }
             _print_category_table(category, variant_names, rows, applicability)
+            categories_json[category] = {
+                "n_scored": len(cat_questions),
+                "applicable": applicability,
+                "variants": rows,
+            }
+
+        result = {
+            "path": _display_path(path),
+            "project": dataset.project,
+            "object_count": index.object_count,
+            "stale": [{"id": q.id, "reason": q.stale_reason} for q in stale],
+            "categories": categories_json,
+            "questions": questions_json,
+        }
+        return result
     finally:
         # Cleanup runs even if an exception blew up mid-run (a bad variant,
         # a crashed report, a partial _seed_fixture failure, ...) — a
@@ -674,6 +794,195 @@ def run_dataset(
                 )
 
 
+# ---------------------------------------------------------------------------
+# --json / --out / --compare
+# ---------------------------------------------------------------------------
+
+def build_payload(datasets: list[dict[str, Any]]) -> dict[str, Any]:
+    """The --json document: versioned, no timestamps, no absolute local
+    paths (see _display_path) — determinism + privacy (a saffira report
+    lives in gitignored dokkai_agent/, but the FORMAT must stay clean)."""
+    return {"schema_version": SCHEMA_VERSION, "datasets": datasets}
+
+
+_MD_HEADERS = (
+    ["variant"] + [f"eh@{k}" for k in HIT_KS] + [f"fh@{k}" for k in HIT_KS]
+    + ["eMRR@10", "fMRR@10", "cov@10", "abstain", "waste_tok", "ctx_tok", "raw_tok10"]
+)
+
+
+def _md_row(cells: list[str]) -> str:
+    return "| " + " | ".join(cells) + " |"
+
+
+def _md_metric_cells(agg: dict[str, Any]) -> list[str]:
+    cells = [_fmt(agg[f"entity_hit@{k}"]) for k in HIT_KS]
+    cells += [_fmt(agg[f"file_hit@{k}"]) for k in HIT_KS]
+    cells.append(_fmt(agg["mrr_entity10"], 3))
+    cells.append(_fmt(agg["mrr_file10"], 3))
+    cells.append(_fmt(agg["coverage10"]))
+    cells.append(_fmt(agg["abstention_rate"]))
+    cells.append(_fmt(agg["waste_tokens"], 0))
+    cells.append(_fmt(agg["context_tokens"], 0))
+    cells.append(_fmt(agg["raw_tokens10"], 0))
+    return cells
+
+
+def render_markdown(payload: dict[str, Any]) -> str:
+    """
+    Same content policy as stdout: aggregate tables only, no per-question
+    rows (those live in --json's "questions" section only). Built purely
+    from ``payload`` (no clock/env access), so two identical runs produce a
+    byte-identical file.
+    """
+    lines: list[str] = ["# Retrieval Eval Report", ""]
+    for ds in payload["datasets"]:
+        lines.append(f"## Dataset: {ds['path']}")
+        lines.append("")
+        lines.append(f"- project: `{ds['project']}` ({ds['object_count']} objects)")
+        if ds["stale"]:
+            # MED-2: ids ONLY — stale REASONS carry qualified_names/file
+            # paths verbatim, which is exactly the private per-question
+            # detail this artifact (designed for PR bodies) must not leak.
+            # Full reasons stay available in stdout and --json.
+            stale_ids = ", ".join(s["id"] for s in ds["stale"])
+            lines.append(f"- STALE ({len(ds['stale'])}): {stale_ids}")
+        lines.append("")
+        for category, cat in ds["categories"].items():
+            lines.append(f"### {category} ({cat['n_scored']} scored)")
+            lines.append("")
+            if category == "flow":
+                lines.append("cov@10 is entity-only: a same-file sibling does not count as covering the step.")
+                lines.append("")
+            app = cat["applicable"]
+            lines.append(
+                f"n= entity:{app['entity']} file:{app['file']} coverage:{app['coverage']} "
+                f"negation:{app['negation']} (of {cat['n_scored']} scored)"
+            )
+            lines.append("")
+            lines.append(_md_row(_MD_HEADERS))
+            lines.append(_md_row(["---"] * len(_MD_HEADERS)))
+            for vname, agg in cat["variants"].items():
+                lines.append(_md_row([vname] + _md_metric_cells(agg)))
+            lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _metric_digits(metric: str) -> int:
+    if metric in ("waste_tokens", "context_tokens", "raw_tokens10"):
+        return 0
+    if metric in ("mrr_entity10", "mrr_file10"):
+        return 3
+    return 2
+
+
+def _fmt_metric_delta(baseline_v: float, current_v: float, metric: str) -> str:
+    digits = _metric_digits(metric)
+    delta = current_v - baseline_v
+    sign = "+" if delta >= 0 else ""
+    return f"{metric}: {baseline_v:.{digits}f}->{current_v:.{digits}f} ({sign}{delta:.{digits}f})"
+
+
+def _dataset_key(ds: dict[str, Any]) -> str:
+    return f"{ds['path']}::{ds['project']}"
+
+
+def render_compare(current: dict[str, Any], baseline_path: str) -> None:
+    """
+    Delta view: current run vs. a previous --json file. Every
+    dataset+category+variant+metric present on BOTH sides gets a
+    baseline->current (delta) line — including zero deltas, so an identical
+    re-run visibly PROVES "no change" rather than going silent on it.
+    Anything present on only one side is listed under "not comparable",
+    never silently dropped. Never touches exit code (informational only).
+    """
+    try:
+        with open(baseline_path, encoding="utf-8") as f:
+            baseline = json.load(f)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        print(f"\n--compare: cannot read baseline {baseline_path!r}: {e}")
+        return
+
+    print(f"\n{'=' * 72}\nCompare vs baseline: {baseline_path}")
+    if baseline.get("schema_version") != SCHEMA_VERSION:
+        print(
+            f"  WARNING: baseline schema_version={baseline.get('schema_version')!r} != "
+            f"current {SCHEMA_VERSION!r} — comparison may not be meaningful"
+        )
+
+    baseline_by_key = {_dataset_key(d): d for d in baseline.get("datasets", [])}
+    current_by_key = {_dataset_key(d): d for d in current.get("datasets", [])}
+    not_comparable: list[str] = []
+
+    for key in sorted(set(baseline_by_key) | set(current_by_key)):
+        b_ds, c_ds = baseline_by_key.get(key), current_by_key.get(key)
+        if b_ds is None:
+            not_comparable.append(f"dataset {key!r}: only in current run")
+            continue
+        if c_ds is None:
+            not_comparable.append(f"dataset {key!r}: only in baseline")
+            continue
+
+        print(f"\n-- {key} --")
+
+        b_stale_ids = {s["id"] for s in b_ds.get("stale", [])}
+        c_stale_ids = {s["id"] for s in c_ds.get("stale", [])}
+        if b_stale_ids != c_stale_ids:
+            print("  " + "!" * 70)
+            print(
+                "  WARNING: stale question set CHANGED — baseline and current are scoring "
+                "a DIFFERENT set of questions; deltas below are not apples-to-apples."
+            )
+            print(f"    baseline-only stale: {sorted(b_stale_ids - c_stale_ids) or '-'}")
+            print(f"    current-only stale:  {sorted(c_stale_ids - b_stale_ids) or '-'}")
+            print("  " + "!" * 70)
+
+        b_cats, c_cats = b_ds.get("categories", {}), c_ds.get("categories", {})
+        for cat in sorted(set(b_cats) | set(c_cats)):
+            b_cat, c_cat = b_cats.get(cat), c_cats.get(cat)
+            if b_cat is None:
+                not_comparable.append(f"{key} / category {cat!r}: only in current run")
+                continue
+            if c_cat is None:
+                not_comparable.append(f"{key} / category {cat!r}: only in baseline")
+                continue
+
+            b_variants, c_variants = b_cat.get("variants", {}), c_cat.get("variants", {})
+            printed_category = False
+            for vname in sorted(set(b_variants) | set(c_variants)):
+                b_v, c_v = b_variants.get(vname), c_variants.get(vname)
+                if b_v is None:
+                    not_comparable.append(f"{key} / {cat} / variant {vname!r}: only in current run")
+                    continue
+                if c_v is None:
+                    not_comparable.append(f"{key} / {cat} / variant {vname!r}: only in baseline")
+                    continue
+                if not printed_category:
+                    print(f"  {cat}:")
+                    printed_category = True
+                pairs = []
+                for m in COMPARE_METRICS:
+                    bv, cv = b_v.get(m), c_v.get(m)
+                    if bv is None and cv is None:
+                        continue  # not applicable on EITHER side (e.g. coverage10 outside flow) — not an asymmetry
+                    if bv is None or cv is None:
+                        # LOW-2: one side has it, the other doesn't — a real
+                        # asymmetry (e.g. a metric added/removed between
+                        # schema revisions, or a question set change that
+                        # made a mode (in)applicable). LOUD, not a silent
+                        # drop from the average.
+                        side = "current" if bv is None else "baseline"
+                        not_comparable.append(f"{key} / {cat} / {vname} / metric {m!r}: only in {side}")
+                        continue
+                    pairs.append(_fmt_metric_delta(bv, cv, m))
+                print(f"    {vname}: " + (", ".join(pairs) if pairs else "no comparable metrics"))
+
+    if not_comparable:
+        print("\n  not comparable (present in only one run):")
+        for line in not_comparable:
+            print(f"    - {line}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -689,11 +998,48 @@ def parse_args() -> argparse.Namespace:
         "--keep-fixture", action="store_true",
         help="Skip cleanup of a seeded fixture dataset's chunks (for manual inspection)",
     )
+    parser.add_argument(
+        "--json", default=None, metavar="FILE",
+        help="Write the full machine-readable results (aggregates + per-question rows) to FILE",
+    )
+    parser.add_argument(
+        "--out", default=None, metavar="FILE.md",
+        help="Write the same aggregate tables as stdout to FILE.md (markdown)",
+    )
+    parser.add_argument(
+        "--compare", default=None, metavar="BASELINE.json",
+        help="Compare this run against a previous --json file (delta view, informational only)",
+    )
     return parser.parse_args()
+
+
+def _validate_writable(path: str, flag: str) -> None:
+    """
+    LOW-3(a): prove ``path`` is writable BEFORE the run does any real work —
+    a bad ``--json``/``--out`` path (e.g. a nonexistent directory) must fail
+    IMMEDIATELY, not after a full (possibly minutes-long) run. Opens in
+    APPEND mode and closes without writing: proves writability WITHOUT
+    truncating an existing file — a crash mid-run must never have already
+    destroyed an old baseline just because a path check ran first.
+    """
+    try:
+        with open(path, "a", encoding="utf-8"):
+            pass
+    except OSError as e:
+        print(f"Cannot write {flag} path {path!r}: {e}")
+        sys.exit(1)
 
 
 def main() -> None:
     args = parse_args()
+
+    # LOW-3(a): validated at argument time, before dataset resolution / any
+    # Weaviate work — a clean pre-run error, nothing runs.
+    if args.json:
+        _validate_writable(args.json, "--json")
+    if args.out:
+        _validate_writable(args.out, "--out")
+
     dataset_paths = args.dataset or sorted(glob.glob(DEFAULT_DATASET_GLOB))
     if not dataset_paths:
         print(f"No datasets found (default glob: {DEFAULT_DATASET_GLOB}); pass --dataset PATH")
@@ -710,15 +1056,47 @@ def main() -> None:
         sys.exit(1)
 
     client = get_client()
+    dataset_results: list[dict[str, Any]] = []
     try:
         retriever = Retriever(client)
         for path in dataset_paths:
-            run_dataset(
+            result = run_dataset(
                 path, client, retriever, variant_names,
                 verbose=args.verbose, keep_fixture=args.keep_fixture,
             )
+            if result is not None:
+                dataset_results.append(result)
     finally:
         client.close()
+
+    # --json/--out/--compare all key off the SAME in-memory payload, built
+    # unconditionally (cheap — just the already-computed aggregates/records)
+    # so --compare works standalone without requiring --json too.
+    payload = build_payload(dataset_results)
+
+    # LOW-3(b): --compare BEFORE the file writes below, so its output always
+    # lands even if a write fails (the append-mode pre-check above proves
+    # writability up front, but can't rule out a late TOCTOU failure — disk
+    # fills up mid-run, permissions revoked, ...).
+    if args.compare:
+        render_compare(payload, args.compare)
+
+    # LOW-3(c): still wrapped, for that same late-failure case — a clean
+    # one-line error instead of a traceback after a full run.
+    if args.json:
+        try:
+            with open(args.json, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+                f.write("\n")
+        except OSError as e:
+            print(f"Cannot write --json path {args.json!r}: {e}")
+
+    if args.out:
+        try:
+            with open(args.out, "w", encoding="utf-8") as f:
+                f.write(render_markdown(payload))
+        except OSError as e:
+            print(f"Cannot write --out path {args.out!r}: {e}")
 
 
 if __name__ == "__main__":
