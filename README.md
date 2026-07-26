@@ -23,6 +23,7 @@ Everything runs **100% locally** — Weaviate for vectors, Ollama for both embed
   - [Routines UI](#routines-ui)
 - [How it works](#how-it-works)
 - [Descriptions (Tier 2)](#descriptions-tier-2)
+- [Retrieval eval harness](#retrieval-eval-harness)
 - [Features](#features)
 - [Tech stack](#tech-stack)
 - [Prerequisites](#prerequisites)
@@ -680,6 +681,85 @@ Full pipeline run on `sample_back-end` (medium TS/Python backend), local Ollama,
 
 ---
 
+## Retrieval eval harness
+
+`scripts/eval_retrieval.py` is a deterministic (given an identical corpus
+and index state), LLM-free harness that measures retrieval quality — never
+an answer's correctness. Weaviate hybrid scores are `RELATIVE_SCORE`-normalized per
+response, so they're never comparable across queries or variants; every
+metric here is rank-based instead: hit@k (entity/file, k=1/3/5/10),
+eMRR@10/fMRR@10, entity-only coverage@10 for multi-target flow questions,
+abstention rate plus wasted tokens for negation probes (queries with no
+correct target), and context/raw top-10 token costs.
+
+**Run it:**
+
+```bash
+uv run python scripts/eval_retrieval.py
+```
+
+Bare, this runs the committed synthetic fixture dataset — 16 questions
+across 4 categories (identifier / conceptual / flow / negation)
+(`scripts/eval_dataset_fixture.json`) over a self-seeded 37-chunk synthetic
+corpus (`scripts/eval_fixture.py`). Flags:
+
+- `--dataset PATH` (repeatable) — bring your own dataset JSON instead of the default glob (`scripts/eval_dataset_*.json`)
+- `--variants seeds,bm25,...` — comma-separated subset of variants to run (default: all — see below)
+- `--verbose` — print per-question rows
+- `--json FILE` — write the full machine-readable results (aggregates + per-question rows)
+- `--out FILE.md` — write the aggregate-only tables as markdown
+- `--compare BASELINE.json` — signed delta view against a previous `--json` run — the before/after gate for retrieval changes
+- `--keep-fixture` — skip cleanup of a seeded fixture dataset, for manual inspection
+
+**Dataset schema** — plain JSON naming a Weaviate `project` and a list of `questions`:
+
+```json
+{
+  "project": "your-project",
+  "fixture": false,
+  "questions": [
+    {
+      "id": "ident-example",
+      "category": "identifier",
+      "query": "read_soil_moisture",
+      "expect": [{"qualified_name": "pkg.module.read_soil_moisture", "path": "src/module.py"}],
+      "notes": "optional free-text"
+    }
+  ]
+}
+```
+
+`category` is one of `identifier` / `conceptual` / `flow` / `negation`;
+`expect` lists one or more `{qualified_name, path}` targets (`path`
+optional) — a negation probe (a query with no correct target) uses
+`expect: []`. Before scoring, every target is resolved against a live
+cursor scan of the corpus (a drift detector): a target that no longer
+exists marks its whole question **stale** — excluded from aggregates and
+listed by id, never silently scored 0.
+
+**Caveat — this touches the live Weaviate collection.** A `fixture: true`
+dataset (like the committed one) self-seeds its synthetic corpus into your
+real collection under a dedicated project (`_eval_fixture`) right before
+scoring, and removes it again in a `finally` block once the run finishes
+(`--keep-fixture` to leave it seeded for manual inspection). Requires
+Weaviate and the embedding provider up — same prerequisites as ingestion.
+
+**Variants** (all go through the existing `Retriever`, no dedicated eval code path):
+
+| Variant | What it runs |
+| --- | --- |
+| `seeds` | Hybrid seed search only (vector + BM25, with the identifier fast-path) — no graph expansion |
+| `seeds-nofast` | Same seed search, with the identifier fast-path disabled |
+| `bm25` | BM25-only seed search — no vector, no graph expansion |
+| `graph` | Production retrieval: hybrid seeds plus graph expansion — the same path (and seed count) the MCP `context()` tool uses |
+| `graph-bm25` | BM25 seeds plus graph expansion — a fully deterministic, zero-embedding pipeline |
+
+**Workflow for retrieval changes:** capture a `--json` baseline before the
+change, make the change, then run again with `--compare BASELINE.json` —
+share the aggregate tables (not the full `--json`) in a PR.
+
+---
+
 ## Features
 
 - ✅ Full repo → dependency graph → vectorized chunks pipeline
@@ -698,6 +778,7 @@ Full pipeline run on `sample_back-end` (medium TS/Python backend), local Ollama,
 - ✅ **Frontend UI** — Next.js web app: streaming chat with sources, interactive dependency graph, conversation history, ingestion/job monitoring, LLM config and user administration, role-gated (see [Frontend UI](#frontend-ui))
 - ✅ **Code review & bug-hunt routines** _(experimental demo, not part of dokkai core — see disclaimer)_ — branch-vs-base review and free-text bug-hunt investigations (agentic tool loop, Ollama-native), both with graph-anchored findings, pushable playbooks and model-pulled skills, run as background jobs over the shared job system with a dedicated UI (see [Code review routines](#code-review-routines))
 - ✅ **One-command full stack** — `dokkai up --full` / `docker compose --profile full up -d` containerizes the API and frontend UI alongside Weaviate/Postgres/Memgraph (see [One-command full stack](#one-command-full-stack))
+- ✅ **Retrieval eval harness** (`scripts/eval_retrieval.py`) — deterministic, LLM-free rank-based quality metrics (hit@k, MRR, coverage, abstention, token cost) across 5 retrieval variants, with a self-seeded synthetic fixture, a stale-target drift detector, and `--compare` baseline deltas (see [Retrieval eval harness](#retrieval-eval-harness))
 
 ---
 
