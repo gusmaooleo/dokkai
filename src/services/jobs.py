@@ -327,7 +327,7 @@ def _run_pipeline_sync(job: Job) -> None:
         job.stage_progress = {"stage": stage, "done": done, "total": total}
         job.updated_at = _now()
 
-    async def _pipeline() -> tuple[str, dict]:
+    async def _pipeline() -> tuple[dict, dict]:
         report("cgr", 0, 0)
         ingest_result = await ingestByLocalRepository(job.repo_path)
         output_json = ingest_result["output_json"]
@@ -338,12 +338,15 @@ def _run_pipeline_sync(job: Job) -> None:
             describe=job.describe,
             progress=report,
         )
-        return output_json, vectorize_result
+        return ingest_result, vectorize_result
 
     try:
-        output_json, vectorize_result = asyncio.run(_pipeline())
+        ingest_result, vectorize_result = asyncio.run(_pipeline())
         job.result = {
-            "ingest": {"output_json": output_json},
+            "ingest": {
+                "output_json": ingest_result["output_json"],
+                "filter": ingest_result["filter"],
+            },
             "vectorize": vectorize_result,
         }
         job.status = "succeeded"
@@ -453,7 +456,12 @@ def _run_graph_only_sync(job: Job) -> None:
 
     try:
         ingest_result = asyncio.run(_graph())
-        job.result = {"ingest": {"output_json": ingest_result["output_json"]}}
+        job.result = {
+            "ingest": {
+                "output_json": ingest_result["output_json"],
+                "filter": ingest_result["filter"],
+            }
+        }
         job.status = "succeeded"
         job.stage = "done"
     except Exception as e:  # surface a readable error to the poller

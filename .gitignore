@@ -63,3 +63,4 @@ commits.md
 /dokkai_agent
 # Claude Code local setup (builder subagents, settings)
 /.claude/
+/.codex/

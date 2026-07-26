@@ -74,6 +74,16 @@ class LLMProvider(ABC):
 
     provider_name: str
 
+    @property
+    def context_window(self) -> int | None:
+        """
+        Input context window in tokens, when the provider reports/configures
+        one. ``None`` for remote providers (OpenAI/Anthropic) — dokkai
+        doesn't track their per-model limits here, so callers fall back to a
+        conservative constant (see ``services.chat._REMOTE_CTX_TOKENS``).
+        """
+        return None
+
     @abstractmethod
     async def chat(
         self,
@@ -324,6 +334,20 @@ class OllamaProvider(LLMProvider):
         # Keep the model resident in memory between requests. "-1" = stay loaded
         # indefinitely; a duration like "30m" lets Ollama unload it when idle.
         self._keep_alive = _parse_keep_alive(os.getenv("OLLAMA_KEEP_ALIVE", "-1"))
+
+    @property
+    def context_window(self) -> int | None:
+        # 0 (or negative) is a plausible OLLAMA_NUM_CTX value meaning "let
+        # Ollama pick its own default". Returning None here would send the
+        # caller to the large remote-provider fallback — a phantom window
+        # that re-enables the exact overflow the budget exists to kill. The
+        # server's own default is SMALL (2k–4k depending on version/model),
+        # so budget conservatively against 4096; set OLLAMA_NUM_CTX
+        # explicitly for a bigger window. (Note: the request still sends the
+        # user's literal num_ctx value — 0 delegates to the server.)
+        if self._num_ctx <= 0:
+            return 4096
+        return self._num_ctx
 
     async def chat(
         self,

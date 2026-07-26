@@ -628,16 +628,17 @@ see the demo disclaimer at the top of this section:
 **Ingestion pipeline** (`POST /instances/pipeline`):
 
 1. **Graph extraction** — [code-graph-rag](https://github.com/vitali87/code-graph-rag) (`cgr`) spins up an ephemeral Memgraph container and emits a JSON graph of the repo (4k+ nodes, 8k+ relationships for a medium backend).
-2. **Chunking** — each code entity (Class / Function / Method / Interface / Enum / Type) becomes one chunk containing a compact header, its **graph relations** (calls, called_by, inherits, …) and the **actual source code** sliced from the file.
-3. **Vectorization & storage** — chunks are written to Weaviate, which embeds them via Ollama (`nomic-embed-text`). Each object gets a **deterministic UUID** derived from `(project, qualified_name)`, so re‑ingestion upserts in place (no duplicates).
+2. **Gitignore-aware filtering** — the graph is filtered before anything else consumes it: paths matched by the repo's `.gitignore` (one batched, read-only `git check-ignore` — nested and global ignores respected) plus a curated set of build-artifact patterns cgr misses (`.next/`, `.nuxt/`, `storybook-static/`, `*.min.js`, `*.map`, …) are removed, nodes and edges alike. Build output never gets chunked, embedded, LLM-described, or ranked against real code. The job result reports what was filtered (`files_filtered_gitignore` / `files_filtered_defaults` / `git_status` — non-git directories degrade to the defaults-only path).
+3. **Chunking** — each code entity (Class / Function / Method / Interface / Enum / Type) becomes one chunk containing a compact header, its **graph relations** (calls, called_by, inherits, … — capped in the embedded text so hub entities don't poison their own vectors; full lists are stored as metadata) and the **actual source code** sliced from the file.
+4. **Vectorization & storage** — chunks are written to Weaviate, which embeds them via Ollama (`nomic-embed-text`). Each object gets a **deterministic UUID** derived from `(project, qualified_name)`, so re‑ingestion upserts in place (no duplicates), and chunks from files that no longer exist (or are now ignored) are **purged** after a successful re-ingest (`stale_chunks_purged` in the job result).
 
 **Retrieval** (`search_graph`):
 
-1. **Seeds** — hybrid search (vector + BM25) finds the entry points.
+1. **Seeds** — hybrid search (vector + BM25) finds the entry points. Identifier-shaped queries (e.g. `validate_token`) short-circuit this to an exact qualified-name lookup plus a keyword scan, falling back to hybrid search when nothing matches.
 2. **Graph expansion** — a breadth‑first walk over the stored `qualified_name` edges pulls in callers/callees/definitions, scored with per‑hop decay and edge weights, with hub‑node protection so a popular utility doesn't flood the context.
 3. **Context assembly** — results are ranked and formatted with provenance (`SEED` vs `hop 1 · calls ← X`) so the model understands the structure.
 
-**Generation** (`POST /chat`) — the connected context is injected into an audience‑specific prompt and streamed from the local Ollama model over Server‑Sent Events.
+**Generation** (`POST /chat`) — the connected context is injected into an audience‑specific prompt and streamed from the local Ollama model over Server‑Sent Events. The prompt is **token-budgeted against the provider's real context window** (Ollama's `num_ctx`): the retrieved context is sized before it is built, recent conversation history gets a guaranteed slice (oldest turns fall off first), and follow-up questions retrieve with the last user turns included — so "and where is it validated?" finds the referent instead of retrieving blind.
 
 ---
 
@@ -970,7 +971,7 @@ curl -X DELETE localhost:8000/auth/users/2 -H "Authorization: Bearer $TOKEN"
 | `POST` | `/routines/skills` | admin, user | Create a skill |
 | `PATCH` | `/routines/skills/{name}` | admin, user | Update a skill's `description`/`content` |
 | `DELETE` | `/routines/skills/{name}` | admin, user | Delete a skill |
-| `POST` | `/chat` | admin, user | Chat over the codebase (SSE: `sources` → `token` → `done`) |
+| `POST` | `/chat` | admin, user | Chat over the codebase (SSE: `sources` → `token` → `done`; if no LLM provider is configured, the stream instead emits a single `error` event with no `sources` and the user message is not persisted — no orphan conversation) |
 | `GET` | `/chat/conversations` | any | List conversations (persisted in Postgres; 503 if Postgres is unreachable) |
 | `GET` | `/chat/conversations/{id}` | any | Get a conversation's history (503 if Postgres is unreachable) |
 | `DELETE` | `/chat/conversations/{id}` | admin, user | Delete a conversation (503 if Postgres is unreachable) |
@@ -1068,7 +1069,7 @@ These are known and tracked in the [Roadmap](#roadmap):
 | 12 | CLI polish (agentic `srcs --agent` MCP loop, `watch` incremental re-ingestion, `doctor` diagnostics) | ✅ done (pending merge) |
 | 13 | Multi-codebase association (multiple labeled codebases per project, domain-tagged, for end-to-end system understanding) | planned |
 | 14 | Answer guardrails (grounding check to detect unanswerable/out-of-scope questions) | backlog |
-| 15 | Retrieval router (question-aware choice of retrieval strategy) | backlog |
+| 15 | Retrieval router (question-aware choice of retrieval strategy; a first identifier-shape heuristic already ships in the retriever) | backlog |
 | 16 | Native ingestion engine (in-house parsing, no external ingestion dependency, broader language coverage) | backlog |
 | 17 | Chat UI improvements (visualization/navigation of long conversations) | backlog |
 
