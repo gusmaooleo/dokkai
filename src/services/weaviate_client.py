@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
+
 import weaviate
 from weaviate.classes.config import Configure, Property, DataType
 from weaviate.classes.query import Filter
@@ -200,12 +202,76 @@ def _ensure_imports_property(client: weaviate.WeaviateClient) -> None:
         return
     logger.info("Added missing 'imports' property to collection '%s'", COLLECTION_NAME)
 
+# Per-call cap on Filter.by_id().contains_any(...) — keeps each delete_many
+# gRPC call bounded regardless of how many objects need removing.
+_DELETE_CHUNK_SIZE = 500
+
+
+def _uuids_matching(
+    collection,
+    *,
+    return_properties: list[str],
+    predicate: Callable[[dict], bool],
+) -> list[str]:
+    """
+    Cursor-scan EVERY object in the collection (``collection.iterator()`` —
+    no offset/``QUERY_MAXIMUM_RESULTS`` ceiling, unlike ``fetch_objects``'
+    offset paging — live-confirmed to raise at exactly 10,000 matched
+    objects), collecting the uuid of each whose *predicate* (evaluated on its
+    ``properties``) returns True.
+
+    Deliberately does NOT pass a server-side ``project_name`` filter to
+    narrow the scan: ``iterator()`` doesn't accept a ``filters`` argument on
+    weaviate-client 4.20.4 (confirmed via signature introspection) — but even
+    if it did, this schema's TEXT properties use the default WORD
+    tokenization, under which ``equal`` matches by "document's tokens are a
+    superset of the query's tokens", NOT literal string equality. Live
+    -confirmed cross-project contamination: ``Filter.by_property
+    ("project_name").equal("back-end")`` matches an object whose
+    ``project_name`` is ``"sample_back-end"``. *predicate* MUST do its own
+    exact (``==``) comparison — never trust a server-side text filter alone
+    for tenant isolation on this schema.
+    """
+    return [
+        str(obj.uuid)
+        for obj in collection.iterator(return_properties=return_properties)
+        if predicate(obj.properties)
+    ]
+
+
+def _delete_by_uuids(collection, uuids: list[str], *, context: str) -> int:
+    """
+    Delete objects by id, chunked at :data:`_DELETE_CHUNK_SIZE` per
+    ``delete_many`` call. Raises loudly on ANY failure — mirroring
+    ``upsert_chunks``' own ``batch.failed_objects`` convention ("fail loudly
+    instead of silently under-reporting") — rather than returning a
+    successful count that quietly omits failures. Returns the total
+    successful-delete count.
+    """
+    if not uuids:
+        return 0
+    successful = 0
+    failed = 0
+    for i in range(0, len(uuids), _DELETE_CHUNK_SIZE):
+        batch_uuids = uuids[i : i + _DELETE_CHUNK_SIZE]
+        result = collection.data.delete_many(where=Filter.by_id().contains_any(batch_uuids))
+        successful += result.successful
+        failed += result.failed
+    if failed:
+        raise RuntimeError(f"{context}: {failed}/{len(uuids)} objects failed to delete")
+    return successful
+
+
 def delete_project_chunks(client: weaviate.WeaviateClient, project_name: str) -> int:
     collection = client.collections.get(COLLECTION_NAME)
-    result = collection.data.delete_many(
-        where=Filter.by_property("project_name").equal(project_name),
+    uuids = _uuids_matching(
+        collection,
+        return_properties=["project_name"],
+        predicate=lambda props: props.get("project_name") == project_name,
     )
-    return result.successful
+    return _delete_by_uuids(
+        collection, uuids, context=f"delete_project_chunks(project_name={project_name!r})"
+    )
 
 def fetch_project_chunk_index(client: weaviate.WeaviateClient, project_name: str) -> dict[str, dict]:
     """
@@ -281,6 +347,8 @@ def upsert_chunks(
     client: weaviate.WeaviateClient,
     chunks: list[CodeChunk],
     ingestion_id: str,
+    *,
+    on_purge: Callable[[int], None] | None = None,
 ) -> int:
     # NOTE: chunker.CodeChunk.build_text now caps the relation lists it
     # embeds into chunk_text (_MAX_RELATION_ITEMS) — an already-ingested
@@ -338,13 +406,37 @@ def upsert_chunks(
         )
 
     # Remove entities left over from earlier ingests of this project (deleted at
-    # the source). Done AFTER a successful insert — deterministic UUIDs upsert
-    # current entities in place, so there is no wipe-then-fail data-loss window.
-    collection.data.delete_many(
-        where=Filter.all_of([
-            Filter.by_property("project_name").equal(project_name),
-            Filter.by_property("ingestion_id").not_equal(ingestion_id),
-        ])
+    # the source, or filtered out by ignore_rules on a re-ingest — feature 21).
+    # Done AFTER a successful insert — deterministic UUIDs upsert current
+    # entities in place, so there is no wipe-then-fail data-loss window.
+    #
+    # Deliberately NOT Filter.by_property("ingestion_id").not_equal(ingestion_id)
+    # (nor an `equal("project_name")` server-side filter to narrow the scan):
+    # confirmed live (Weaviate 1.28.4 / weaviate-client 4.20.4) that `not_equal`
+    # on a WORD-tokenized TEXT property never matches anything — even
+    # single-token values like "alpha" vs "beta" — and `equal` matches by
+    # token-superset, not exact string (`equal("back-end")` matches
+    # "sample_back-end"). See `_uuids_matching`'s docstring — this is the
+    # exact-client-side-match, no-10k-ceiling helper shared with
+    # `delete_project_chunks`.
+    stale_uuids = _uuids_matching(
+        collection,
+        return_properties=["project_name", "ingestion_id"],
+        predicate=lambda props: (
+            props.get("project_name") == project_name
+            and props.get("ingestion_id") != ingestion_id
+        ),
     )
+    purged = _delete_by_uuids(
+        collection,
+        stale_uuids,
+        context=f"upsert_chunks purge (project={project_name!r}, ingestion_id={ingestion_id!r})",
+    )
+    logger.info(
+        "upsert_chunks: purged %d stale chunk(s) for project '%s' (ingestion_id != '%s')",
+        purged, project_name, ingestion_id,
+    )
+    if on_purge is not None:
+        on_purge(purged)
 
     return len(seen_ids)
