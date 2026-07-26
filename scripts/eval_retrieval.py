@@ -16,14 +16,17 @@ Weaviate hybrid scores are RELATIVE_SCORE-normalized per response, so they
 are never comparable across queries or variants — every metric here is
 rank-based (hit@k, MRR, coverage), not score-based.
 
-C1 is read-only: it does not seed fixtures (``fixture: true`` datasets just
-print a note and expect the project to already exist — fixture seeding is a
-later commit).
+A ``fixture: true`` dataset (e.g. ``scripts/eval_dataset_fixture.json``) is
+self-seeding: its synthetic corpus (``scripts/eval_fixture.py``) is upserted
+into the live collection under the dataset's ``project`` right before the
+resolution pass, and removed again once the dataset finishes (``finally`` —
+survives a crash mid-run). Pass ``--keep-fixture`` to leave it seeded for
+manual inspection.
 
 Usage
 -----
     uv run python scripts/eval_retrieval.py \
-        [--dataset PATH ...] [--variants seeds,bm25,...] [--verbose]
+        [--dataset PATH ...] [--variants seeds,bm25,...] [--verbose] [--keep-fixture]
 """
 
 from __future__ import annotations
@@ -54,7 +57,13 @@ from services.retriever import (  # noqa: E402
     VECTOR_CODE,
     VECTOR_SUMMARY,
 )
-from services.weaviate_client import COLLECTION_NAME, get_client  # noqa: E402
+from services.weaviate_client import (  # noqa: E402
+    COLLECTION_NAME,
+    delete_project_chunks,
+    ensure_collection,
+    get_client,
+    upsert_chunks,
+)
 
 CATEGORIES = ("identifier", "conceptual", "flow", "negation")
 HIT_KS = (1, 3, 5, 10)
@@ -100,17 +109,26 @@ def _parse_target(raw: Any, qid: str) -> Target:
     if not isinstance(raw, dict):
         raise DatasetError(f"question {qid!r}: expect entry must be an object, got {raw!r}")
     qn, path = raw.get("qualified_name"), raw.get("path")
-    if qn is not None and not isinstance(qn, str):
-        raise DatasetError(f"question {qid!r}: expect.qualified_name must be a string, got {qn!r}")
-    if path is not None and not isinstance(path, str):
-        raise DatasetError(f"question {qid!r}: expect.path must be a string, got {path!r}")
+    if qn is not None:
+        if not isinstance(qn, str):
+            raise DatasetError(f"question {qid!r}: expect.qualified_name must be a string, got {qn!r}")
+        if not qn:
+            # LOW-C: an empty string is a value, not "absent" — reject it
+            # outright rather than silently leaving a target with no real
+            # signal that still counts toward "(N scored)".
+            raise DatasetError(f"question {qid!r}: expect.qualified_name must not be empty")
+    if path is not None:
+        if not isinstance(path, str):
+            raise DatasetError(f"question {qid!r}: expect.path must be a string, got {path!r}")
+        if not path:
+            raise DatasetError(f"question {qid!r}: expect.path must not be empty")
     if qn is None and path is None:
         raise DatasetError(f"question {qid!r}: expect entry needs qualified_name and/or path")
     return Target(qualified_name=qn, path=path)
 
 
 def load_dataset(path: str) -> Dataset:
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         raw = json.load(f)
 
     if not isinstance(raw, dict):
@@ -119,6 +137,22 @@ def load_dataset(path: str) -> Dataset:
     if not isinstance(project, str) or not project:
         raise DatasetError(f"{path}: 'project' is required and must be a non-empty string")
     fixture = bool(raw.get("fixture", False))
+    if fixture:
+        # MED-1(b)/LOW-3: a fixture dataset MUST target eval_fixture's own
+        # project — otherwise a typo'd/foreign `project` would seed the
+        # synthetic corpus under a real project name, and `run_dataset`'s
+        # cleanup (which, per MED-1(d), always deletes eval_fixture's own
+        # PROJECT_NAME) would silently miss the mismatch instead of
+        # protecting it. Caught here as a normal SCHEMA/LOAD ERROR — a
+        # one-dataset abort — rather than surfacing later as a raw
+        # RuntimeError that kills the whole run. Local import: only a
+        # `fixture: true` dataset ever needs eval_fixture.
+        import eval_fixture
+
+        if project != eval_fixture.PROJECT_NAME:
+            raise DatasetError(
+                f"{path}: fixture datasets must use project={eval_fixture.PROJECT_NAME!r}, got {project!r}"
+            )
     raw_questions = raw.get("questions")
     if not isinstance(raw_questions, list) or not raw_questions:
         raise DatasetError(f"{path}: 'questions' is required and must be a non-empty list")
@@ -153,6 +187,17 @@ def load_dataset(path: str) -> Dataset:
                 raise DatasetError(f"question {qid!r}: negation questions must have expect: []")
         elif not expect:
             raise DatasetError(f"question {qid!r}: category {category!r} needs >=1 expect target")
+
+        if category == "flow":
+            # LOW-B: not a schema error (the target is otherwise valid) —
+            # just a heads-up that coverage@10 is entity-only (LOW-5), so a
+            # path-only target can never contribute to it.
+            for t in expect:
+                if t.qualified_name is None:
+                    print(
+                        f"  WARNING: question {qid!r} (flow) has a path-only target "
+                        f"({t.path!r}) — it can never count toward cov@10, coverage is entity-only"
+                    )
 
         questions.append(Question(
             id=qid, category=category, query=query, expect=expect,
@@ -448,13 +493,24 @@ def _fmt(v: float | None, digits: int = 2) -> str:
     return "-" if v is None else f"{v:.{digits}f}"
 
 
-def _print_category_table(category: str, variant_names: list[str], rows: dict[str, dict]) -> None:
+def _print_category_table(
+    category: str, variant_names: list[str], rows: dict[str, dict], applicability: dict[str, int],
+) -> None:
     n_scored = next(iter(rows.values()))["n"] if rows else 0
     print(f"\n-- {category} ({n_scored} scored) --")
     if category == "flow":
         # LOW-5: state the entity-only rule where it's read, not just in the
         # docstring — a same-file sibling never counts as covering a step.
         print("  cov@10 is entity-only: a same-file sibling does not count as covering the step")
+    # LOW-A: eh@k/fh@k/MRR/coverage/negation each average over a DIFFERENT
+    # subset of these n_scored questions (a question mixing entity-only and
+    # file-only targets contributes to only one column each) — without this,
+    # a mean over 1 question reads as a mean over all n_scored.
+    print(
+        f"  n= entity:{applicability['entity']} file:{applicability['file']} "
+        f"coverage:{applicability['coverage']} negation:{applicability['negation']} "
+        f"(of {n_scored} scored)"
+    )
 
     # Uniform column set across every category table: "-" fills wherever a
     # category's questions don't carry that metric (coverage@10 is only ever
@@ -484,63 +540,138 @@ def _print_category_table(category: str, variant_names: list[str], rows: dict[st
         print("  ".join(c.ljust(w) for c, w in zip(cells, widths)))
 
 
-def run_dataset(path: str, client, retriever: Retriever, variant_names: list[str], *, verbose: bool) -> None:
+def _seed_fixture(client) -> tuple[int, str]:
+    """
+    Seed the synthetic fixture corpus (``scripts/eval_fixture.py``) into the
+    live collection under ``eval_fixture.PROJECT_NAME`` — ``load_dataset()``
+    already enforced ``dataset.project == PROJECT_NAME`` for any
+    ``fixture: true`` dataset, so this never takes a caller-supplied project
+    name. Seeded via the same ``upsert_chunks`` plumbing real ingestion uses.
+    """
+    import eval_fixture  # local import: only needed for fixture datasets
+
+    # LOW-1: only create/upgrade the collection when it doesn't already
+    # exist. ensure_collection() unconditionally inherits the
+    # DOKKAI_RECREATE_COLLECTION escape hatch, which DROPS THE ENTIRE
+    # collection (every project, not just the fixture's) — never call it
+    # when the collection is already there.
+    if not client.collections.exists(COLLECTION_NAME):
+        ensure_collection(client)
+
+    chunks = eval_fixture.build_chunks()
+    if not chunks:
+        # MED-1(c): a programming error (or a hostile monkeypatch), not a
+        # dataset problem — an empty list makes the per-chunk project_name
+        # guard below vacuously true, which would otherwise let a broken
+        # fixture "seed" 0 objects while still marking fixture_seeded and
+        # triggering a (harmless here, but silently wrong) cleanup pass.
+        raise RuntimeError("eval_fixture.build_chunks() returned no chunks")
+    if any(c.project_name != eval_fixture.PROJECT_NAME for c in chunks):
+        raise RuntimeError(
+            f"eval_fixture.build_chunks() chunks must all carry project_name={eval_fixture.PROJECT_NAME!r}"
+        )
+    return upsert_chunks(client, chunks, ingestion_id="eval-fixture-seed"), eval_fixture.PROJECT_NAME
+
+
+def run_dataset(
+    path: str, client, retriever: Retriever, variant_names: list[str], *,
+    verbose: bool, keep_fixture: bool = False,
+) -> None:
     print(f"\n{'=' * 72}\nDataset: {path}")
     try:
         dataset = load_dataset(path)
-    except (DatasetError, OSError, json.JSONDecodeError) as e:
+    except (DatasetError, OSError, json.JSONDecodeError, UnicodeDecodeError, ImportError) as e:
         # MED-1: a nonexistent path (OSError), malformed JSON
-        # (JSONDecodeError) and a schema violation (DatasetError) must all
+        # (JSONDecodeError), a non-UTF-8 file (UnicodeDecodeError), a schema
+        # violation (DatasetError) and a missing/broken eval_fixture module
+        # (ImportError, from the lazy import in the fixture gate) must all
         # abort ONLY this dataset — never the whole run.
         print(f"  SCHEMA/LOAD ERROR — dataset aborted: {e}")
         return
 
-    if dataset.fixture:
-        print("  fixture seeding not yet implemented, expecting project to exist")
+    fixture_seeded = False
+    try:
+        if dataset.fixture:
+            # LOW-2: set BEFORE calling _seed_fixture, not after it returns —
+            # a partial failure (real chunks already upserted, then an
+            # exception, e.g. from upsert_chunks' own failed_objects check)
+            # must still be swept by the finally below. A no-op cleanup on
+            # the rare case nothing was actually written yet is a cheap
+            # price for that guarantee.
+            fixture_seeded = True
+            seeded, seeded_project = _seed_fixture(client)
+            print(f"  seeded {seeded} fixture chunk(s) under project={seeded_project!r}")
 
-    index = resolve_project(client, dataset.project)
-    print(f"  project: {dataset.project} ({index.object_count} objects)")
-    if index.object_count == 0:
-        print("  SKIPPED — project has 0 objects in Weaviate")
-        return
+        index = resolve_project(client, dataset.project)
+        print(f"  project: {dataset.project} ({index.object_count} objects)")
+        if index.object_count == 0:
+            print("  SKIPPED — project has 0 objects in Weaviate")
+            return
 
-    mark_stale(dataset, index)
-    stale = [q for q in dataset.questions if q.stale]
-    scored_questions = [q for q in dataset.questions if not q.stale]
-    if stale:
-        print(f"  STALE questions ({len(stale)}, excluded from aggregates):")
-        for q in stale:
-            print(f"    [{q.id}] {q.stale_reason}")
+        mark_stale(dataset, index)
+        stale = [q for q in dataset.questions if q.stale]
+        scored_questions = [q for q in dataset.questions if not q.stale]
+        if stale:
+            print(f"  STALE questions ({len(stale)}, excluded from aggregates):")
+            for q in stale:
+                print(f"    [{q.id}] {q.stale_reason}")
 
-    # records[category][variant] = list of per-question record dicts
-    records: dict[str, dict[str, list[dict]]] = {c: {v: [] for v in variant_names} for c in CATEGORIES}
+        # records[category][variant] = list of per-question record dicts
+        records: dict[str, dict[str, list[dict]]] = {c: {v: [] for v in variant_names} for c in CATEGORIES}
 
-    for q in scored_questions:
-        for vname in variant_names:
-            results = VARIANTS[vname](retriever, q.query, dataset.project)
-            record = evaluate(q, results, index, retriever)
-            records[q.category][vname].append(record)
-            if verbose:
-                bits = [f"[{q.id}] {q.category} variant={vname}"]
-                if q.category == "negation":
-                    bits.append(f"abstained={record['abstained']}")
-                else:
-                    if "entity_hits" in record:
-                        bits.append(f"eh@1={record['entity_hits'][1]} eMRR={record['mrr_entity']:.3f}")
-                    if "file_hits" in record:
-                        bits.append(f"fh@1={record['file_hits'][1]} fMRR={record['mrr_file']:.3f}")
-                    if "coverage" in record:
-                        bits.append(f"cov={record['coverage']:.2f}")
-                    bits.append(f"described={record['all_described']}")
-                bits.append(f"tok={record['context_tokens']}/{record['raw_tokens10']}")
-                print("  " + " ".join(bits))
+        for q in scored_questions:
+            for vname in variant_names:
+                results = VARIANTS[vname](retriever, q.query, dataset.project)
+                record = evaluate(q, results, index, retriever)
+                records[q.category][vname].append(record)
+                if verbose:
+                    bits = [f"[{q.id}] {q.category} variant={vname}"]
+                    if q.category == "negation":
+                        bits.append(f"abstained={record['abstained']}")
+                    else:
+                        if "entity_hits" in record:
+                            bits.append(f"eh@1={record['entity_hits'][1]} eMRR={record['mrr_entity']:.3f}")
+                        if "file_hits" in record:
+                            bits.append(f"fh@1={record['file_hits'][1]} fMRR={record['mrr_file']:.3f}")
+                        if "coverage" in record:
+                            bits.append(f"cov={record['coverage']:.2f}")
+                        bits.append(f"described={record['all_described']}")
+                    bits.append(f"tok={record['context_tokens']}/{record['raw_tokens10']}")
+                    print("  " + " ".join(bits))
 
-    for category in CATEGORIES:
-        cat_questions = [q for q in scored_questions if q.category == category]
-        if not cat_questions:
-            continue
-        rows = {v: aggregate(records[category][v]) for v in variant_names}
-        _print_category_table(category, variant_names, rows)
+        for category in CATEGORIES:
+            cat_questions = [q for q in scored_questions if q.category == category]
+            if not cat_questions:
+                continue
+            rows = {v: aggregate(records[category][v]) for v in variant_names}
+            applicability = {
+                "entity": sum(1 for q in cat_questions if any(t.qualified_name is not None for t in q.expect)),
+                "file": sum(1 for q in cat_questions if any(_target_path(t, index) is not None for t in q.expect)),
+                "coverage": len(cat_questions) if category == "flow" else 0,
+                "negation": len(cat_questions) if category == "negation" else 0,
+            }
+            _print_category_table(category, variant_names, rows, applicability)
+    finally:
+        # Cleanup runs even if an exception blew up mid-run (a bad variant,
+        # a crashed report, a partial _seed_fixture failure, ...) — a
+        # seeded fixture must never leak into the live shared collection.
+        if fixture_seeded:
+            # MED-1(d): belt and suspenders on top of load_dataset()'s
+            # project==PROJECT_NAME check — cleanup ALWAYS targets
+            # eval_fixture's own constant, never dataset.project, so this
+            # can never be tricked (or mistakenly edited) into deleting an
+            # arbitrary project. Import is cheap here: eval_fixture is
+            # already in sys.modules from _seed_fixture (or load_dataset).
+            import eval_fixture
+
+            if keep_fixture:
+                print(f"  --keep-fixture: leaving seeded chunks under project={eval_fixture.PROJECT_NAME!r}")
+            else:
+                removed = delete_project_chunks(client, eval_fixture.PROJECT_NAME)
+                print(
+                    f"  fixture cleanup: removed {removed} chunk(s) "
+                    f"from project={eval_fixture.PROJECT_NAME!r}"
+                )
 
 
 def parse_args() -> argparse.Namespace:
@@ -554,6 +685,10 @@ def parse_args() -> argparse.Namespace:
         help=f"Comma-separated variant names to run (default: all — {','.join(VARIANTS)})",
     )
     parser.add_argument("--verbose", action="store_true", help="Print per-question rows")
+    parser.add_argument(
+        "--keep-fixture", action="store_true",
+        help="Skip cleanup of a seeded fixture dataset's chunks (for manual inspection)",
+    )
     return parser.parse_args()
 
 
@@ -578,7 +713,10 @@ def main() -> None:
     try:
         retriever = Retriever(client)
         for path in dataset_paths:
-            run_dataset(path, client, retriever, variant_names, verbose=args.verbose)
+            run_dataset(
+                path, client, retriever, variant_names,
+                verbose=args.verbose, keep_fixture=args.keep_fixture,
+            )
     finally:
         client.close()
 
