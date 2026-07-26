@@ -628,8 +628,9 @@ see the demo disclaimer at the top of this section:
 **Ingestion pipeline** (`POST /instances/pipeline`):
 
 1. **Graph extraction** — [code-graph-rag](https://github.com/vitali87/code-graph-rag) (`cgr`) spins up an ephemeral Memgraph container and emits a JSON graph of the repo (4k+ nodes, 8k+ relationships for a medium backend).
-2. **Chunking** — each code entity (Class / Function / Method / Interface / Enum / Type) becomes one chunk containing a compact header, its **graph relations** (calls, called_by, inherits, …) and the **actual source code** sliced from the file.
-3. **Vectorization & storage** — chunks are written to Weaviate, which embeds them via Ollama (`nomic-embed-text`). Each object gets a **deterministic UUID** derived from `(project, qualified_name)`, so re‑ingestion upserts in place (no duplicates).
+2. **Gitignore-aware filtering** — the graph is filtered before anything else consumes it: paths matched by the repo's `.gitignore` (one batched, read-only `git check-ignore` — nested and global ignores respected) plus a curated set of build-artifact patterns cgr misses (`.next/`, `.nuxt/`, `storybook-static/`, `*.min.js`, `*.map`, …) are removed, nodes and edges alike. Build output never gets chunked, embedded, LLM-described, or ranked against real code. The job result reports what was filtered (`files_filtered_gitignore` / `files_filtered_defaults` / `git_status` — non-git directories degrade to the defaults-only path).
+3. **Chunking** — each code entity (Class / Function / Method / Interface / Enum / Type) becomes one chunk containing a compact header, its **graph relations** (calls, called_by, inherits, … — capped in the embedded text so hub entities don't poison their own vectors; full lists are stored as metadata) and the **actual source code** sliced from the file.
+4. **Vectorization & storage** — chunks are written to Weaviate, which embeds them via Ollama (`nomic-embed-text`). Each object gets a **deterministic UUID** derived from `(project, qualified_name)`, so re‑ingestion upserts in place (no duplicates), and chunks from files that no longer exist (or are now ignored) are **purged** after a successful re-ingest (`stale_chunks_purged` in the job result).
 
 **Retrieval** (`search_graph`):
 
@@ -637,7 +638,7 @@ see the demo disclaimer at the top of this section:
 2. **Graph expansion** — a breadth‑first walk over the stored `qualified_name` edges pulls in callers/callees/definitions, scored with per‑hop decay and edge weights, with hub‑node protection so a popular utility doesn't flood the context.
 3. **Context assembly** — results are ranked and formatted with provenance (`SEED` vs `hop 1 · calls ← X`) so the model understands the structure.
 
-**Generation** (`POST /chat`) — the connected context is injected into an audience‑specific prompt and streamed from the local Ollama model over Server‑Sent Events.
+**Generation** (`POST /chat`) — the connected context is injected into an audience‑specific prompt and streamed from the local Ollama model over Server‑Sent Events. The prompt is **token-budgeted against the provider's real context window** (Ollama's `num_ctx`): the retrieved context is sized before it is built, recent conversation history gets a guaranteed slice (oldest turns fall off first), and follow-up questions retrieve with the last user turns included — so "and where is it validated?" finds the referent instead of retrieving blind.
 
 ---
 
