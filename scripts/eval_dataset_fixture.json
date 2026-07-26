@@ -1,0 +1,150 @@
+{
+  "project": "_eval_fixture",
+  "fixture": true,
+  "questions": [
+    {
+      "id": "ident-snake",
+      "category": "identifier",
+      "query": "read_soil_moisture",
+      "expect": [
+        {"qualified_name": "greenhouse.services.sensor_service.read_soil_moisture",
+         "path": "src/services/sensor_service.py"}
+      ]
+    },
+    {
+      "id": "ident-camel",
+      "category": "identifier",
+      "query": "calculateNutrientMix",
+      "expect": [
+        {"qualified_name": "greenhouse.services.nutrient_service.calculateNutrientMix",
+         "path": "src/services/nutrient_service.py"}
+      ]
+    },
+    {
+      "id": "ident-dotted",
+      "category": "identifier",
+      "query": "greenhouse.controllers.irrigation_controller.IrrigationController.handle_watering_request",
+      "expect": [
+        {"qualified_name": "greenhouse.controllers.irrigation_controller.IrrigationController.handle_watering_request",
+         "path": "src/controllers/irrigation_controller.py"}
+      ]
+    },
+    {
+      "id": "ident-class",
+      "category": "identifier",
+      "query": "IrrigationController",
+      "expect": [
+        {"qualified_name": "greenhouse.controllers.irrigation_controller.IrrigationController",
+         "path": "src/controllers/irrigation_controller.py"}
+      ]
+    },
+    {
+      "id": "concept-moisture",
+      "category": "conceptual",
+      "query": "how does the system read moisture levels from the soil",
+      "expect": [
+        {"qualified_name": "greenhouse.services.sensor_service.read_soil_moisture",
+         "path": "src/services/sensor_service.py"}
+      ]
+    },
+    {
+      "id": "concept-watering",
+      "category": "conceptual",
+      "query": "how are watering requests handled for a greenhouse zone",
+      "expect": [
+        {"qualified_name": "greenhouse.controllers.irrigation_controller.IrrigationController.handle_watering_request",
+         "path": "src/controllers/irrigation_controller.py"}
+      ]
+    },
+    {
+      "id": "concept-notify",
+      "category": "conceptual",
+      "query": "how does the system send notifications to the operator",
+      "expect": [
+        {"qualified_name": "greenhouse.services.notification_service.NotificationService.notify",
+         "path": "src/services/notification_service.py"}
+      ]
+    },
+    {
+      "id": "concept-scheduler",
+      "category": "conceptual",
+      "query": "how does the scheduler run the daily greenhouse tasks",
+      "expect": [
+        {"qualified_name": "greenhouse.scheduler.greenhouse_scheduler.GreenhouseScheduler.run_daily_tasks",
+         "path": "src/scheduler/greenhouse_scheduler.py"}
+      ]
+    },
+    {
+      "id": "flow-watering-chain",
+      "category": "flow",
+      "query": "trace how a watering request flows from the controller down to the moisture sensor driver",
+      "expect": [
+        {"qualified_name": "greenhouse.controllers.irrigation_controller.IrrigationController.handle_watering_request",
+         "path": "src/controllers/irrigation_controller.py"},
+        {"qualified_name": "greenhouse.services.zone_service.ZoneService.get_zone_status",
+         "path": "src/services/zone_service.py"},
+        {"qualified_name": "greenhouse.services.sensor_service.read_soil_moisture",
+         "path": "src/services/sensor_service.py"},
+        {"qualified_name": "greenhouse.drivers.moisture_sensor_driver.read_raw_value",
+         "path": "src/drivers/moisture_sensor_driver.py"}
+      ]
+    },
+    {
+      "id": "flow-nutrient-chain",
+      "category": "flow",
+      "query": "trace how the nutrient mix is calculated and then mixed into a fertilizer batch",
+      "expect": [
+        {"qualified_name": "greenhouse.services.nutrient_service.calculateNutrientMix",
+         "path": "src/services/nutrient_service.py"},
+        {"qualified_name": "greenhouse.services.nutrient_service.mixFertilizerBatch",
+         "path": "src/services/nutrient_service.py"}
+      ]
+    },
+    {
+      "id": "flow-alert-chain",
+      "category": "flow",
+      "query": "trace how a low moisture alert gets raised and delivered as a notification",
+      "expect": [
+        {"qualified_name": "greenhouse.services.alert_service.raise_low_moisture_alert",
+         "path": "src/services/alert_service.py"},
+        {"qualified_name": "greenhouse.services.notification_service.NotificationService.notify",
+         "path": "src/services/notification_service.py"}
+      ]
+    },
+    {
+      "id": "flow-climate-chain",
+      "category": "flow",
+      "query": "trace how adjusting the temperature controls the roof vent position",
+      "expect": [
+        {"qualified_name": "greenhouse.controllers.climate_controller.ClimateController.adjust_temperature",
+         "path": "src/controllers/climate_controller.py"},
+        {"qualified_name": "greenhouse.services.actuator_service.set_vent_position",
+         "path": "src/services/actuator_service.py"}
+      ]
+    },
+    {
+      "id": "neg-chess",
+      "category": "negation",
+      "query": "the Sicilian Defense chess opening strategy",
+      "expect": []
+    },
+    {
+      "id": "neg-mortgage",
+      "category": "negation",
+      "query": "long-term fixed-rate home mortgage refinancing",
+      "expect": []
+    },
+    {
+      "id": "neg-shakespeare",
+      "category": "negation",
+      "query": "describe the plot of a Shakespearean tragedy involving a Danish prince",
+      "expect": []
+    },
+    {
+      "id": "neg-baking",
+      "category": "negation",
+      "query": "how do I convert a recipe from cups to grams for baking bread",
+      "expect": []
+    }
+  ]
+}
