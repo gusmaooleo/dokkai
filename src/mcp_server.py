@@ -477,6 +477,155 @@ def outline(file: str, project: str | None = None) -> str:
     return "\n".join(lines)
 
 
+_PATH_BUDGET = 4_000
+
+
+_PATH_VIA_EXTERNAL_NOTE = (
+    "note: this path only connects through external modules — weak structural coupling"
+)
+
+
+def _format_path_node(index: int, node: dict) -> str:
+    loc = node["absolute_path"] or node["path"] or ""
+    if loc and node.get("start_line") is not None:
+        loc += f":{node['start_line']}"
+    # LOW-3: a pathless node (~32 anonymous nested functions in the corpus,
+    # no `path`/`absolute_path` property at all) gets no location suffix —
+    # never a dangling "— :N"; get_entity(qname) is the fallback.
+    suffix = f" — {loc}" if loc else ""
+    kind_label = f"{node['kind']}, external" if node.get("is_external") else node["kind"]
+    return f"{index + 1}. [{kind_label}] {node['qualified_name']}{suffix}"
+
+
+def _format_path_hop(hop: dict) -> str:
+    arrow = f"-{hop['type']}->" if hop["direction"] == "out" else f"<-{hop['type']}-"
+    return f"   {arrow}"
+
+
+def _path_node_groups(nodes: list[dict], hops: list[dict]) -> list[list[str]]:
+    """One render group per node: its own line plus its OUTGOING hop line
+    (if any) — the atomic unit truncation keeps or drops whole, never
+    splitting a node from its hop line."""
+    groups = []
+    for i, node in enumerate(nodes):
+        group = [_format_path_node(i, node)]
+        if i < len(hops):
+            group.append(_format_path_hop(hops[i]))
+        groups.append(group)
+    return groups
+
+
+def _path_header(payload: dict) -> str:
+    return (
+        f"{payload['project']} — '{payload['source']}' to '{payload['target']}' "
+        f"({_count_label(len(payload['hops']), 'hop', 'hops')})"
+    )
+
+
+def _render_path(payload: dict) -> str:
+    if not payload["found"]:
+        edge_types = ", ".join(payload["edge_types"])
+        return (
+            f"{payload['project']} — no path from '{payload['source']}' to "
+            f"'{payload['target']}' within {_count_label(payload['max_depth'], 'hop', 'hops')} "
+            f"(edge types: {edge_types}). Try neighbors() on each endpoint, "
+            "or raise max_depth."
+        )
+
+    lines = [_path_header(payload)]
+    for group in _path_node_groups(payload["nodes"], payload["hops"]):
+        lines.extend(group)
+    if payload["via_external"]:
+        lines.append(_PATH_VIA_EXTERNAL_NOTE)
+    return "\n".join(lines)
+
+
+def _truncate_path(payload: dict, budget: int) -> str:
+    """
+    INFO-4 fallback for an over-budget render — keeps BOTH endpoints: a head
+    growing from the source and a tail growing from the target, with a
+    single exact ``(… N hops omitted …)`` marker in between. Whole node+hop
+    groups only (never a mid-line cut), grown greedily one group at a time
+    alternating head/tail so a realistic path shows as much of both ends as
+    fits. The per-step budget check reserves the WORST-CASE marker width
+    (all hops omitted) — a conservative overestimate, same "+1 per line"
+    margin as tree's/outline's truncation helpers — so the result is never
+    over budget, only occasionally short of the true limit by a few chars.
+    """
+    header = _path_header(payload)
+    note = _PATH_VIA_EXTERNAL_NOTE if payload["via_external"] else None
+    reserved_note_len = len(note) + 1 if note else 0
+    groups = _path_node_groups(payload["nodes"], payload["hops"])
+    total = len(groups)
+    worst_marker = len(f"(… {total} hops omitted …)")
+
+    def _fits(h: int, t: int) -> bool:
+        kept_lines = [header]
+        for g in groups[:h]:
+            kept_lines.extend(g)
+        kept_lines.append("#" * worst_marker)
+        for g in groups[total - t :] if t else []:
+            kept_lines.extend(g)
+        return sum(len(l) + 1 for l in kept_lines) + reserved_note_len <= budget
+
+    head = tail = 0
+    grow_head = True
+    while head + tail < total:
+        candidate = (head + 1, tail) if grow_head else (head, tail + 1)
+        if not _fits(*candidate):
+            break
+        head, tail = candidate
+        grow_head = not grow_head
+
+    lines = [header]
+    for g in groups[:head]:
+        lines.extend(g)
+    if head + tail < total:
+        # Drop the last head group's dangling arrow — it points into the
+        # elided region. With it gone, rendered hop lines + omitted equals
+        # the path's total hops exactly, in every regime (incl. head or
+        # tail == 0 under degenerate budgets).
+        if head and len(groups[head - 1]) == 2:
+            lines.pop()
+        rendered_hops = (head - 1 if head else 0) + (tail - 1 if tail else 0)
+        omitted_hops = len(payload["hops"]) - rendered_hops
+        lines.append(f"(… {omitted_hops} hops omitted …)")
+    for g in (groups[total - tail :] if tail else []):
+        lines.extend(g)
+    if note:
+        lines.append(note)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+@_watchdog
+def path(source: str, target: str, max_depth: int = 10, project: str | None = None) -> str:
+    """Shortest structural route between two entities — answers "how does X
+    reach Y" for e2e wiring questions. Undirected BFS over calls/inherits/
+    implements/overrides/defines/imports edges, excluding third-party
+    external modules (e.g. mongoose, express) as pass-through hubs — a path
+    that only connects via one is still returned, marked `[Module,
+    external]` with a weak-coupling note, never silently preferred over a
+    real app-level route. The result is the shortest STRUCTURAL connection,
+    not necessarily the runtime call narrative. When a mutual edge exists in
+    both directions between two nodes, the rendered arrow reflects whichever
+    direction the deterministic tie-break selects — both are equally true.
+    Call search() first to get exact qualified_name endpoints (Module
+    qualified_names work too, since import edges connect modules)."""
+    if max_depth < 1:
+        raise ValueError("max_depth must be >= 1")
+    if max_depth > 20:
+        raise ValueError("max_depth must be <= 20")
+    resolved = _resolve_project(project)
+    payload = navigation.get_path(resolved, source, target, max_depth=max_depth)
+    if not payload["found"]:
+        return _render_path(payload)
+    text = _render_path(payload)
+    if len(text) <= _PATH_BUDGET:
+        return text
+    return _truncate_path(payload, _PATH_BUDGET)
+
+
 _MAX_FILE_LINES = 2_000
 _MAX_FILE_BYTES = 100_000
 

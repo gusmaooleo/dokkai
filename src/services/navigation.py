@@ -15,7 +15,14 @@ import re
 from typing import Any
 
 from services.chunker import CODE_ENTITY_LABELS
-from services.graph_store import Graph, get_graph, resolve_file
+from services.graph_store import (
+    Graph,
+    NEIGHBORHOOD_EDGE_TYPES,
+    get_graph,
+    normalize_node,
+    resolve_entity,
+    resolve_file,
+)
 from services.retriever import Retriever
 from services.weaviate_client import get_client
 
@@ -361,4 +368,216 @@ def get_outline(project: str, file: str) -> dict[str, Any]:
         "file": file_path,
         "entities": top_level,
         "summaries_available": summaries_available,
+    }
+
+
+# ---------------------------------------------------------------------------
+# path — shortest structural route between two entities
+# ---------------------------------------------------------------------------
+
+# The neighborhood edge set plus IMPORTS — module-level import edges become
+# followable here so two entities connected only through their modules'
+# import wiring (not a direct call) still resolve to a path. CONTAINS_* stays
+# excluded (it would connect virtually everything through the folder tree,
+# making "shortest path" meaningless).
+_PATH_EDGE_TYPES = NEIGHBORHOOD_EDGE_TYPES | {"IMPORTS"}
+
+
+def _is_external(node: dict[str, Any]) -> bool:
+    return bool(node.get("properties", {}).get("is_external"))
+
+
+def _node_payload(node: dict[str, Any]) -> dict[str, Any]:
+    """``normalize_node``'s shape plus ``is_external`` — needed to mark
+    external-hub nodes in a ``via_external`` path's render; ``normalize_node``
+    itself omits the property."""
+    payload = normalize_node(node)
+    payload["is_external"] = _is_external(node)
+    return payload
+
+
+def _path_neighbors(graph: Graph, node_id: int, edge_types: set[str]) -> list[tuple[int, str, str]]:
+    """
+    ``(neighbor_id, edge_type, direction)`` reachable from *node_id* over
+    *edge_types*, in BOTH directions (undirected traversal). ``direction`` is
+    ``"out"`` when the stored edge is ``node_id -[edge_type]-> neighbor_id``,
+    ``"in"`` when it's ``neighbor_id -[edge_type]-> node_id``.
+    """
+    neighbors = [
+        (nid, rtype, "out") for rtype, nid in graph.outgoing.get(node_id, []) if rtype in edge_types
+    ]
+    neighbors += [
+        (nid, rtype, "in") for rtype, nid in graph.incoming.get(node_id, []) if rtype in edge_types
+    ]
+    return neighbors
+
+
+def _reconstruct_path(
+    parent: dict[int, tuple[int, str, str]], source_id: int, target_id: int
+) -> tuple[list[int], list[tuple[int, int, str, str]]]:
+    """Walk ``parent`` pointers from *target_id* back to *source_id*, then
+    reverse into source->target order. Each hop is ``(from_id, to_id,
+    edge_type, direction)`` — ``direction`` as in :func:`_path_neighbors`,
+    relative to ``from_id``."""
+    hops: list[tuple[int, int, str, str]] = []
+    node_id = target_id
+    while node_id != source_id:
+        parent_id, rtype, direction = parent[node_id]
+        hops.append((parent_id, node_id, rtype, direction))
+        node_id = parent_id
+    hops.reverse()
+    node_ids = [source_id] + [to_id for (_from_id, to_id, _rtype, _direction) in hops]
+    return node_ids, hops
+
+
+def _bfs_path(
+    graph: Graph,
+    source_id: int,
+    target_id: int,
+    edge_types: set[str],
+    max_depth: int,
+    *,
+    exclude_external: bool = False,
+) -> tuple[list[int] | None, list[tuple[int, int, str, str]] | None]:
+    """
+    Undirected BFS from *source_id* to *target_id* over *edge_types*, up to
+    *max_depth* hops. Returns ``(node_ids, hops)`` for the first shortest
+    path found (see :func:`_reconstruct_path`), or ``(None, None)`` when no
+    path exists within *max_depth*.
+
+    ``exclude_external=True`` (phase 1 of the two-phase search — decision
+    PATH-external) refuses to traverse THROUGH any node whose
+    ``properties.is_external`` is truthy: such a candidate is skipped
+    entirely UNLESS it's the target itself, so an explicitly-resolved
+    external endpoint (e.g. someone asking for a path TO ``express``) still
+    resolves — only pass-through external hubs (mongoose, express, vitest —
+    the corpus's highest-degree nodes) are excluded as intermediates.
+
+    Deterministic across processes: each BFS layer's frontier, and each
+    node's candidate neighbors, are sorted by ``node_id`` (an int assigned at
+    ingestion — stable within a graph JSON and immune to PYTHONHASHSEED,
+    unlike Python's hash-based set/dict iteration order) before being
+    walked, so ties among multiple shortest paths always resolve to the same
+    one.
+    """
+    parent: dict[int, tuple[int, str, str]] = {}
+    visited = {source_id}
+    frontier = [source_id]
+    for _ in range(max_depth):
+        next_frontier: list[int] = []
+        for node_id in frontier:
+            candidates = sorted(_path_neighbors(graph, node_id, edge_types))
+            for neighbor_id, rtype, direction in candidates:
+                if neighbor_id in visited:
+                    continue
+                if (
+                    exclude_external
+                    and neighbor_id != target_id
+                    and _is_external(graph.node_by_id[neighbor_id])
+                ):
+                    continue
+                visited.add(neighbor_id)
+                parent[neighbor_id] = (node_id, rtype, direction)
+                if neighbor_id == target_id:
+                    return _reconstruct_path(parent, source_id, target_id)
+                next_frontier.append(neighbor_id)
+        frontier = sorted(next_frontier)
+        if not frontier:
+            break
+    return None, None
+
+
+def get_path(project: str, source: str, target: str, max_depth: int = 10) -> dict[str, Any]:
+    """
+    Assemble the shortest structural-path payload between *source* and
+    *target* entities in *project*'s graph.
+
+    Endpoints resolve via :func:`services.graph_store.resolve_entity` — the
+    same resolution ``neighbors()``/``get_entity()`` use, so Module
+    qualified_names work too (IMPORTS edges connect Modules, not just code
+    entities).
+
+    TWO-PHASE search (decision PATH-external — third-party hubs like
+    mongoose/express/vitest otherwise tunnel 70% of shortest paths into a
+    false "these are close" reading): phase 1 is undirected BFS over
+    :data:`_PATH_EDGE_TYPES` excluding external nodes as intermediates (see
+    :func:`_bfs_path`'s ``exclude_external``) — this is the real
+    app-level structural coupling. Only when phase 1 finds nothing within
+    *max_depth* does phase 2 re-run the same BFS unrestricted; a phase-2 hit
+    sets ``via_external=True`` in the payload (rendered with a weak-coupling
+    note). Both phases share the identical deterministic tie-break.
+
+    ``source == target`` returns a trivial one-node path (``found=True``,
+    zero hops) — not an error. No path within *max_depth* hops (in EITHER
+    phase) returns ``found=False`` — also not an error, a normal outcome for
+    two genuinely unrelated entities.
+
+    The returned dict ALWAYS carries ``found``, ``via_external``,
+    ``max_depth`` and ``edge_types`` regardless of outcome (trivial / found /
+    not-found), so callers never need to branch on key presence.
+
+    Raises :class:`ValueError` (mirroring ``get_entity``'s message) when
+    *source* or *target* doesn't resolve to an entity in the project's
+    graph. Callers are expected to have already validated *max_depth*.
+    """
+    graph = get_graph(project)
+    source_node = resolve_entity(graph, source)
+    if source_node is None:
+        raise ValueError(f"entity '{source}' not found in project '{project}' — try search first")
+    target_node = resolve_entity(graph, target)
+    if target_node is None:
+        raise ValueError(f"entity '{target}' not found in project '{project}' — try search first")
+
+    source_id = source_node["node_id"]
+    target_id = target_node["node_id"]
+    edge_types = sorted(_PATH_EDGE_TYPES)
+
+    if source_id == target_id:
+        return {
+            "project": project,
+            "source": source,
+            "target": target,
+            "found": True,
+            "via_external": False,
+            "max_depth": max_depth,
+            "edge_types": edge_types,
+            "nodes": [_node_payload(source_node)],
+            "hops": [],
+        }
+
+    node_ids, hops = _bfs_path(
+        graph, source_id, target_id, _PATH_EDGE_TYPES, max_depth, exclude_external=True
+    )
+    via_external = False
+    if node_ids is None:
+        node_ids, hops = _bfs_path(
+            graph, source_id, target_id, _PATH_EDGE_TYPES, max_depth, exclude_external=False
+        )
+        via_external = node_ids is not None
+
+    if node_ids is None:
+        return {
+            "project": project,
+            "source": source,
+            "target": target,
+            "found": False,
+            "via_external": False,
+            "max_depth": max_depth,
+            "edge_types": edge_types,
+            "nodes": [],
+            "hops": [],
+        }
+
+    return {
+        "project": project,
+        "source": source,
+        "target": target,
+        "found": True,
+        "via_external": via_external,
+        "max_depth": max_depth,
+        "edge_types": edge_types,
+        "nodes": [_node_payload(graph.node_by_id[nid]) for nid in node_ids],
+        "hops": [
+            {"type": rtype, "direction": direction} for (_from_id, _to_id, rtype, direction) in hops
+        ],
     }
