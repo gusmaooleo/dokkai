@@ -39,17 +39,23 @@ from services.weaviate_client import count_chunks_by_project, get_client
 # to loop/re-call tools without it — see scripts/mcp_harness.py's SYSTEM_PROMPT
 # for the same phrasing pattern proven there).
 _INSTRUCTIONS_DEFAULT = (
-    "Explore an ingested codebase: start with search(query) to find seed entities, "
-    "then use neighbors()/get_entity() to explore call graph and read code, and "
-    "get_file() for raw file ranges. Use context() for a one-shot answer bundle."
+    "Explore an ingested codebase. Orient with tree() for the repo's shape, then "
+    "narrow with outline(file) to map a file's entities or search(query) for seed "
+    "entities by name/concept. Read ONLY the chosen range via get_file(path, "
+    "start_line, end_line) — never fetch a whole file when a range will do. Use neighbors()/"
+    "get_entity() to explore the call graph and read code, path(source, target) to "
+    "answer \"how does X reach Y\", and context() for a one-shot answer bundle."
 )
 _INSTRUCTIONS_SMALL_MODEL = (
     "Explore an ingested codebase. Call ONE tool, then check if its result already "
-    "answers the question. Start with search(query) or context(query) for seed "
-    "entities, grep_project(pattern) for a known identifier, neighbors()/get_entity() "
-    "for call graph and code, get_file() for raw ranges. Never call the same tool "
-    "with the same arguments twice. As soon as you have enough information, STOP "
-    "calling tools and answer as plain text."
+    "answers the question. Orient with tree() for the repo's shape, narrow with "
+    "outline(file) or search(query)/context(query) for seed entities, "
+    "grep_project(pattern) for a known identifier, neighbors()/get_entity() for call "
+    "graph and code, path(source, target) for how X reaches Y, get_file(path, "
+    "start_line, end_line) for raw ranges — read ONLY the range you need, never a "
+    "whole file. Never "
+    "call the same tool with the same arguments twice. As soon as you have enough "
+    "information, STOP calling tools and answer as plain text."
 )
 _MCP_PROFILE = os.getenv("DOKKAI_MCP_PROFILE")
 
@@ -171,7 +177,8 @@ def list_projects() -> str:
 @_watchdog
 def search(query: str, project: str | None = None, k: int = 8) -> str:
     """Hybrid (semantic + keyword) search for code entities matching a query.
-    Returns ranked hits with qname, location and score."""
+    Returns ranked hits with qname, location and score. For a hit's whole
+    file, call outline(file) next."""
     if k < 1:
         raise ValueError("k must be >= 1")
     resolved = _resolve_project(project)
@@ -192,8 +199,7 @@ def search(query: str, project: str | None = None, k: int = 8) -> str:
         score = f"{c.score:.2f}" if c.score is not None else "n/a"
         lines.append(f"{i}. [{c.entity_type}] {c.qualified_name} — {loc} (score {score})")
         if c.description:
-            desc = c.description[:140]
-            lines.append(f"   {desc}")
+            lines.append(f"   {navigation.first_sentence(c.description)}")
     return "\n".join(lines)
 
 
@@ -282,7 +288,8 @@ def neighbors(
     limit: int = 30,
 ) -> str:
     """Graph neighborhood of an entity (calls/inherits/implements/overrides/
-    defines), BFS up to depth hops. direction: in|out|both."""
+    defines), BFS up to depth hops, each with a best-effort 1-line summary
+    when Weaviate has one. direction: in|out|both."""
     if direction not in ("in", "out", "both"):
         raise ValueError("direction must be one of: in, out, both")
     if depth < 1:
@@ -294,6 +301,12 @@ def neighbors(
         resolved, entity=qualified_name, depth=depth, direction=direction, limit=limit
     )
 
+    # Best-effort, ONE batched round trip — degrades to {} (no summary lines,
+    # no error) when Weaviate is unreachable, preserving neighbors()'s
+    # offline behavior exactly.
+    qnames = [node["qualified_name"] for node in result["nodes"] if node.get("qualified_name")]
+    summaries, _ = navigation.fetch_summaries(resolved, qnames)
+
     index_of: dict[int, int] = {}
     lines = []
     for i, node in enumerate(result["nodes"], 1):
@@ -302,6 +315,9 @@ def neighbors(
         if node.get("start_line") is not None:
             loc += f":{node['start_line']}"
         lines.append(f"{i}. hop={node['hop']} [{node['kind']}] {node['qualified_name']} — {loc}")
+        summary = summaries.get(node["qualified_name"])
+        if summary:
+            lines.append(f"   {navigation.first_sentence(summary)}")
 
     for edge in result["edges"]:
         src = index_of.get(edge["source"])
@@ -396,9 +412,10 @@ def tree(path: str | None = None, depth: int = 2, project: str | None = None) ->
     """Directory structure map of the repo: directories with aggregate file/
     entity counts, files with per-kind entity counts (e.g. "2 Class, 5
     Method"). Cheap, deterministic overview to orient before diving in — use
-    outline(file) next to see inside a file. `path` is a repo-relative
-    DIRECTORY path (e.g. "src/features"); absolute paths and file paths are
-    not accepted."""
+    outline(file) next to see inside a file. `path` is a DIRECTORY path,
+    relative (e.g. "src/features") or absolute under the project's repo
+    root (stripped automatically); a file path raises a hint to use
+    outline() instead."""
     if depth < 1:
         raise ValueError("depth must be >= 1")
     if depth > 10:
@@ -639,7 +656,9 @@ def get_file(
     end_line: int | None = None,
 ) -> str:
     """Read a file from the ingested project tree by path (relative or
-    absolute), optionally restricted to a 1-indexed inclusive line range."""
+    absolute), optionally restricted to a 1-indexed inclusive line range.
+    Call outline(file) first to pick the exact range — avoid fetching a
+    whole file when a range will do."""
     resolved = _resolve_project(project)
     node = resolve_file(resolved, path)
     if node is None:

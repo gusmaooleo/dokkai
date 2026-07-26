@@ -18,6 +18,7 @@ from services.chunker import CODE_ENTITY_LABELS
 from services.graph_store import (
     Graph,
     NEIGHBORHOOD_EDGE_TYPES,
+    _derive_repo_path,
     get_graph,
     normalize_node,
     resolve_entity,
@@ -99,14 +100,58 @@ def _compute_aggregates(node: _DirNode) -> tuple[int, int]:
     return files, entities
 
 
+def _is_file_path(root: _DirNode, normalized: str) -> bool:
+    """Whether *normalized* (a repo-relative path, no leading/trailing
+    slashes) names a FILE in *root*'s tree — used to give a targeted hint
+    instead of the generic "not found" error."""
+    parts = normalized.split("/")
+    node = root
+    for part in parts[:-1]:
+        if part not in node["dirs"]:
+            return False
+        node = node["dirs"][part]
+    return parts[-1] in node["files"]
+
+
+def _resolve_tree_path_input(graph: Graph, path: str | None) -> str | None:
+    """
+    Normalize *path* for :func:`_navigate`. A repo-relative directory path
+    (or ``None``) passes through unchanged. An ABSOLUTE path gets the
+    project's repo root stripped — derived the same way
+    :func:`services.graph_store.resolve_file` resolution does (see
+    :func:`services.graph_store._derive_repo_path`) — so
+    ``tree(path="<repo_root>/src")`` behaves exactly like
+    ``tree(path="src")``. An absolute path that isn't under the repo root
+    raises a targeted :class:`ValueError` instead of falling through to the
+    generic "not found" hint.
+    """
+    if not path or not path.startswith("/"):
+        return path
+    repo_root = _derive_repo_path(graph)
+    if repo_root and (path == repo_root or path.startswith(repo_root + "/")):
+        return path[len(repo_root) :].strip("/")
+    hint = f" (repo root: {repo_root})" if repo_root else ""
+    raise ValueError(
+        f"path '{path}' is an absolute path but not under the project's repo root{hint}"
+    )
+
+
 def _navigate(root: _DirNode, path: str | None) -> _DirNode:
-    """Resolve *path* (relative directory path, or ``None``/empty for the
-    repo root) to its tree node. Raises :class:`ValueError` with a few
-    top-level candidates when *path* doesn't resolve to a directory."""
+    """Resolve *path* (repo-relative directory path, already stripped of any
+    repo-root prefix by :func:`_resolve_tree_path_input`, or ``None``/empty
+    for the repo root) to its tree node. Raises :class:`ValueError` — with a
+    "that's a file" hint when *path* names a file (see :func:`_is_file_path`),
+    else a few top-level candidates — when *path* doesn't resolve to a
+    directory."""
     if not path:
         return root
+    normalized = path.strip("/")
+    if _is_file_path(root, normalized):
+        raise ValueError(
+            f"path '{path}' is a file, not a directory — use outline('{path}') to see inside it"
+        )
     node = root
-    for part in path.strip("/").split("/"):
+    for part in normalized.split("/"):
         if part not in node["dirs"]:
             candidates = sorted(root["dirs"])[:8]
             hint = ", ".join(candidates) if candidates else "(no subdirectories)"
@@ -164,26 +209,30 @@ def get_tree(project: str, path: str | None = None, depth: int = 2) -> dict[str,
     """
     Assemble the directory-tree payload for *project*.
 
-    ``path`` scopes the tree to a subtree root (relative directory path,
-    e.g. ``src/features``); ``None``/empty selects the repo root. ``depth``
-    is how many directory levels below the root to expand — deeper
-    directories still get a line (aggregate counts) but aren't expanded
-    further. Callers are expected to have already validated ``depth``.
+    ``path`` scopes the tree to a subtree root — a repo-relative directory
+    path (e.g. ``src/features``) or an absolute one under the project's repo
+    root (see :func:`_resolve_tree_path_input`); ``None``/empty selects the
+    repo root. ``depth`` is how many directory levels below the root to
+    expand — deeper directories still get a line (aggregate counts) but
+    aren't expanded further. Callers are expected to have already validated
+    ``depth``.
 
     Raises :class:`services.graph_store.GraphNotFoundError` when no graph
     has been ingested for the project (propagated from
     :func:`services.graph_store.get_graph`), and :class:`ValueError` when
-    ``path`` doesn't resolve to a directory in the project's tree.
+    ``path`` is an absolute path outside the repo root, names a file instead
+    of a directory, or otherwise doesn't resolve in the project's tree.
     """
     graph = get_graph(project)
     root = _build_tree(graph)
     _compute_aggregates(root)
-    subtree = _navigate(root, path)
+    relative_path = _resolve_tree_path_input(graph, path)
+    subtree = _navigate(root, relative_path)
 
     files, entities = subtree["agg"]
     return {
         "project": project,
-        "root": path or "",
+        "root": relative_path or "",
         "depth": depth,
         "files": files,
         "entities": entities,
@@ -230,12 +279,14 @@ def _signature_line(lines: list[str] | None, start_line: int | None) -> str | No
     return line
 
 
-def _first_sentence(text: str, max_chars: int = _SUMMARY_MAX_CHARS) -> str:
+def first_sentence(text: str, max_chars: int = _SUMMARY_MAX_CHARS) -> str:
     """
     First sentence of *text* (up to the first ``.``/``!``/``?`` followed by
     whitespace or end-of-string), capped at *max_chars*. When the sentence
     itself exceeds the cap, cuts at the last whole word inside it — never
-    mid-word (unlike ``search()``'s plain ``[:140]`` slice).
+    mid-word. Public: shared by ``get_outline`` and the MCP ``search()``/
+    ``neighbors()`` tools' one-line summaries (the uniform replacement for
+    ``search()``'s old plain ``[:140]`` slice, which could cut mid-word).
     """
     text = text.strip()
     if not text:
@@ -251,27 +302,32 @@ def _first_sentence(text: str, max_chars: int = _SUMMARY_MAX_CHARS) -> str:
     return truncated.rstrip() + "…"
 
 
-def _fetch_summaries(project: str, qualified_names: list[str]) -> tuple[dict[str, str], bool]:
+def fetch_summaries(project: str, qualified_names: list[str]) -> tuple[dict[str, str], bool]:
     """
     Batch-fetch entity descriptions for *qualified_names* from Weaviate in
     ONE round trip (see :meth:`services.retriever.Retriever._fetch_by_qnames`
     — deterministic UUID lookup, the same pattern
     :func:`services.graph_store._fetch_chunk_fields` uses for a single
     entity). Degrades to ``({}, False)`` — logged, never raised — when
-    Weaviate is unreachable or the fetch itself fails; ``get_outline`` must
-    always succeed regardless of Weaviate's availability.
+    Weaviate is unreachable or the fetch itself fails.
+
+    Public: shared by ``get_outline`` and the MCP ``neighbors()`` tool's
+    best-effort summaries. Callers that must work identically whether or not
+    Weaviate is up (``neighbors()``'s offline property) rely on this never
+    raising — an empty dict silently produces no summary lines, not an
+    error.
     """
     if not qualified_names:
         return {}, True
     try:
         client = get_client()
     except Exception as e:
-        logger.warning("outline: Weaviate unreachable, omitting summaries: %s", e)
+        logger.warning("navigation: Weaviate unreachable, omitting summaries: %s", e)
         return {}, False
     try:
         fetched = Retriever(client)._fetch_by_qnames(qualified_names, project)
     except Exception as e:
-        logger.warning("outline: failed to fetch summaries for '%s': %s", project, e)
+        logger.warning("navigation: failed to fetch summaries for '%s': %s", project, e)
         return {}, False
     finally:
         client.close()
@@ -292,7 +348,7 @@ def get_outline(project: str, file: str) -> dict[str, Any]:
 
     Each entity carries a disk-derived ``signature`` (see
     :func:`_signature_line`) and a Weaviate-derived one-line ``summary``
-    (see :func:`_first_sentence`), both ``None`` when unavailable —
+    (see :func:`first_sentence`), both ``None`` when unavailable —
     ``summaries_available`` tells the caller whether that's because Weaviate
     was unreachable or because the entity simply had no description.
 
@@ -334,7 +390,7 @@ def get_outline(project: str, file: str) -> dict[str, Any]:
         for n in entity_nodes
         if n["properties"].get("qualified_name")
     ]
-    summaries, summaries_available = _fetch_summaries(project, qualified_names)
+    summaries, summaries_available = fetch_summaries(project, qualified_names)
 
     def _to_entry(n: dict[str, Any]) -> dict[str, Any]:
         props = n["properties"]
@@ -348,7 +404,7 @@ def get_outline(project: str, file: str) -> dict[str, Any]:
             "start_line": start_line,
             "end_line": props.get("end_line"),
             "signature": _signature_line(lines, start_line),
-            "summary": _first_sentence(description) if description else None,
+            "summary": first_sentence(description) if description else None,
             "methods": [],
         }
 
