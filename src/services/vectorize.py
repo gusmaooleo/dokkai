@@ -75,9 +75,9 @@ async def process_and_store(
     """
     path = Path(output_json_path)
     # Unique per run — even with a constant canonical stem (post-promotion,
-    # ingested/<project>.json) — so upsert_chunks' stale-entity `not_equal`
-    # cleanup (see weaviate_client.upsert_chunks) still distinguishes "this
-    # run" from "an earlier run" of the same project.
+    # ingested/<project>.json) — so upsert_chunks' stale-entity purge (see
+    # weaviate_client.upsert_chunks) still distinguishes "this run" from "an
+    # earlier run" of the same project.
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     ingestion_id = f"{path.stem}-{timestamp}"
 
@@ -103,10 +103,16 @@ async def process_and_store(
         report("describe", len(chunks), len(chunks))
 
     client = get_client()
+    purge_stats = {"count": 0}
     try:
         ensure_collection(client, recreate=recreate)
         report("upsert", 0, len(chunks))
-        inserted = upsert_chunks(client, chunks, ingestion_id)
+        inserted = upsert_chunks(
+            client,
+            chunks,
+            ingestion_id,
+            on_purge=lambda n: purge_stats.__setitem__("count", n),
+        )
         report("upsert", inserted, len(chunks))
     finally:
         client.close()
@@ -119,6 +125,7 @@ async def process_and_store(
         "chunks_created": inserted,
         "ingestion_id": ingestion_id,
         "descriptions": desc_stats,
+        "stale_chunks_purged": purge_stats["count"],
     }
 
 

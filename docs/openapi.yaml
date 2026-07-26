@@ -2277,6 +2277,51 @@ components:
           description: "Unique per run: `<project>-<UTC timestamp>`, e.g. `your-repo-20260708T120000`."
         descriptions:
           $ref: "#/components/schemas/DescriptionStats"
+        stale_chunks_purged:
+          type: integer
+          description: >-
+            Chunks removed because they belonged to an earlier ingestion_id
+            of this same project (deleted at the source, or filtered out by
+            gitignore-aware ingestion on this re-ingest — feature 21).
+
+    IngestFilterStats:
+      type: object
+      description: >-
+        Gitignore-aware ingestion filtering stats (feature 21) — applied to
+        the cgr graph JSON before chunking, so filtered paths never reach
+        embedding/description.
+      properties:
+        files_filtered_gitignore:
+          type: integer
+          description: Distinct paths excluded by `git check-ignore` (git repos only).
+        files_filtered_defaults:
+          type: integer
+          description: >-
+            Distinct paths excluded by the curated defaults (build output
+            dirs like `.next`/`dist`, `*.min.js`/`*.map`, ...) — applied
+            regardless of git status.
+        nodes_removed:
+          type: integer
+          description: Graph nodes removed as a result of the above.
+        edges_removed:
+          type: integer
+          description: Relationships removed because either endpoint was removed.
+        nodes_outside_repo:
+          type: integer
+          description: >-
+            Nodes whose recorded path resolves outside the repository root —
+            left alone (never filtered), just counted.
+        git_status:
+          type: string
+          enum: [ok, not-a-repo, error]
+          description: >-
+            `ok`: git ran normally (or there was nothing to check). `not-a-repo`:
+            repo_path isn't a git working tree (defaults-only filtering still
+            applied — expected, harmless). `error`: git IS a repo but the
+            check failed anyway (e.g. a `--full` container's bind mount
+            triggers git's "dubious ownership" guard) — gitignore rules were
+            silently skipped this run; distinguishable from a genuinely clean
+            repo only via this field.
 
     Job:
       type: object
@@ -2339,6 +2384,8 @@ components:
                         project are removed. This is the same file the Graph
                         API (`GET /graph/...`) reads from.
                       example: ingested/your-repo.json
+                    filter:
+                      $ref: "#/components/schemas/IngestFilterStats"
                 vectorize:
                   $ref: "#/components/schemas/VectorizeResult"
             - $ref: "#/components/schemas/RefreshResult"

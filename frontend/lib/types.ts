@@ -301,6 +301,24 @@ export interface VectorizeResult {
   chunks_created: number;
   ingestion_id: string;
   descriptions: DescriptionStats;
+  /** Chunks removed because they belonged to an earlier ingestion_id of this
+   * same project (deleted at the source, or filtered out by gitignore-aware
+   * ingestion on this re-ingest). */
+  stale_chunks_purged: number;
+}
+
+/** Gitignore-aware ingestion filtering stats, nested under `ingest.filter`
+ * on pipeline/graph-only job results. */
+export interface IngestFilterStats {
+  files_filtered_gitignore: number;
+  files_filtered_defaults: number;
+  nodes_removed: number;
+  edges_removed: number;
+  nodes_outside_repo: number;
+  /** "error" means a real git repo's gitignore rules were silently skipped
+   * this run (e.g. a container's "dubious ownership" guard) — distinct from
+   * "not-a-repo" (expected, harmless). */
+  git_status: "ok" | "not-a-repo" | "error";
 }
 
 export interface RefreshResult {
@@ -317,13 +335,13 @@ export interface RefreshResult {
 }
 
 export interface PipelineResult {
-  ingest: { output_json: string };
+  ingest: { output_json: string; filter: IngestFilterStats };
   vectorize: VectorizeResult;
 }
 
 /** Result of a `kind: "graph"` job — cgr only, no vectorize stage. */
 export interface GraphOnlyResult {
-  ingest: { output_json: string };
+  ingest: { output_json: string; filter: IngestFilterStats };
 }
 
 /** The `Job` object returned by `GET /instances/jobs/{id}` and its SSE stream. */
