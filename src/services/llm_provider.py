@@ -1,9 +1,26 @@
 """
 Multi-provider LLM abstraction layer.
 
-Supports OpenAI, Anthropic, and Ollama (local) through a unified interface.
+Providers are config entries, not bespoke classes (feature 22): a handful
+of API "shapes" are implemented once, and any provider — built-in or
+custom — is served by pointing a shape at a base URL and a key. This
+mirrors OpenClaw's provider-registry pattern and needs zero new
+dependencies: both shapes ride SDKs already in ``pyproject.toml``.
+
+- ``openai-completions`` — the ``openai`` SDK with a ``base_url``
+  override. Serves OpenAI, Gemini's OpenAI-compatible surface, and any
+  other OpenAI-compatible endpoint (Groq, Together, OpenRouter, LM
+  Studio, vLLM, ...).
+- ``anthropic-messages`` — the ``anthropic`` SDK's Messages API.
+- Ollama (local) keeps its own native path — it isn't one of the two
+  shapes above, so it's handled directly rather than routed through one.
+
 Each provider implements ``chat()`` (blocking) and ``stream()`` (async
 generator) methods.
+
+Embeddings are out of scope here — dokkai's vector search stays
+Weaviate-native (``text2vec-ollama``); this module only covers chat-style
+completions (the describe pass and the chat/routines answer step).
 """
 
 from __future__ import annotations
@@ -11,6 +28,7 @@ from __future__ import annotations
 import logging
 import os
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import AsyncIterator, cast
 from urllib.parse import urlsplit, urlunsplit
 
@@ -123,13 +141,28 @@ class LLMProvider(ABC):
 
 
 # -----------------------------------------------------------------------
-# OpenAI
+# openai-completions shape (OpenAI, Gemini's OpenAI-compat surface, and
+# any other OpenAI-compatible endpoint)
 # -----------------------------------------------------------------------
 
-class OpenAIProvider(LLMProvider):
-    provider_name = "openai"
+class OpenAICompletionsProvider(LLMProvider):
+    """
+    The ``openai-completions`` shape: the ``openai`` SDK pointed at a
+    ``base_url``. One class, many providers — ``provider_name``/
+    ``display_name`` only affect model-catalog filtering and
+    human-readable messages, not the request wire format.
+    """
 
-    def __init__(self, api_key: str, base_url: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        base_url: str | None,
+        provider_name: str,
+        display_name: str,
+    ) -> None:
+        self.provider_name = provider_name
+        self._display_name = display_name
         self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
@@ -171,28 +204,40 @@ class OpenAIProvider(LLMProvider):
             if delta and delta.content:
                 yield delta.content
 
-    _FALLBACK_MODELS = [
-        "gpt-4o",
-        "gpt-4o-mini",
-        "gpt-4-turbo",
-        "gpt-3.5-turbo",
-        "o1",
-        "o1-mini",
-        "o3-mini",
-    ]
-
     async def list_models(self) -> list[str]:
         try:
             models = await self._client.models.list()
-            return sorted(
-                m.id for m in models.data
-                if "gpt" in m.id or "o1" in m.id or "o3" in m.id
-            )
+            ids = [m.id for m in models.data]
+            if self.provider_name == "openai":
+                # The live OpenAI catalog includes non-chat models
+                # (embeddings, TTS, etc.) that need filtering out.
+                ids = [i for i in ids if "gpt" in i or "o1" in i or "o3" in i]
+            elif self.provider_name == "gemini":
+                # Gemini's catalog ids are prefixed "models/" (confirmed
+                # live: e.g. "models/gemini-flash-latest"), which the
+                # chat/completions body and the persisted config accept,
+                # but which makes models.retrieve() build a double
+                # "models/models/..." URL (it appends its own "models/"
+                # segment) and disagrees with the unprefixed static
+                # fallback catalog below. Strip it so both agree. Gemini's
+                # /models also mirrors its FULL catalog (embeddings,
+                # imagen/veo/lyria generation, TTS, ...), not just
+                # chat-capable models — denylist the known non-chat
+                # modalities; this is a minimal filter, not a verified
+                # allowlist, so an unrecognized non-chat id could still
+                # slip through.
+                ids = [i.removeprefix("models/") for i in ids]
+                ids = [
+                    i for i in ids
+                    if not any(marker in i for marker in _GEMINI_NON_CHAT_MARKERS)
+                ]
+            return sorted(ids)
         except Exception as e:
             logger.warning(
-                "Failed to fetch live OpenAI model catalog, using static fallback: %s", e
+                "Failed to fetch live %s model catalog, using static fallback: %s",
+                self._display_name, e,
             )
-            return sorted(self._FALLBACK_MODELS)
+            return sorted(_FALLBACK_MODELS.get(self.provider_name, []))
 
     async def health_check(self, model: str | None = None) -> tuple[bool, str]:
         try:
@@ -200,22 +245,31 @@ class OpenAIProvider(LLMProvider):
                 await self._client.models.retrieve(model)
                 return True, f"Model '{model}' is available"
             await self._client.models.list()
-            return True, "OpenAI API is reachable"
+            return True, f"{self._display_name} API is reachable"
         except Exception as e:
             if model:
-                return False, f"OpenAI model '{model}' error: {e}"
-            return False, f"OpenAI API error: {e}"
+                return False, f"{self._display_name} model '{model}' error: {e}"
+            return False, f"{self._display_name} API error: {e}"
 
 
 # -----------------------------------------------------------------------
-# Anthropic
+# anthropic-messages shape
 # -----------------------------------------------------------------------
 
-class AnthropicProvider(LLMProvider):
-    provider_name = "anthropic"
+class AnthropicMessagesProvider(LLMProvider):
+    """The ``anthropic-messages`` shape: the ``anthropic`` SDK's Messages API."""
 
-    def __init__(self, api_key: str) -> None:
-        self._client = AsyncAnthropic(api_key=api_key)
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        base_url: str | None = None,
+        provider_name: str,
+        display_name: str,
+    ) -> None:
+        self.provider_name = provider_name
+        self._display_name = display_name
+        self._client = AsyncAnthropic(api_key=api_key, base_url=base_url)
 
     async def chat(
         self,
@@ -257,21 +311,16 @@ class AnthropicProvider(LLMProvider):
             async for text in stream.text_stream:
                 yield text
 
-    _FALLBACK_MODELS = [
-        "claude-sonnet-4-20250514",
-        "claude-opus-4-20250514",
-        "claude-3-5-haiku-20241022",
-    ]
-
     async def list_models(self) -> list[str]:
         try:
             models = await self._client.models.list(timeout=5.0)
             return sorted([m.id async for m in models])
         except Exception as e:
             logger.warning(
-                "Failed to fetch live Anthropic model catalog, using static fallback: %s", e
+                "Failed to fetch live %s model catalog, using static fallback: %s",
+                self._display_name, e,
             )
-            return list(self._FALLBACK_MODELS)
+            return list(_FALLBACK_MODELS.get(self.provider_name, []))
 
     async def health_check(self, model: str | None = None) -> tuple[bool, str]:
         try:
@@ -279,11 +328,11 @@ class AnthropicProvider(LLMProvider):
                 await self._client.models.retrieve(model)
                 return True, f"Model '{model}' is available"
             await self._client.models.list()
-            return True, "Anthropic API is reachable"
+            return True, f"{self._display_name} API is reachable"
         except Exception as e:
             if model:
-                return False, f"Anthropic model '{model}' error: {e}"
-            return False, f"Anthropic API error: {e}"
+                return False, f"{self._display_name} model '{model}' error: {e}"
+            return False, f"{self._display_name} API error: {e}"
 
     @staticmethod
     def _split_system(
@@ -502,6 +551,94 @@ class OllamaProvider(LLMProvider):
 
 
 # -----------------------------------------------------------------------
+# Built-in registry — provider id -> {shape, default base URL, key env,
+# display name}. This is the "config entry, not a class" from the module
+# docstring: registering a new built-in is adding a row here, not writing
+# a new provider class.
+# -----------------------------------------------------------------------
+
+_SHAPE_OPENAI_COMPLETIONS = "openai-completions"
+_SHAPE_ANTHROPIC_MESSAGES = "anthropic-messages"
+
+
+@dataclass(frozen=True)
+class _ProviderSpec:
+    shape: str
+    # None => don't override; let the SDK use its own default (the real
+    # OpenAI API for the openai-completions shape).
+    default_base_url: str | None
+    # Which env var the key normally lives in. get_provider itself never
+    # reads env vars — callers resolve and pass ``api_key`` explicitly —
+    # so this is used only to (a) decide whether a key is mandatory for
+    # this provider and (b) name the var in the "requires an API key"
+    # message below. None for custom (non-built-in) ids: many
+    # OpenAI-compatible local servers (LM Studio, vLLM, ...) don't
+    # require a key at all.
+    key_env: str | None
+    display_name: str
+
+
+# Ollama is deliberately not in this table: it's not one of the two
+# shapes above (its own native path, see OllamaProvider) and is handled
+# directly in get_provider().
+_REGISTRY: dict[str, _ProviderSpec] = {
+    "openai": _ProviderSpec(
+        shape=_SHAPE_OPENAI_COMPLETIONS,
+        default_base_url=None,
+        key_env="OPENAI_API_KEY",
+        display_name="OpenAI",
+    ),
+    "gemini": _ProviderSpec(
+        shape=_SHAPE_OPENAI_COMPLETIONS,
+        # Gemini's OpenAI-compatible surface. Trailing slash required —
+        # not an openai-SDK requirement (it normalizes base URLs with or
+        # without one); Gemini's own compat-endpoint routing needs it.
+        default_base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        key_env="GEMINI_API_KEY",
+        display_name="Gemini",
+    ),
+    "anthropic": _ProviderSpec(
+        shape=_SHAPE_ANTHROPIC_MESSAGES,
+        default_base_url=None,
+        key_env="ANTHROPIC_API_KEY",
+        display_name="Anthropic",
+    ),
+}
+
+# Minimal denylist of substrings marking a Gemini catalog id as a known
+# non-chat modality (embeddings, image/video/music generation, TTS, the
+# QA-only "aqa" model) — see the comment in
+# OpenAICompletionsProvider.list_models(). Not a verified allowlist: an
+# id that matches none of these still isn't guaranteed to support
+# chat/completions, only known *not* to be one of these.
+_GEMINI_NON_CHAT_MARKERS = ("embedding", "imagen", "veo-", "lyria", "tts", "aqa")
+
+# Static model-catalog fallbacks (feature 10), keyed by provider id — used
+# by list_models() when the live catalog call fails.
+_FALLBACK_MODELS: dict[str, list[str]] = {
+    "openai": [
+        "gpt-4o",
+        "gpt-4o-mini",
+        "gpt-4-turbo",
+        "gpt-3.5-turbo",
+        "o1",
+        "o1-mini",
+        "o3-mini",
+    ],
+    "gemini": [
+        "gemini-pro-latest",
+        "gemini-flash-latest",
+        "gemini-flash-lite-latest",
+    ],
+    "anthropic": [
+        "claude-sonnet-4-20250514",
+        "claude-opus-4-20250514",
+        "claude-3-5-haiku-20241022",
+    ],
+}
+
+
+# -----------------------------------------------------------------------
 # Factory
 # -----------------------------------------------------------------------
 
@@ -512,34 +649,62 @@ def get_provider(
     base_url: str | None = None,
 ) -> LLMProvider:
     """
-    Instantiate an LLM provider by name.
+    Instantiate an LLM provider by id.
+
+    ``provider_name`` resolves through the built-in registry (openai,
+    gemini, anthropic, ollama). An id that isn't built in is still
+    servable — through the openai-completions shape — as long as
+    ``base_url`` is given, which covers any OpenAI-compatible endpoint
+    (Groq, Together, OpenRouter, LM Studio, vLLM, ...).
 
     Parameters
     ----------
     provider_name : str
-        One of 'openai', 'anthropic', 'ollama'.
+        A built-in id ('openai', 'gemini', 'anthropic', 'ollama') or a
+        custom id paired with ``base_url``.
     api_key : str
-        API key for remote providers.
+        API key for remote providers. Required for built-in remotes
+        (openai/gemini/anthropic); optional for a custom endpoint.
     base_url : str, optional
-        Custom base URL override (useful for Ollama or OpenAI-compatible APIs).
+        Base URL override. Required for a custom (non-built-in) id.
     """
     name = provider_name.lower().strip()
 
-    if name == "openai":
-        if not api_key:
-            raise ValueError("OpenAI requires an API key")
-        return OpenAIProvider(api_key=api_key, base_url=base_url)
-
-    elif name == "anthropic":
-        if not api_key:
-            raise ValueError("Anthropic requires an API key")
-        return AnthropicProvider(api_key=api_key)
-
-    elif name == "ollama":
+    if name == "ollama":
         return OllamaProvider(base_url=base_url)
 
-    else:
-        raise ValueError(
-            f"Unknown provider '{provider_name}'. "
-            f"Supported: openai, anthropic, ollama"
+    spec = _REGISTRY.get(name)
+    if spec is None:
+        if not base_url:
+            builtins = ", ".join(sorted(list(_REGISTRY) + ["ollama"]))
+            raise ValueError(
+                f"Unknown provider '{provider_name}'. Built-in providers: "
+                f"{builtins}. A custom provider needs a base_url pointing "
+                f"at an OpenAI-compatible endpoint."
+            )
+        spec = _ProviderSpec(
+            shape=_SHAPE_OPENAI_COMPLETIONS,
+            default_base_url=None,
+            key_env=None,
+            display_name=provider_name.strip(),
         )
+
+    if spec.key_env and not api_key:
+        raise ValueError(f"{spec.display_name} requires an API key")
+
+    resolved_base_url = base_url or spec.default_base_url
+
+    if spec.shape == _SHAPE_ANTHROPIC_MESSAGES:
+        return AnthropicMessagesProvider(
+            api_key=api_key,
+            base_url=resolved_base_url,
+            provider_name=name,
+            display_name=spec.display_name,
+        )
+
+    return OpenAICompletionsProvider(
+        api_key=api_key,
+        base_url=resolved_base_url,
+        provider_name=name,
+        display_name=spec.display_name,
+    )
