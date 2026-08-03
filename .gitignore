@@ -61,6 +61,12 @@ ingested/*.json
 data/
 commits.md
 /dokkai_agent
+
+# LLM provider registrations (feature 22) — config/ itself is committed
+# (holds providers.example.json); only the real file, which may hold a
+# literal key, is ignored. Compose mounts the directory, not this file, so
+# a missing config/providers.json never becomes a bind-mount directory trap.
+config/providers.json
 # Claude Code local setup (builder subagents, settings)
 /.claude/
 /.codex/

@@ -63,9 +63,28 @@ services:
     restart: on-failure:0
     ports:
       - "8000:8000"
+    # Forwards the host .env (OPENAI_API_KEY, GEMINI_API_KEY,
+    # ANTHROPIC_API_KEY, GROQ_API_KEY, ... — anything config/providers.json
+    # references via ${VAR}) into the container. Arbitrary provider key var
+    # names can't be enumerated here individually, so the whole file is
+    # forwarded; `required: false` keeps `docker compose config`/`up`
+    # working for a fresh clone with no .env yet. The explicit
+    # `environment:` block below still wins over anything of the same name
+    # in .env (verified via `docker compose config` — Compose applies
+    # env_file first, environment: last).
+    env_file:
+      - path: .env
+        required: false
     environment:
       DATABASE_URL: postgresql://dokkai:dokkai@postgres:5432/dokkai
       WEAVIATE_HOST: weaviate
+      # Pinned (not left to env_file/.env): the in-container Weaviate
+      # service always listens on these ports regardless of what the host
+      # publishes them as — a host remap like WEAVIATE_HTTP_PORT=8081 (to
+      # dodge a taken 8080 for ./dev.sh) must not leak into this container,
+      # or every search/ingest call dials the wrong port and fails.
+      WEAVIATE_HTTP_PORT: "8080"
+      WEAVIATE_GRPC_PORT: "50051"
       MEMGRAPH_HOST: memgraph
       # Ollama runs on the host, not in compose — reach it the same way
       # Weaviate does (see OLLAMA_EMBED_ENDPOINT above).
@@ -102,6 +121,13 @@ services:
       # description cache (./data/) must persist across container restarts.
       - ingested_data:/app/ingested
       - api_data:/app/data
+      # LLM provider registrations (feature 22 — config/providers.json).
+      # Mounts the DIRECTORY, never the file: config/providers.json is
+      # gitignored, and a bind-mount whose source FILE is missing gets
+      # created by Docker as a directory, breaking confusingly — the
+      # directory itself is always present (it's committed, holding
+      # providers.example.json), so this mount never hits that trap.
+      - ./config:/app/config:ro
     depends_on:
       postgres:
         condition: service_healthy
