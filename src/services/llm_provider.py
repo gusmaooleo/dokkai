@@ -84,6 +84,35 @@ def effective_base_url(url: str) -> str:
     return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
 
+# Matches the userinfo segment of a URL's netloc (``scheme://user:pass@``)
+# — greedy up to the LAST ``@`` before the next ``/``/whitespace/end of
+# string, mirroring how a real URL parser resolves the userinfo boundary
+# (an unencoded ``@`` inside a password is technically invalid URL syntax,
+# but this still redacts up to the rightmost one rather than stopping at
+# the first, leaking the remainder). Never matches when there's no ``@``
+# before the first path segment — an ordinary host-only URL is untouched.
+_USERINFO_RE = re.compile(r"://[^/\s]*@")
+
+
+def _redact_userinfo(text: str) -> str:
+    """
+    Redact an embedded userinfo credential (``scheme://user:pass@host``)
+    from *text* — used to scrub ``validate_base_url``'s error messages
+    before they're returned, never the successfully-validated URL itself
+    (which the caller still needs, intact, to actually connect/persist).
+
+    ``validate_base_url`` is shared by three entry points that each put a
+    raw, caller-supplied ``base_url`` straight into a returned error
+    string — the ``/config/llm`` POST body, the ``config/providers.json``
+    loader (feature 22, C3), and ``DESC_BASE_URL`` (C4) — any of which can
+    read back to the caller (an HTTP 400 body, a boot-time traceback, a
+    job log). A malformed value with embedded Basic-auth credentials
+    (``https://bob:secret@`` — hostless, so it fails validation) must not
+    echo the password back in the rejection message.
+    """
+    return _USERINFO_RE.sub("://***@", text)
+
+
 def validate_base_url(raw: str) -> tuple[str | None, str]:
     """
     Normalize and validate a remote-provider ``base_url``.
@@ -118,24 +147,31 @@ def validate_base_url(raw: str) -> tuple[str | None, str]:
       caller gets THIS function's actionable message instead of an SDK
       one, and so the guarantee below is literally true.
 
+    Every error message below is passed through ``_redact_userinfo``
+    before being returned — a rejected URL with embedded Basic-auth
+    credentials (``https://bob:secret@`` — hostless, so it always fails
+    validation) never echoes the password back; only the userinfo segment
+    is scrubbed, the rest of the URL (host, port, path — the actionable
+    part) stays visible.
+
     Returns ``(normalized_url, error_message)``. On success,
     ``error_message`` is ``""`` and ``normalized_url`` is the trimmed
-    string — the exact value the caller must go on to validate further,
-    persist, and pass to ``get_provider``, never the raw input. On
-    failure, ``normalized_url`` is ``None`` and ``error_message`` explains
-    why.
+    string, WITH any userinfo it legitimately contains left intact — the
+    exact value the caller must go on to validate further, persist, and
+    pass to ``get_provider``, never the raw input. On failure,
+    ``normalized_url`` is ``None`` and ``error_message`` explains why.
     """
     normalized = raw.strip()
     if any(c in normalized for c in "\t\r\n"):
-        return None, (
+        return None, _redact_userinfo(
             f"Invalid base_url '{raw}': contains a tab or line break"
         )
     try:
         parsed = urlsplit(normalized)
     except ValueError as e:
-        return None, f"Invalid base_url '{raw}': {e}"
+        return None, _redact_userinfo(f"Invalid base_url '{raw}': {e}")
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        return None, (
+        return None, _redact_userinfo(
             f"Invalid base_url '{raw}': must be a full http:// or https:// "
             "URL with a host, e.g. 'http://localhost:1234/v1'"
         )

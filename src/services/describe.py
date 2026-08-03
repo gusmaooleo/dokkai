@@ -7,10 +7,61 @@ conceptual queries ("how does the alarm flow work?") reach implementation
 code through the ``summary`` vector. Description calls go through the shared
 provider abstraction in ``services.llm_provider``.
 
+Configured entirely through env vars (never the ``/config/llm`` UI/DB path —
+decision 22-lote19 Q4a): ``DESC_PROVIDER`` (default ``ollama``) accepts any
+id the registry can serve — a built-in (``openai``, ``gemini``,
+``anthropic``), an id registered via ``config/providers.json``, or an
+arbitrary OpenAI-compatible id paired with ``DESC_BASE_URL``. ``DESC_MODEL``
+and ``DESC_CONCURRENCY`` name the model and the parallel-request cap. Ollama
+alone keeps using ``OLLAMA_BASE_URL``, unchanged.
+
+``DESC_BASE_URL`` is validated the same way as every other caller-supplied
+base URL in this codebase (``services.llm_provider.validate_base_url`` —
+scheme, host, no embedded control characters) before it ever reaches an
+SDK client; a rejected value is a graceful skip, like every other
+descriptor misconfiguration, never a raised exception or an opaque SDK
+error. ``DESC_BASE_URL`` overriding a REGISTERED provider's own base URL —
+a built-in's default, or a file-registered id's own ``baseUrl`` alike —
+redirects that provider's key to the override host too — allowed, since
+``get_provider`` documents that override, but logged as a warning naming
+the provider and the target host (never the key). Both cases are
+"leftover-prone" the same way: ``DESC_BASE_URL`` is a single global env
+var, so switching ``DESC_PROVIDER`` to a different already-registered id
+without unsetting a ``DESC_BASE_URL`` left over from an earlier
+custom-endpoint experiment silently redirects the NEW id's key too. Only a
+genuinely UNREGISTERED id — where ``DESC_BASE_URL`` is the sole source of
+a base URL, not an override of anything — stays silent.
+
+Key precedence: an explicit ``DESC_API_KEY`` (blank/whitespace-only counts
+as unset) always wins (this is what makes an UNREGISTERED remote id, e.g.
+``DESC_PROVIDER=groq`` pointed at Groq's endpoint via ``DESC_BASE_URL``
+with no ``config/providers.json`` entry, actually authenticate — without
+it, a provider id the registry doesn't recognize has no other way to
+receive a key and would silently send an unauthenticated request).
+Otherwise a built-in reads its own standard env var (``OPENAI_API_KEY``
+etc, via ``key_env_for()`` — and a missing one is reported by name,
+alongside ``DESC_API_KEY``, in the skip reason). Otherwise a
+file-registered provider's own key (resolved inside ``get_provider``
+itself, from ``config/providers.json``'s ``${ENV}`` or literal
+``apiKey``, with its own already-specific missing-key diagnostic) applies.
+A key is optional throughout — keyless is legitimate for a local
+OpenAI-compatible server (LM Studio, vLLM, ...).
+
 Cost control (a description is one LLM call — the pipeline's dominant cost):
   - **Selective**: skip tests, entities without source, and trivial one-liners.
-  - **Cached by source hash**: unchanged source reuses its description across
-    re-ingestions — pairs with the deterministic UUID for incremental ingest.
+  - **Cached by source hash ALONE**: unchanged source reuses its description
+    across re-ingestions, regardless of ``DESC_PROVIDER``/``DESC_MODEL`` —
+    pairs with the deterministic UUID for incremental ingest. This is
+    deliberate, not an oversight: keying on model too would force a full
+    paid re-describe of every existing corpus the first time anyone
+    upgrades a model. The trade-off is that switching provider/model is a
+    no-op on chunks already described — it only affects new/changed
+    source. To force EXISTING chunks to regenerate under the currently
+    configured provider/model, use ``POST /instances/{project}/describe``
+    with ``{"force": true}``. Note :func:`describe_chunks`'s returned
+    ``stats["model"]`` names the CONFIGURED model, not necessarily the one
+    that produced every description in the batch — some may be cache hits
+    generated earlier, by a different provider or model.
   - **Concurrent**: bounded parallel requests to the configured provider.
 
 If no model is configured (``DESC_MODEL`` unset) or the configured provider
@@ -26,14 +77,25 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 from collections.abc import Callable
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from services.chunker import CodeChunk
-from services.llm_provider import LLMMessage, LLMProvider, get_provider
+from services.llm_provider import (
+    LLMMessage,
+    LLMProvider,
+    get_provider,
+    get_registered_provider_ids,
+    key_env_for,
+    validate_base_url,
+)
 from services.retriever import _is_test_path
+
+logger = logging.getLogger(__name__)
 
 
 DESC_SYSTEM_PROMPT = (
@@ -157,21 +219,132 @@ class DescriptionCache:
 # Provider-backed generation (services.llm_provider)
 # ---------------------------------------------------------------------------
 
+def _descriptor_base_url(provider_name: str) -> str:
+    """
+    Base URL env var for *provider_name*.
+
+    ``OLLAMA_BASE_URL`` for Ollama — unchanged, byte-identical to before
+    this function existed. ``DESC_BASE_URL`` (new, feature 22 C4) for any
+    other provider — a built-in (openai/gemini/anthropic), a
+    ``config/providers.json`` id, or a fully custom one. Named to match the
+    existing ``DESC_PROVIDER``/``DESC_MODEL``/``DESC_CONCURRENCY``
+    convention rather than reusing ``OLLAMA_BASE_URL``, whose name is
+    Ollama-specific.
+
+    Empty (unset) is not an error here: a registered id (built-in or
+    file-registered) already carries its own default/registered base URL
+    inside the registry, so ``DESC_BASE_URL`` is only REQUIRED for a
+    genuinely unregistered custom id — and that requirement is enforced by
+    ``get_provider`` itself (via ``_resolve_provider`` below), not here.
+    """
+    if provider_name == "ollama":
+        return os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    return os.getenv("DESC_BASE_URL", "").strip()
+
+
+# The three ids that ship inside services.llm_provider's own _REGISTRY at
+# import time (C1). Used ONLY to enrich the missing-key skip reason below
+# (point 4, review round 2) — a file-registered provider missing its
+# ${ENV} key already gets a MORE specific diagnostic straight from
+# get_provider (it names the exact var AND the config/providers.json path
+# that references it), which this set deliberately does not override; only
+# a built-in's generic "requires an API key" (which names no variable at
+# all) needs the enrichment. NOT used for the DESC_BASE_URL-override
+# warning below anymore (review round 2, point 3) — see
+# get_registered_provider_ids() at that call site instead.
+_BUILTIN_IDS = frozenset({"openai", "gemini", "anthropic"})
+
+
 def _resolve_provider(provider_name: str, base_url: str) -> tuple[LLMProvider | None, str]:
-    """Instantiate the configured provider, or return a graceful-skip reason."""
-    if provider_name == "openai":
-        api_key = os.getenv("OPENAI_API_KEY", "")
-        if not api_key:
-            return None, "OPENAI_API_KEY not set"
-        return get_provider("openai", api_key=api_key), ""
-    if provider_name == "anthropic":
-        api_key = os.getenv("ANTHROPIC_API_KEY", "")
-        if not api_key:
-            return None, "ANTHROPIC_API_KEY not set"
-        return get_provider("anthropic", api_key=api_key), ""
+    """
+    Instantiate the configured provider, or return a graceful-skip reason.
+
+    Resolves *provider_name* through the shared registry in
+    ``services.llm_provider`` (feature 22): ``get_provider`` itself already
+    knows every built-in id (openai, gemini, anthropic), every id
+    registered via ``config/providers.json`` (C3, carrying its own base URL
+    and, usually, its own key), and any other id paired with *base_url* (an
+    OpenAI-compatible endpoint). This function adds:
+
+    - ``DESC_BASE_URL`` validation (``validate_base_url``, the SAME
+      validator every other caller-supplied base URL in this codebase goes
+      through — ``config/providers.json``'s loader and ``/config/llm``'s
+      POST body) BEFORE it ever reaches ``get_provider``/the SDK. Skipping
+      this would let a malformed value either raise ``httpx.InvalidURL``
+      (not a ``ValueError`` — would escape this function's except clause
+      entirely, surfacing as an unattributed HTTP 500 through
+      ``controllers.instances``, which only catches ``DescriptorError``)
+      or, for a scheme-less value, get silently accepted and fail later
+      with a message that never mentions the URL.
+    - the descriptor's own key-lookup convention: an explicit
+      ``DESC_API_KEY`` (blank/whitespace-only treated as unset — a
+      whitespace value must fall through to the next level, never be sent
+      verbatim as a garbage credential) always wins; otherwise a built-in
+      reads its standard env var via ``key_env_for()``; a
+      file-registered/custom provider otherwise needs no env lookup here,
+      since ``get_provider`` resolves its own key internally.
+    - a warning (never the key) when ``DESC_BASE_URL`` overrides a
+      provider that has its own configured base URL — a built-in's
+      default, OR a file-registered id's own ``baseUrl``. Both are
+      "leftover-prone" the same way: ``DESC_BASE_URL`` is one global env
+      var, so switching ``DESC_PROVIDER`` to a DIFFERENT already-registered
+      id without unsetting a ``DESC_BASE_URL`` left over from an earlier
+      custom-endpoint experiment silently redirects that id's key too —
+      whether the key came from a built-in's fixed env var or from a file
+      entry's own ``${ENV}``/literal ``apiKey``. Only a genuinely
+      UNREGISTERED id (``DESC_BASE_URL`` is its only source of a base URL
+      at all — there is nothing to "override") stays silent.
+    - when a built-in's key is missing (empty after the above), a skip
+      reason naming BOTH ``DESC_API_KEY`` and the built-in's own standard
+      var — ``get_provider``'s own message here names neither. A
+      file-registered id's own missing-``${ENV}`` message is untouched:
+      it already names the exact variable and the ``config/providers.json``
+      path that references it, which is more specific than anything this
+      function could add.
+
+    Every one of the above turns into the graceful ``(None, reason)`` skip
+    this module's callers expect — this function NEVER raises.
+
+    Ollama keeps its own native path here, unchanged: it isn't part of the
+    registry (see ``services.llm_provider``'s module docstring — it's
+    handled directly, not through either of the two shapes), *base_url*
+    for it is always ``OLLAMA_BASE_URL`` (never validated here — untouched,
+    byte-identical to before this function was generalized), and it is
+    NEVER subject to the DESC_BASE_URL-override warning above.
+    """
     if provider_name == "ollama":
         return get_provider("ollama", base_url=base_url), ""
-    return None, f"unknown DESC_PROVIDER '{provider_name}'"
+
+    if base_url:
+        normalized_base_url, url_error = validate_base_url(base_url)
+        if url_error:
+            return None, f"invalid DESC_BASE_URL: {url_error}"
+        base_url = normalized_base_url
+
+    if provider_name in get_registered_provider_ids() and base_url:
+        host = urlsplit(base_url).hostname or base_url
+        logger.warning(
+            "descriptor: DESC_PROVIDER=%s is resolving with a DESC_BASE_URL "
+            "override (host: %s) — its API key is being sent to that host "
+            "instead of %s's own configured base URL. Unset DESC_BASE_URL "
+            "if this wasn't intentional.",
+            provider_name, host, provider_name,
+        )
+
+    key_env = key_env_for(provider_name)
+    override_key = os.getenv("DESC_API_KEY", "").strip()
+    api_key = override_key if override_key else (os.getenv(key_env, "") if key_env else "")
+
+    try:
+        provider = get_provider(provider_name, api_key=api_key, base_url=base_url or None)
+    except ValueError as e:
+        if not api_key and key_env and provider_name in _BUILTIN_IDS:
+            return None, (
+                f"{provider_name} requires an API key — set DESC_API_KEY, "
+                f"or {key_env}"
+            )
+        return None, str(e)
+    return provider, ""
 
 
 _TRIMMED_DOC_CAP = 600
@@ -259,7 +432,7 @@ async def ensure_descriptor_available() -> tuple[str, str]:
         raise DescriptorError(_NO_MODEL_MESSAGE)
 
     provider_name = os.getenv("DESC_PROVIDER", "ollama").lower().strip()
-    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    base_url = _descriptor_base_url(provider_name)
 
     await _require_provider(provider_name, base_url, model)
     return provider_name, model
@@ -311,7 +484,7 @@ async def describe_chunks(
         raise DescriptorError(_NO_MODEL_MESSAGE)
 
     provider_name = os.getenv("DESC_PROVIDER", "ollama").lower().strip()
-    base_url = base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    base_url = base_url or _descriptor_base_url(provider_name)
     concurrency = concurrency or int(os.getenv("DESC_CONCURRENCY", "4"))
     cache = cache if cache is not None else DescriptionCache()
 
