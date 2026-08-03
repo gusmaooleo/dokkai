@@ -8,10 +8,34 @@ from pydantic import BaseModel, Field
 
 
 class ProviderData(BaseModel):
-    provider_name: str = Field(..., description="'openai', 'anthropic', or 'ollama'")
+    provider_name: str = Field(
+        ...,
+        description=(
+            "Ignored when is_local=true (Ollama is always used, forced "
+            "regardless of this value — Ollama is not reachable through "
+            "is_local=false). When is_local=false: one of the built-in "
+            "remote ids ('openai', 'gemini', 'anthropic') or any custom id "
+            "paired with base_url (an OpenAI-compatible endpoint, e.g. "
+            "Groq, LM Studio, vLLM)"
+        ),
+    )
     model: str = Field(..., description="Model name, e.g. 'gpt-4o-mini', 'claude-sonnet-4', 'llama3'")
-    key: str = Field(default="", description="API key (empty for local providers)")
-    base_url: str | None = Field(default=None, description="Custom base URL override")
+    key: str = Field(
+        default="",
+        description=(
+            "API key. Empty for local (Ollama) providers and optional for "
+            "custom endpoints that don't require one; required for the "
+            "built-in remote providers (openai, gemini, anthropic)"
+        ),
+    )
+    base_url: str | None = Field(
+        default=None,
+        description=(
+            "Base URL override — a full http:// or https:// URL with a "
+            "host. Required when is_local=false and provider_name isn't "
+            "one of the built-in remote ids (openai, gemini, anthropic)"
+        ),
+    )
 
 
 class LLMConfigRequest(BaseModel):

@@ -12,11 +12,18 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import httpx
 
 from services.db import DatabaseUnavailableError, get_pool
-from services.llm_provider import effective_base_url, get_provider, LLMProvider
+from services.llm_provider import (
+    effective_base_url,
+    get_builtin_provider_ids,
+    get_provider,
+    key_env_for,
+    LLMProvider,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +187,54 @@ async def save_persisted_config(config: LLMConfig) -> None:
 # High-level helpers
 # -----------------------------------------------------------------------
 
+def _validate_base_url(raw: str) -> tuple[str | None, str]:
+    """
+    Normalize and validate a remote-provider ``base_url``.
+
+    Strips surrounding whitespace — ``urlsplit`` does not, so a pasted
+    URL with a trailing newline would otherwise validate cleanly here and
+    then die inside the SDK with ``InvalidURL: Invalid non-printable
+    ASCII character`` — and requires a full ``http``/``https`` URL with a
+    non-empty host. Rejects, before any network call:
+
+    - a scheme-less URL (``localhost:1234/v1``);
+    - a hostless one, including the single-slash typo
+      (``http:/x``, ``http://``, ``http:///v1``, ``http:/localhost:1234/v1``);
+    - anything ``urlsplit`` itself refuses to parse, e.g. an unbalanced
+      IPv6 bracket (``http://[::1:8000/v1``), which raises ``ValueError``
+      rather than returning a result;
+    - a tab/CR/LF anywhere INSIDE the string. ``urlsplit`` deletes those
+      characters before parsing while ``.strip()`` only touches the ends,
+      so ``ht\\ntp://host/v1`` would otherwise be validated as the cleaned
+      URL but stored and dialled as the raw one. httpx refuses it either
+      way, so nothing was ever silently mis-dialled — this exists so the
+      caller gets THIS function's actionable message instead of an SDK
+      one, and so the guarantee below is literally true.
+
+    Returns ``(normalized_url, error_message)``. On success,
+    ``error_message`` is ``""`` and ``normalized_url`` is the trimmed
+    string — the exact value the caller must go on to validate further,
+    persist, and pass to ``get_provider``, never the raw input. On
+    failure, ``normalized_url`` is ``None`` and ``error_message`` explains
+    why.
+    """
+    normalized = raw.strip()
+    if any(c in normalized for c in "\t\r\n"):
+        return None, (
+            f"Invalid base_url '{raw}': contains a tab or line break"
+        )
+    try:
+        parsed = urlsplit(normalized)
+    except ValueError as e:
+        return None, f"Invalid base_url '{raw}': {e}"
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None, (
+            f"Invalid base_url '{raw}': must be a full http:// or https:// "
+            "URL with a host, e.g. 'http://localhost:1234/v1'"
+        )
+    return normalized, ""
+
+
 async def validate_and_save_config(
     is_local: bool,
     provider_name: str,
@@ -195,8 +250,11 @@ async def validate_and_save_config(
     2. The requested model is actually installed
 
     For remote configs, verifies that:
-    1. An API key is provided
-    2. The provider is reachable
+    1. The provider id and base_url combination is resolvable (a built-in
+       id, or a custom id paired with an http(s) base_url)
+    2. An API key is provided, when the provider requires one (built-in
+       remotes always do; a custom OpenAI-compatible endpoint may not)
+    3. The provider is reachable
 
     Returns (success, message).
     """
@@ -247,11 +305,44 @@ async def validate_and_save_config(
         )
 
     else:
-        # Remote provider
-        if name not in ("openai", "anthropic"):
-            return False, f"Unknown remote provider: '{provider_name}'. Use 'openai' or 'anthropic'."
+        # Remote provider — resolved through the registry built in
+        # services.llm_provider (feature 22): a built-in id (openai,
+        # gemini, anthropic) uses its own default base URL and requires
+        # its key; any other id is servable through the openai-completions
+        # shape as soon as a base_url is supplied, and its key is optional
+        # (LM Studio/vLLM/llama.cpp and similar local servers commonly
+        # don't require one). Every check below runs before any network
+        # call, so a malformed config never costs a live request.
+        if not name:
+            return False, "provider_name is required"
 
-        if not key:
+        if name == "ollama":
+            # Ollama is always local — it isn't one of this branch's
+            # built-ins (get_builtin_provider_ids() excludes it) and
+            # isn't a valid "custom" id either; a base_url here would
+            # silently skip the is_local branch's /api/tags model check.
+            return False, (
+                "provider_name 'ollama' is only reachable with "
+                "is_local=true (Ollama is always local) — retry with "
+                "is_local=true."
+            )
+
+        builtins = get_builtin_provider_ids()
+
+        if base_url:
+            normalized_base_url, url_error = _validate_base_url(base_url)
+            if url_error:
+                return False, url_error
+            base_url = normalized_base_url
+
+        if name not in builtins and not base_url:
+            return False, (
+                f"Unknown provider '{provider_name}'. Built-in providers: "
+                f"{', '.join(sorted(builtins))}. A custom provider needs "
+                "an OpenAI-compatible base_url."
+            )
+
+        if key_env_for(name) and not key:
             return False, f"API key is required for {name}"
 
         # Quick connectivity check

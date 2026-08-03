@@ -639,6 +639,35 @@ _FALLBACK_MODELS: dict[str, list[str]] = {
 
 
 # -----------------------------------------------------------------------
+# Public registry accessors — the config layer (services.llm_config) needs
+# to know which ids are built-in and whether a key is required, without
+# reaching into the private _REGISTRY dict (keeps _ProviderSpec internal).
+# -----------------------------------------------------------------------
+
+def get_builtin_provider_ids() -> frozenset[str]:
+    """
+    Ids servable directly through the built-in registry (``openai``,
+    ``gemini``, ``anthropic``). Excludes ``ollama``, which isn't part of
+    this registry — it's handled through its own native path (see module
+    docstring), not one of the two shapes above.
+    """
+    return frozenset(_REGISTRY)
+
+
+def key_env_for(provider_name: str) -> str | None:
+    """
+    The env var a built-in provider's API key normally lives in, or
+    ``None`` if *provider_name* isn't a built-in id, or is built-in but
+    doesn't require a key. Callers (``services.llm_config``) use it as the
+    "is a key mandatory here?" predicate — ``get_provider`` itself never
+    reads env vars, so the var is named for the caller's benefit, not
+    consulted.
+    """
+    spec = _REGISTRY.get(provider_name.lower().strip())
+    return spec.key_env if spec else None
+
+
+# -----------------------------------------------------------------------
 # Factory
 # -----------------------------------------------------------------------
 

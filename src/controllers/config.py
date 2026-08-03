@@ -39,8 +39,10 @@ async def set_llm_config(data: LLMConfigRequest):
     When ``is_local=true``, the system will look for an Ollama instance
     at the default port and verify the model is installed.
 
-    When ``is_local=false``, it requires ``provider_data.key`` and will
-    validate connectivity with the remote provider.
+    When ``is_local=false``, it validates connectivity with the remote
+    provider; ``provider_data.key`` is required for the built-in remote
+    providers (openai, gemini, anthropic) and optional for a custom
+    OpenAI-compatible endpoint.
     """
     success, message = await validate_and_save_config(
         is_local=data.is_local,
