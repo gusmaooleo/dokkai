@@ -61,7 +61,29 @@ Cost control (a description is one LLM call — the pipeline's dominant cost):
     with ``{"force": true}``. Note :func:`describe_chunks`'s returned
     ``stats["model"]`` names the CONFIGURED model, not necessarily the one
     that produced every description in the batch — some may be cache hits
-    generated earlier, by a different provider or model.
+    generated earlier, by a different provider or model. The PROVIDER and
+    model that actually produced each cached description ARE recorded
+    alongside it (:class:`DescriptionCache`, feature 22 C8, under a
+    reserved ``__models__`` side-key — entries themselves stay bare
+    ``hash -> description`` strings, unchanged from before C8, so a
+    ``git checkout main`` against a cache this code wrote, or the reverse,
+    is never a hard failure) — a cache hit whose recorded provider+model
+    differs from the currently configured one is still served as-is (the
+    key is still source hash alone) but counted in the returned
+    ``stats["stale_model_hits"]`` and logged as a single aggregate warning,
+    so a switch is visible instead of silently producing a mixed-quality
+    corpus. Pre-C8 cache entries (no ``__models__`` record at all — the
+    common case on first upgrade, since the real corpus predates C8
+    entirely) have no recorded producer — read as-is, served as hits,
+    never counted as stale (there is nothing to compare) and never
+    invalidated: getting this wrong would force a paid re-describe of
+    every existing corpus on upgrade, the exact cost this whole cache
+    exists to avoid. They're counted separately, in
+    ``stats["unknown_model_hits"]``, with one aggregate informational
+    (not warning) log line pointing at ``force: true`` — silence here
+    would leave the one corpus that most needs the signal (a pre-C8 cache,
+    which is every existing user's, today) with no indication that
+    "upgrade the model" requires an explicit re-describe.
   - **Concurrent**: bounded parallel requests to the configured provider.
 
 If no model is configured (``DESC_MODEL`` unset) or the configured provider
@@ -180,40 +202,155 @@ def _default_cache_path() -> Path:
     return base / "data" / "description_cache.json"
 
 
+_MODELS_KEY = "__models__"  # reserved side-key — see DescriptionCache docstring
+
+
+def _split_cache_payload(raw: object) -> tuple[dict[str, str], dict[str, tuple[str | None, str | None]]]:
+    """
+    Split a just-parsed cache JSON object into ``(descriptions, producers)``.
+
+    ``descriptions`` is ``hash -> text`` — every key except the reserved
+    ``__models__`` side-key, and only where the value is a plain string.
+    Anything else under a hash key (wrong type — a leftover dict from an
+    earlier, since-reverted, per-entry-shape attempt at this feature; a
+    number; a list; ...) is DROPPED, not served: a miss costs one
+    redundant description next run, serving it as text (or worse, handing
+    a non-string through to ``chunk.description`` and eventually a
+    Weaviate ``TEXT`` property) costs a corrupted/blank entry that never
+    recovers on its own.
+
+    ``producers`` is ``hash -> (model, provider)``, read from
+    ``__models__`` when present and well-formed (a dict of
+    ``hash -> {"model": ..., "provider": ...}``); a missing, wrong-typed,
+    or malformed ``__models__`` (or a malformed per-hash entry inside it)
+    is treated as "nothing recorded" rather than raising — never blocks
+    reading the descriptions themselves.
+
+    A non-dict top-level payload (corrupt file, or valid JSON that isn't a
+    JSON object) returns two empty dicts rather than raising — same
+    graceful-empty-cache behavior ``DescriptionCache.__init__`` already had
+    pre-C8 for a JSON-decode failure.
+    """
+    descriptions: dict[str, str] = {}
+    producers: dict[str, tuple[str | None, str | None]] = {}
+    if not isinstance(raw, dict):
+        return descriptions, producers
+    for key, value in raw.items():
+        if key == _MODELS_KEY:
+            continue
+        if isinstance(value, str):
+            descriptions[key] = value
+    raw_producers = raw.get(_MODELS_KEY)
+    if isinstance(raw_producers, dict):
+        for h, v in raw_producers.items():
+            if isinstance(v, dict):
+                model = v.get("model")
+                provider = v.get("provider")
+                producers[h] = (
+                    model if isinstance(model, str) else None,
+                    provider if isinstance(provider, str) else None,
+                )
+    return descriptions, producers
+
+
 class DescriptionCache:
-    """``source_hash -> description``, persisted as a single JSON file."""
+    """
+    ``source_hash -> description`` — bare strings, byte-identical to the
+    pre-C8 shape — persisted as a single JSON file, plus a reserved
+    ``__models__`` side-key recording which provider/model produced each
+    entry: ``{"<source_hash>": {"model": ..., "provider": ...}}``.
+
+    Chosen (feature 22 C8, decision ``22-cache-model``, revised after
+    review) over changing each entry's OWN shape (``hash ->
+    {"text": ..., "model": ...}``) specifically so a plain ``git checkout
+    main`` is never a hard failure: no source hash can ever equal the
+    literal string ``"__models__"`` (hashes are hex sha256, ``__models__``
+    isn't valid hex), so code that only ever addresses REAL hash keys —
+    which is everything main's ``DescriptionCache`` does — never touches
+    it. Concretely: a cache this code wrote, read by ``main``, yields
+    exactly the strings ``main`` expects (nothing downstream — e.g.
+    ``weaviate_client.py``'s ``TEXT`` property write — ever sees anything
+    but a string); a cache ``main`` wrote (or generated fresh, with no
+    ``__models__`` at all), read by this code, is just every entry
+    reporting "producer unknown". ``main``'s own merge-on-save
+    (``{**on_disk, **self._data}``) passes ``__models__`` through
+    untouched as an ordinary key it doesn't recognize, so **no description
+    is ever lost in either direction**.
+
+    Producer metadata is best-effort under version mixing: if a ``main``
+    process holds the map as an ordinary key while a newer process records
+    a producer, ``main``'s save writes its own stale snapshot back and that
+    producer is dropped. The description survives; the entry simply reports
+    "producer unknown" and is re-recorded the next time it is generated.
+    """
 
     def __init__(self, path: Path | None = None) -> None:
         self._path = path or _default_cache_path()
         self._data: dict[str, str] = {}
+        self._producers: dict[str, tuple[str | None, str | None]] = {}
         if self._path.exists():
             try:
-                self._data = json.loads(self._path.read_text(encoding="utf-8"))
+                raw = json.loads(self._path.read_text(encoding="utf-8"))
+                self._data, self._producers = _split_cache_payload(raw)
             except (json.JSONDecodeError, OSError):
-                self._data = {}
+                self._data, self._producers = {}, {}
 
-    def get(self, source_hash: str) -> str | None:
-        return self._data.get(source_hash)
+    def get(self, source_hash: str) -> tuple[str, str | None, str | None] | None:
+        """Returns ``(description, model, provider)`` or ``None`` on a
+        miss. ``model``/``provider`` are ``None`` when no producer was
+        recorded — a pre-C8 entry, or one this process itself wrote
+        without a known provider/model (shouldn't happen in practice, but
+        never crashes)."""
+        text = self._data.get(source_hash)
+        if text is None:
+            return None
+        model, provider = self._producers.get(source_hash, (None, None))
+        return text, model, provider
 
-    def set(self, source_hash: str, description: str) -> None:
+    def set(self, source_hash: str, description: str, model: str | None = None, provider: str | None = None) -> None:
+        # The whole side-key design rests on no source hash ever colliding
+        # with _MODELS_KEY. `_source_hash` returns a sha256 hexdigest, so it
+        # can't today — but if that ever changed, the collision would be
+        # silent and permanent: save() would overwrite the description with
+        # the producer map, and every run would pay to re-describe that
+        # entity forever. Cheap to make load-bearing rather than documented.
+        if source_hash == _MODELS_KEY:
+            raise ValueError(f"source hash may not be the reserved key {_MODELS_KEY!r}")
         self._data[source_hash] = description
+        if model is not None or provider is not None:
+            self._producers[source_hash] = (model, provider)
+        else:
+            self._producers.pop(source_hash, None)
 
     def save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         # Merge with what's on disk (a concurrent job may have written entries we
         # don't have) and write atomically, so a full-file overwrite can't clobber
-        # a parallel writer or leave a truncated file behind.
-        merged = dict(self._data)
+        # a parallel writer or leave a truncated file behind. Descriptions and
+        # producers are merged independently — both sides go through
+        # _split_cache_payload, so this is correct regardless of whether the
+        # on-disk file predates __models__ entirely (pre-C8/HEAD-written).
+        merged_data = dict(self._data)
+        merged_producers = dict(self._producers)
         if self._path.exists():
             try:
-                on_disk = json.loads(self._path.read_text(encoding="utf-8"))
-                merged = {**on_disk, **self._data}
+                raw = json.loads(self._path.read_text(encoding="utf-8"))
+                on_disk_data, on_disk_producers = _split_cache_payload(raw)
+                merged_data = {**on_disk_data, **self._data}
+                merged_producers = {**on_disk_producers, **self._producers}
             except (json.JSONDecodeError, OSError):
                 pass
+        payload: dict[str, object] = dict(merged_data)
+        if merged_producers:
+            payload[_MODELS_KEY] = {
+                h: {"model": model, "provider": provider}
+                for h, (model, provider) in merged_producers.items()
+            }
         tmp = self._path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(merged, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         tmp.replace(self._path)
-        self._data = merged
+        self._data = merged_data
+        self._producers = merged_producers
 
 
 # ---------------------------------------------------------------------------
@@ -460,7 +597,12 @@ async def describe_chunks(
     an unavailable provider still succeeds offline).
 
     Returns a stats dict (enabled / describable / cached / generated / failed /
-    skipped / templated) suitable for surfacing in a job status.
+    skipped / templated / stale_model_hits / unknown_model_hits) suitable
+    for surfacing in a job status. ``stale_model_hits`` counts cache hits
+    whose recorded provider/model is KNOWN (not a pre-C8/unrecorded entry)
+    and differs from the currently configured provider/model.
+    ``unknown_model_hits`` counts hits with no recorded producer at all —
+    see the module docstring's "Cached by source hash ALONE" note.
     """
     # Template pass first — model-independent, so it runs even without an LLM
     # configured. Templated chunks never reach the LLM target list.
@@ -488,17 +630,53 @@ async def describe_chunks(
 
     # Cache pass first — reuse descriptions for unchanged source (no LLM call).
     # force=True skips reads only; every target below still gets its fresh
-    # result written back to the cache.
+    # result written back to the cache. A hit whose recorded provider+model
+    # differs from the CURRENTLY CONFIGURED one (known producer, not the
+    # pre-C8/unrecorded "unknown" case) is still served — the cache stays
+    # keyed on source hash alone — but counted so describe_chunks can warn
+    # about it below rather than silently mixing description quality
+    # across providers/models. A hit with NO recorded producer at all is
+    # counted separately (unknown_model_hits) — never a mismatch (nothing
+    # to compare against), but still surfaced once, informationally, since
+    # it's the common case on first upgrade and the one that most needs a
+    # pointer at force=True.
     to_generate: list[tuple[CodeChunk, str]] = []
     cached = 0
+    stale_model_hits = 0
+    unknown_model_hits = 0
+    stale_producers: set[str] = set()
     for chunk in targets:
         source_hash = _source_hash(chunk)
         hit = None if force else cache.get(source_hash)
         if hit is not None:
-            chunk.description = hit
+            text, hit_model, hit_provider = hit
+            chunk.description = text
             cached += 1
+            if hit_model is None and hit_provider is None:
+                unknown_model_hits += 1
+            elif hit_model != model or hit_provider != provider_name:
+                stale_model_hits += 1
+                stale_producers.add(f"{hit_provider or '?'}/{hit_model or '?'}")
         else:
             to_generate.append((chunk, source_hash))
+
+    if stale_model_hits:
+        logger.warning(
+            "descriptor: %d cached description(s) served from provider/model(s) "
+            "%s, which differ from the currently configured '%s/%s' — they "
+            "will keep serving as-is (the cache is keyed on source hash "
+            "alone) until re-described with force=True.",
+            stale_model_hits, sorted(stale_producers), provider_name, model,
+        )
+    if unknown_model_hits:
+        logger.info(
+            "descriptor: %d cached description(s) were written before this "
+            "tracking existed, so their provider/model is unknown — they may "
+            "or may not match the currently configured '%s/%s'. A refresh "
+            "with force: true regenerates every describable entity, not "
+            "only these, under the current provider/model.",
+            unknown_model_hits, provider_name, model,
+        )
 
     generated = failed = 0
     if to_generate:
@@ -518,7 +696,7 @@ async def describe_chunks(
                     desc = ""
                 if desc:
                     chunk.description = desc
-                    cache.set(source_hash, desc)
+                    cache.set(source_hash, desc, model, provider_name)
                     generated += 1
                 else:
                     failed += 1
@@ -533,4 +711,6 @@ async def describe_chunks(
 
     return {"enabled": True, "model": model, "describable": len(targets),
             "cached": cached, "generated": generated, "failed": failed,
-            "pending": 0, "skipped": skipped, "templated": templated}
+            "pending": 0, "skipped": skipped, "templated": templated,
+            "stale_model_hits": stale_model_hits,
+            "unknown_model_hits": unknown_model_hits}

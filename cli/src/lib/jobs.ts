@@ -24,6 +24,13 @@ export interface DescriptionStats {
   pending?: number;
   skipped?: number;
   templated?: number;
+  /** Cache hits whose recorded provider/model is known and differs from the
+   * currently configured one (feature 22) — served as-is, warned about;
+   * re-describe with `force: true` to refresh them. */
+  stale_model_hits?: number;
+  /** Cache hits with no recorded producer at all (pre-feature-22 entry) —
+   * may or may not match the currently configured provider/model. */
+  unknown_model_hits?: number;
 }
 
 export interface JobResult {

@@ -2296,6 +2296,8 @@ components:
         pending: { type: integer, description: Queued but not generated (e.g. model unavailable). }
         skipped: { type: integer, description: Entities not eligible for a description. }
         templated: { type: integer, description: "No-LLM template description (doc-less non-test Types, and Enums without methods)." }
+        stale_model_hits: { type: integer, description: "Cache hits whose recorded provider/model is known and differs from the currently configured one (feature 22) — served as-is, logged as a warning; re-describe with `force: true` to refresh them." }
+        unknown_model_hits: { type: integer, description: "Cache hits with no recorded producer at all — a pre-feature-22 cache entry. May or may not match the currently configured provider/model; logged once, informationally, pointing at `force: true`." }
 
     VectorizeResult:
       type: object
