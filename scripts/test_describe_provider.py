@@ -521,6 +521,25 @@ def main() -> None:
             "DESCRIBE_TEST_FIXTURE_KEY" in r2.stdout,
             r2.stdout,
         )
+        check(
+            # get_builtin_provider_ids() at _resolve_provider's enrichment
+            # check (not get_registered_provider_ids()) is what makes
+            # THIS the message that surfaces: get_provider's own SPECIFIC
+            # diagnostic, which names the config/providers.json path that
+            # references the unresolved var — swapping in
+            # get_registered_provider_ids() there would make a
+            # file-registered id match too (it IS "registered"), silently
+            # replacing this with describe.py's own GENERIC "requires an
+            # API key — set DESC_API_KEY, or VAR" message, which never
+            # names the file. Both mention the var name, so a check that
+            # only looked for that (the one above) can't tell them apart;
+            # this one can.
+            "file-registered provider, unresolved ${ENV} key: reason is get_provider's "
+            "SPECIFIC diagnostic (names the providers.json path), not describe.py's "
+            "generic built-in-only fallback message",
+            str(providers_path) in r2.stdout,
+            r2.stdout,
+        )
 
     # -----------------------------------------------------------------
     # 10. DESC_BASE_URL validation (review round 2, point 1): routed

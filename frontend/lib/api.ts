@@ -25,6 +25,7 @@ import type {
   LaunchRoutineResponse,
   LLMConfig,
   LLMConfigRequest,
+  LLMProvidersListResponse,
   LoginResponse,
   Me,
   ModelsListResponse,
@@ -286,6 +287,7 @@ export const routinesApi = {
 export const configApi = {
   setLlm: (data: LLMConfigRequest) => request<LLMConfig>("/config/llm", { method: "POST", body: data }),
   getLlm: () => request<LLMConfig>("/config/llm"),
+  listProviders: () => request<LLMProvidersListResponse>("/config/llm/providers"),
   listModels: () => request<ModelsListResponse>("/config/llm/models"),
   health: () => request<ProviderHealth>("/config/llm/health"),
 };

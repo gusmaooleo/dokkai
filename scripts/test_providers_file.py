@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -289,6 +290,118 @@ def main() -> None:
             check(
                 f"empty/whitespace-only id rejected: {bad_id!r}",
                 r.returncode != 0 and "empty" in r.stderr,
+                (r.returncode, r.stderr),
+            )
+
+        # -----------------------------------------------------------------
+        # Id charset (feature 22, C5 review, round 2): [a-z0-9._-] after
+        # normalization — underscore IS included ('lm_studio' is a
+        # plausible real id, e.g. for LM Studio, and shouldn't be lost to
+        # defend against a frontend-only sentinel string). A space
+        # ('corp gateway', which loaded cleanly before this rule existed)
+        # and other punctuation outside the set are still rejected.
+        # -----------------------------------------------------------------
+        for bad_id in ("corp gateway", "gr#oq", "gr/oq", "gr@oq"):
+            bad_charset_path = write_fixture(
+                tmpdir,
+                f"bad_charset_{abs(hash(bad_id))}.json",
+                {"providers": {bad_id: {"api": "openai-completions", "baseUrl": "https://x.example/v1"}}},
+            )
+            r = run(IMPORT_AND_PRINT_IDS, bad_charset_path)
+            check(
+                f"invalid-charset id rejected: {bad_id!r}",
+                r.returncode != 0 and "invalid" in r.stderr and bad_id in r.stderr,
+                (r.returncode, r.stderr),
+            )
+
+        # -----------------------------------------------------------------
+        # Id-rejection messages redact embedded userinfo (feature 22, C5
+        # review, round 3): the realistic trigger for THIS specific rule
+        # is an admin pasting a gateway URL into the id SLOT instead of
+        # baseUrl — the resulting boot-time exception must not echo the
+        # credential to stderr (which ships to uvicorn logs / `docker
+        # compose logs`, readable by more people than the gitignored
+        # file). Only the invalid-charset message is independently
+        # exercisable with a credential-bearing id: the shadow/duplicate
+        # messages downstream are reached only AFTER an id has already
+        # passed the charset gate, and a charset-legal id (no ':', '/',
+        # '@') can never itself contain a "://user:pass@" pattern for
+        # _redact_userinfo to find — they're redacted too (uniform with
+        # this module's validate_base_url discipline), but that can't be
+        # proven through a live trigger the way this one can.
+        # -----------------------------------------------------------------
+        userinfo_id_path = write_fixture(
+            tmpdir,
+            "userinfo_id.json",
+            {
+                "providers": {
+                    "https://svc-user:fixture-secret-do-not-print-xyz@gw.example/v1": {
+                        "api": "openai-completions",
+                        "baseUrl": "https://gw.example/v1",
+                    }
+                }
+            },
+        )
+        r = run(IMPORT_AND_PRINT_IDS, userinfo_id_path)
+        check(
+            "credential-bearing id (pasted into the id slot by mistake) is rejected as invalid charset",
+            r.returncode != 0 and "invalid" in r.stderr,
+            (r.returncode, r.stderr),
+        )
+        check(
+            "...and the embedded password is redacted from the boot-time error, not echoed",
+            "fixture-secret-do-not-print-xyz" not in r.stderr and "://***@gw.example" in r.stderr,
+            r.stderr,
+        )
+
+        valid_charset_path = write_fixture(
+            tmpdir,
+            "valid_charset.json",
+            {
+                "providers": {
+                    "my-gateway": {"api": "openai-completions", "baseUrl": "https://x.example/v1"},
+                    "lm_studio": {"api": "openai-completions", "baseUrl": "https://y.example/v1"},
+                }
+            },
+        )
+        r = run(IMPORT_AND_PRINT_IDS, valid_charset_path)
+        check(
+            "valid ids (letters, digits, '.', '_', '-') still load cleanly, incl. 'lm_studio'",
+            r.returncode == 0 and "my-gateway" in r.stdout and "lm_studio" in r.stdout,
+            (r.returncode, r.stdout, r.stderr),
+        )
+
+        # -----------------------------------------------------------------
+        # The Settings card's "Other" tab sentinel (frontend/components/
+        # settings/llm-card.tsx's OTHER_TAB) is kept OUT of the id charset
+        # ON PURPOSE, rather than the charset excluding underscore to keep
+        # it out — see _PROVIDER_ID_RE's module comment. This is the check
+        # that ties the two files together: it reads the ACTUAL current
+        # value of OTHER_TAB out of the frontend source (not a hardcoded
+        # guess that could silently drift from it) and proves the loader
+        # rejects a file entry keyed exactly that — so a future edit to
+        # either side that reopens the collision (the frontend picking a
+        # charset-legal sentinel, or the loader's charset widening to
+        # accept '@') fails HERE instead of shipping quietly.
+        # -----------------------------------------------------------------
+        llm_card_src = (REPO_ROOT / "frontend" / "components" / "settings" / "llm-card.tsx").read_text()
+        other_tab_match = re.search(r'const OTHER_TAB = "([^"]+)"', llm_card_src)
+        check(
+            "found the frontend's OTHER_TAB sentinel declaration to test against",
+            other_tab_match is not None,
+            llm_card_src[:200],
+        )
+        if other_tab_match:
+            sentinel = other_tab_match.group(1)
+            sentinel_path = write_fixture(
+                tmpdir,
+                "sentinel_collision.json",
+                {"providers": {sentinel: {"api": "openai-completions", "baseUrl": "https://x.example/v1"}}},
+            )
+            r = run(IMPORT_AND_PRINT_IDS, sentinel_path)
+            check(
+                f"the frontend's OTHER_TAB sentinel ({sentinel!r}) is structurally rejected as a provider id",
+                r.returncode != 0 and "invalid" in r.stderr,
                 (r.returncode, r.stderr),
             )
 
@@ -652,6 +765,100 @@ def main() -> None:
         check(
             "file-registered id joins get_registered_provider_ids()",
             r.returncode == 0 and "groq" in r.stdout,
+            (r.returncode, r.stdout, r.stderr),
+        )
+
+        # -----------------------------------------------------------------
+        # get_builtin_provider_ids()/display_name_for()/default_base_url_for()
+        # (feature 22, C5 review) — the accessors controllers.config's
+        # provider-listing endpoint uses instead of a second, driftable
+        # copy of the three built-in ids / a str.title()-mangled label /
+        # a hardcoded Gemini URL.
+        # -----------------------------------------------------------------
+        accessors_probe = (
+            "import services.llm_provider as lp\n"
+            "print(sorted(lp.get_builtin_provider_ids()))\n"
+            "print('ollama' in lp.get_builtin_provider_ids())\n"
+            "print('groq' in lp.get_builtin_provider_ids())\n"
+            "print(lp.display_name_for('openai'))\n"
+            "print(lp.display_name_for('groq'))\n"
+            "print(lp.display_name_for('not-registered-at-all'))\n"
+            "print(lp.default_base_url_for('gemini'))\n"
+            "print(lp.default_base_url_for('openai'))\n"
+            "print(lp.default_base_url_for('groq'))\n"
+        )
+        r = run(accessors_probe, groq_path, extra_env={"TEST_GROQ_FIXTURE_KEY": "fixture-secret-do-not-print-abc123"})
+        out_lines = r.stdout.strip().splitlines()
+        check(
+            "accessors probe runs cleanly (9 output lines)",
+            r.returncode == 0 and len(out_lines) == 9,
+            (r.returncode, r.stdout, r.stderr),
+        )
+        if len(out_lines) == 9:
+            check(
+                "get_builtin_provider_ids() is exactly the three built-ins",
+                out_lines[0] == "['anthropic', 'gemini', 'openai']",
+                out_lines[0],
+            )
+            check("get_builtin_provider_ids() excludes ollama", out_lines[1] == "False", out_lines[1])
+            check(
+                "get_builtin_provider_ids() excludes a file-registered id",
+                out_lines[2] == "False",
+                out_lines[2],
+            )
+            check("display_name_for('openai') is 'OpenAI'", out_lines[3] == "OpenAI", out_lines[3])
+            check(
+                "display_name_for('groq') is the file's own id, not a title-cased mangling",
+                out_lines[4] == "groq",
+                out_lines[4],
+            )
+            check(
+                "display_name_for(unregistered) is None",
+                out_lines[5] == "None",
+                out_lines[5],
+            )
+            check(
+                "default_base_url_for('gemini') is its real, non-guessable default",
+                out_lines[6] == "https://generativelanguage.googleapis.com/v1beta/openai/",
+                out_lines[6],
+            )
+            check(
+                "default_base_url_for('openai') is None (no override — SDK's own default applies)",
+                out_lines[7] == "None",
+                out_lines[7],
+            )
+            check(
+                "default_base_url_for('groq') is None EVEN THOUGH groq has a real baseUrl of its own "
+                "(file-registered defaults are never exposed through this accessor)",
+                out_lines[8] == "None",
+                out_lines[8],
+            )
+
+        # -----------------------------------------------------------------
+        # default_base_url_for()'s _redact_userinfo pass is a defense-in-
+        # depth belt-and-braces measure (feature 22, C5 review) — no
+        # built-in default carries embedded userinfo today, so this can't
+        # be proven through the real registry. White-box: replace a
+        # built-in's spec (frozen dataclass -> dataclasses.replace) with
+        # one whose default_base_url legitimately embeds Basic-auth
+        # credentials, and confirm the accessor still scrubs them, rather
+        # than assuming the wrapping call is dead code.
+        # -----------------------------------------------------------------
+        redact_probe = (
+            "import dataclasses\n"
+            "import services.llm_provider as lp\n"
+            "spec = lp._REGISTRY['openai']\n"
+            "lp._REGISTRY['openai'] = dataclasses.replace(\n"
+            "    spec, default_base_url='https://svc-user:svc-secret@sneaky.example/v1'\n"
+            ")\n"
+            "print(lp.default_base_url_for('openai'))\n"
+        )
+        r = run(redact_probe, None)
+        check(
+            "default_base_url_for() redacts embedded userinfo, not just built-in-only gating",
+            r.returncode == 0
+            and "svc-secret" not in r.stdout
+            and "://***@sneaky.example/v1" in r.stdout,
             (r.returncode, r.stdout, r.stderr),
         )
 

@@ -88,6 +88,7 @@ from services.chunker import CodeChunk
 from services.llm_provider import (
     LLMMessage,
     LLMProvider,
+    get_builtin_provider_ids,
     get_provider,
     get_registered_provider_ids,
     key_env_for,
@@ -242,19 +243,6 @@ def _descriptor_base_url(provider_name: str) -> str:
     return os.getenv("DESC_BASE_URL", "").strip()
 
 
-# The three ids that ship inside services.llm_provider's own _REGISTRY at
-# import time (C1). Used ONLY to enrich the missing-key skip reason below
-# (point 4, review round 2) — a file-registered provider missing its
-# ${ENV} key already gets a MORE specific diagnostic straight from
-# get_provider (it names the exact var AND the config/providers.json path
-# that references it), which this set deliberately does not override; only
-# a built-in's generic "requires an API key" (which names no variable at
-# all) needs the enrichment. NOT used for the DESC_BASE_URL-override
-# warning below anymore (review round 2, point 3) — see
-# get_registered_provider_ids() at that call site instead.
-_BUILTIN_IDS = frozenset({"openai", "gemini", "anthropic"})
-
-
 def _resolve_provider(provider_name: str, base_url: str) -> tuple[LLMProvider | None, str]:
     """
     Instantiate the configured provider, or return a graceful-skip reason.
@@ -338,7 +326,14 @@ def _resolve_provider(provider_name: str, base_url: str) -> tuple[LLMProvider | 
     try:
         provider = get_provider(provider_name, api_key=api_key, base_url=base_url or None)
     except ValueError as e:
-        if not api_key and key_env and provider_name in _BUILTIN_IDS:
+        # get_builtin_provider_ids() here, not get_registered_provider_ids():
+        # a file-registered provider missing its ${ENV} key already gets a
+        # MORE specific diagnostic straight from get_provider (it names the
+        # exact var AND the config/providers.json path that references it),
+        # which this branch deliberately does not override — only a
+        # built-in's generic "requires an API key" (which names no variable
+        # at all) needs the enrichment below.
+        if not api_key and key_env and provider_name in get_builtin_provider_ids():
             return None, (
                 f"{provider_name} requires an API key — set DESC_API_KEY, "
                 f"or {key_env}"

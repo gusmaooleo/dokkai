@@ -700,9 +700,14 @@ class _ProviderSpec:
     # that isn't set yet is not a value to log — this field only ever
     # holds the (non-secret) variable NAME.
     api_key_env: str | None = None
-    # providers.json's models[] — feeds the (not-yet-built, C5) UI model
-    # dropdown for this id; empty = free-text model field. Unused by any
-    # consumer in this commit, carried through for forward compatibility.
+    # providers.json's models[] — feeds TWO consumers (feature 22): (1)
+    # list_models()'s fallback (_FALLBACK_MODELS, wired in below) when
+    # this id is the ACTIVE provider and its live catalog call fails, and
+    # (2) GET /config/llm/providers' `models` field (via models_for(),
+    # "Public registry accessors" below, C5), which lets the Settings
+    # card's model dropdown work for a not-yet-active file-registered
+    # provider too, not only the active one. Empty = free-text model
+    # field for both.
     models: tuple[str, ...] = field(default_factory=tuple)
 
 
@@ -782,6 +787,32 @@ _FALLBACK_MODELS: dict[str, list[str]] = {
 # -----------------------------------------------------------------------
 
 _RESERVED_PROVIDER_IDS = frozenset(_REGISTRY) | {"ollama"}
+
+# Charset for a normalized (lowercased/stripped) provider id — lowercase
+# ASCII letters, digits, '.', '_', '-'. Underscore is INCLUDED
+# deliberately (feature 22, C5 review, round 2): 'lm_studio' is a
+# plausible real id (LM Studio being exactly the kind of OpenAI-compatible
+# local server this feature exists to support) and underscore is a common
+# separator — rejecting it to defend against a collision with a frontend
+# sentinel string would be a real, permanent usability cost paid to guard
+# against a string the FRONTEND chose, not one inherent to what a
+# provider id can legitimately be. This still rejects a space
+# (``"corp gateway"``, which loaded cleanly before this rule existed) and
+# anything else outside this set.
+#
+# The Settings card's "Other" tab sentinel (``frontend/components/
+# settings/llm-card.tsx``'s ``OTHER_TAB``) is kept OUT of this charset
+# instead: it's ``"@other"`` — '@' is not in ``[a-z0-9._-]``, so no
+# provider id can EVER equal it; the loader rejects any file entry
+# keyed ``"@other"`` at boot (see the id-charset check below), the same
+# way it rejects ``"corp gateway"``. This makes the two files structurally
+# unable to collide (a file entry can't accidentally become unreachable
+# behind the sentinel tab) rather than relying on two independently
+# maintained regexes happening to agree — see
+# ``scripts/test_providers_file.py``'s dedicated check tying the two
+# together, so a future edit to either side that reopens the collision
+# fails a test instead of shipping quietly.
+_PROVIDER_ID_RE = re.compile(r"^[a-z0-9._-]+$")
 
 _ENTRY_ALLOWED_KEYS = frozenset({"api", "baseUrl", "apiKey", "models"})
 
@@ -913,7 +944,11 @@ def _load_providers_file() -> None:
       into quietly serving something other than intended" reasoning as
       malformed JSON. Unrecognized OTHER top-level keys (e.g. a
       ``"$schema"`` hint) are tolerated.
-    - An entry whose id is empty/shadows a built-in
+    - An entry whose id is empty/contains a character outside
+      ``[a-z0-9._-]`` (after lowercasing — rules out a space, e.g.
+      ``"corp gateway"``, and the frontend's "Other" tab sentinel,
+      ``"@other"``, whose ``'@'`` can never appear in a valid id)/shadows
+      a built-in
       (openai/gemini/anthropic/ollama)/duplicates another entry's id
       after case/whitespace normalization, an unknown ``api`` shape, a
       missing/invalid ``baseUrl``, an unknown field (catches the
@@ -959,26 +994,53 @@ def _load_providers_file() -> None:
     known_shapes = (_SHAPE_OPENAI_COMPLETIONS, _SHAPE_ANTHROPIC_MESSAGES)
     seen_pids: dict[str, str] = {}
 
+    # Every id-rejection message below echoes the raw JSON key
+    # (provider_id) verbatim for its actionable value — but that key is
+    # admin-authored, unvalidated text, and the realistic way it goes
+    # wrong is precisely the mistake the id-charset rule below exists to
+    # catch: pasting a gateway URL into the id SLOT instead of baseUrl
+    # (e.g. "https://svc-user:svc-pw@gw.example/v1": {...}). Without
+    # redaction that credential would be echoed in a boot-time exception
+    # — which typically ships to uvicorn's stderr / `docker compose logs`
+    # / a log aggregator, readable by more people than the gitignored
+    # file itself. _redact_userinfo is applied uniformly to every raise
+    # in this loop for that reason, matching validate_base_url's own
+    # userinfo-redaction discipline rather than leaving some exempt.
     for provider_id, entry in providers.items():
         pid = str(provider_id).strip().lower()
 
         if not pid:
-            raise ValueError(f"{path}: provider id {provider_id!r} must not be empty/whitespace")
+            raise ValueError(
+                _redact_userinfo(f"{path}: provider id {provider_id!r} must not be empty/whitespace")
+            )
+
+        if not _PROVIDER_ID_RE.match(pid):
+            raise ValueError(
+                _redact_userinfo(
+                    f"{path}: provider id {provider_id!r} is invalid — ids may "
+                    "only contain lowercase letters, digits, '.', '_' and '-' "
+                    "(e.g. 'groq', 'my-gateway', 'lm_studio')."
+                )
+            )
 
         if pid in _RESERVED_PROVIDER_IDS:
             raise ValueError(
-                f"{path}: provider id '{provider_id}' shadows a built-in "
-                f"provider ({', '.join(sorted(_RESERVED_PROVIDER_IDS))}) "
-                "— choose a different id."
+                _redact_userinfo(
+                    f"{path}: provider id '{provider_id}' shadows a built-in "
+                    f"provider ({', '.join(sorted(_RESERVED_PROVIDER_IDS))}) "
+                    "— choose a different id."
+                )
             )
 
         if pid in seen_pids:
             raise ValueError(
-                f"{path}: provider ids '{seen_pids[pid]}' and '{provider_id}' "
-                f"both normalize to '{pid}' — duplicate ids "
-                "(case/whitespace-insensitive) are not allowed; rename one. "
-                "(Whichever JSON key sorts last would otherwise silently "
-                "win, discarding the other's shape/base_url/key.)"
+                _redact_userinfo(
+                    f"{path}: provider ids '{seen_pids[pid]}' and '{provider_id}' "
+                    f"both normalize to '{pid}' — duplicate ids "
+                    "(case/whitespace-insensitive) are not allowed; rename one. "
+                    "(Whichever JSON key sorts last would otherwise silently "
+                    "win, discarding the other's shape/base_url/key.)"
+                )
             )
         seen_pids[pid] = str(provider_id)
 
@@ -1062,8 +1124,9 @@ _load_providers_file()
 
 
 # -----------------------------------------------------------------------
-# Public registry accessors — the config layer (services.llm_config) needs
-# to know which ids are built-in and whether a key is required, without
+# Public registry accessors — services.llm_config and controllers.config
+# need to know which ids are registered/built-in, whether a key is
+# required, a display name, and a built-in's default base URL, without
 # reaching into the private _REGISTRY dict (keeps _ProviderSpec internal).
 # -----------------------------------------------------------------------
 
@@ -1111,6 +1174,89 @@ def key_env_for(provider_name: str) -> str | None:
     if spec.api_key_env and not os.getenv(spec.api_key_env):
         return spec.api_key_env
     return None
+
+
+def get_builtin_provider_ids() -> frozenset[str]:
+    """
+    The ids ``dokkai`` ships built-in support for (``openai``, ``gemini``,
+    ``anthropic``) — ``ollama`` excluded, same reasoning as
+    ``get_registered_provider_ids``. Derived from ``_RESERVED_PROVIDER_IDS``,
+    which is frozen from ``_REGISTRY`` BEFORE ``config/providers.json`` is
+    loaded (see that constant's comment), so this is never affected by
+    what the file registers — it answers "is this id code, or config?"
+    for a caller (``controllers.config``'s provider-listing endpoint) that
+    needs to tell the two apart, without that caller keeping its own
+    separate copy of the three ids (a copy that silently goes stale the
+    day a fourth built-in is added here).
+    """
+    return _RESERVED_PROVIDER_IDS - {"ollama"}
+
+
+def display_name_for(provider_name: str) -> str | None:
+    """
+    The human-readable display name for a registered id (built-in or
+    file-registered), or ``None`` if *provider_name* isn't registered at
+    all. For the three built-ins this is their fixed name (``'OpenAI'``,
+    ``'Gemini'``, ``'Anthropic'``). For a file-registered provider it's
+    the id exactly as written in ``config/providers.json`` (original
+    case preserved — the admin's own choice, e.g. ``'OpenRouter'``), NOT
+    a caller-side ``str.title()`` of the normalized lowercase id, which
+    mangles anything with internal capitals (``'gpt4all'`` ->
+    ``'Gpt4All'``). Not secret — the id is already public (it's what a
+    caller sends back as ``provider_name`` on every config write).
+    """
+    spec = _REGISTRY.get(provider_name.lower().strip())
+    return spec.display_name if spec is not None else None
+
+
+def default_base_url_for(provider_name: str) -> str | None:
+    """
+    The DEFAULT base URL for a BUILT-IN id ONLY (``openai``, ``gemini``,
+    ``anthropic``) — ``None`` for anything else, including a
+    file-registered provider, DELIBERATELY: unlike a built-in's default
+    (a fixed literal in this module, e.g. Gemini's OpenAI-compat URL,
+    never secret), a file-registered ``baseUrl`` is admin-authored and
+    ``validate_base_url`` legitimately accepts embedded Basic-auth
+    userinfo in a URL that has a host (``https://user:pass@host/v1``) —
+    and this function feeds a read endpoint any authenticated viewer, not
+    just an admin, can call. Returning ``None`` for anything outside the
+    three built-ins is what keeps that possibility structurally out of
+    reach here, rather than relying on every caller to remember not to
+    ask for it. ``None`` too when the built-in itself has no override
+    (``openai``/``anthropic`` — the SDK's own official default applies).
+
+    The returned value is still passed through ``_redact_userinfo`` as a
+    second line of defense — the three built-in defaults never contain
+    userinfo today, so this is normally a no-op, but it makes "never
+    leaks a credential" a checked invariant of this function rather than
+    an assumption about what the three literals happen to contain.
+    """
+    name = provider_name.lower().strip()
+    if name not in get_builtin_provider_ids():
+        return None
+    spec = _REGISTRY.get(name)
+    if spec is None or spec.default_base_url is None:
+        return None
+    return _redact_userinfo(spec.default_base_url)
+
+
+def models_for(provider_name: str) -> tuple[str, ...]:
+    """
+    A registered provider's declared ``models[]`` (``config/providers.json``,
+    feature 22, C3) — empty for an unregistered id, or a registered one
+    that declared none (``models[]`` absent/empty in the file means
+    "free-text model field", the same meaning ``_load_providers_file``
+    already gives it for the ``list_models()`` fallback below).
+
+    Unlike ``default_base_url_for``, this is NOT restricted to the three
+    built-ins: a model NAME carries no secret and isn't admin-authored
+    connection info the way a file-registered ``baseUrl`` is, so there's
+    no equivalent leak surface to guard against — safe to expose for any
+    registered id, built-in or file-registered. (The built-ins never
+    populate this field today; only ``config/providers.json`` entries do.)
+    """
+    spec = _REGISTRY.get(provider_name.lower().strip())
+    return spec.models if spec is not None else ()
 
 
 # -----------------------------------------------------------------------
