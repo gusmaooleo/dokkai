@@ -826,10 +826,9 @@ _ENTRY_ALLOWED_KEYS = frozenset({"api", "baseUrl", "apiKey", "models"})
 _PROVIDERS_FILE_PATH: Path | None = None
 
 # The exact supported form, matched anchored end-to-end. UPPERCASE-only
-# var name — matching OpenClaw's own convention exactly
-# (src/config/env-substitution.ts / types.secrets.ts:31-32 in the
-# dokkai_agent/openclaw reference clone: names match ``^[A-Z_][A-Z0-9_]*$``)
-# rather than an invented one. This is the load-bearing choice that makes
+# var name — matching OpenClaw's own convention exactly (env var names
+# match ``^[A-Z_][A-Z0-9_]*$``) rather than an invented one. This is the
+# load-bearing choice that makes
 # the discrimination below actually work: env vars are conventionally
 # UPPERCASE, so a value starting with ``$`` + a LOWERCASE letter, a digit,
 # or punctuation is confidently a literal, never a reference — there is no

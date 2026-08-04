@@ -1685,7 +1685,7 @@
               "host": ["{{baseUrl}}"],
               "path": ["config", "llm"]
             },
-            "description": "Requires the admin role. Configure a remote provider (openai|anthropic). Requires provider_data.key. The exact model is probed at save time (models.retrieve) -- an invalid/retired model is rejected with 400 and nothing is saved."
+            "description": "Requires the admin role. Configure a remote provider: a built-in (openai, gemini, anthropic), an id registered via config/providers.json (see List providers), or any other id paired with base_url (an OpenAI-compatible endpoint). Requires provider_data.key for the built-ins; optional for a custom endpoint that doesn't need one. The exact model is probed at save time (models.retrieve) -- an invalid/retired model is rejected with 400 and nothing is saved."
           },
           "response": []
         },
@@ -1704,6 +1704,20 @@
           "response": []
         },
         {
+          "name": "List providers",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/config/llm/providers",
+              "host": ["{{baseUrl}}"],
+              "path": ["config", "llm", "providers"]
+            },
+            "description": "Provider ids the registry can serve directly: the built-ins (openai, gemini, anthropic) plus any id registered from config/providers.json. Excludes ollama (its own local-only path) and never returns a key or anything derived from one."
+          },
+          "response": []
+        },
+        {
           "name": "List models",
           "request": {
             "method": "GET",
@@ -1713,7 +1727,7 @@
               "host": ["{{baseUrl}}"],
               "path": ["config", "llm", "models"]
             },
-            "description": "Models advertised by the active provider. openai/anthropic fetch the provider's live catalog with a short timeout, falling back to a static list on any failure; ollama lists what's pulled locally."
+            "description": "Models advertised by the active provider. Remote providers (openai/gemini/anthropic and any config/providers.json-registered or custom id) fetch the provider's live catalog and fall back to a static/declared list on any failure -- the anthropic-messages shape (anthropic) uses a short (5s) timeout for that call, the openai-completions shape (openai, gemini, everything else) uses the SDK's own default; ollama lists what's pulled locally."
           },
           "response": []
         },
