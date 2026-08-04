@@ -2,6 +2,15 @@ import { spawn } from "node:child_process";
 import chalk from "chalk";
 import ora from "ora";
 import { envVar, resolveApiUrl, resolveDokkaiHome } from "../lib/config.js";
+import {
+  Finding,
+  checkDescModel,
+  checkDescriptorRemote,
+  checkProvidersFile,
+  isOllamaDescriptor,
+  loadProvidersFile,
+  resolveDescriptorProvider,
+} from "../lib/descriptor.js";
 import { getJson } from "../lib/http.js";
 import { modelInstalled, probeOllama } from "../lib/ollama.js";
 
@@ -87,10 +96,15 @@ async function waitForApiReady(url: string): Promise<boolean> {
   return false;
 }
 
+/**
+ * `descModel` is only passed when `DESC_PROVIDER` is (or defaults to)
+ * `ollama` — see `checkDescriptorRemote` (`../lib/descriptor.js`) for the
+ * non-Ollama diagnostics, which never check Ollama's installed models.
+ */
 async function checkOllama(
   baseUrl: string,
   embedModel: string,
-  descModel: string,
+  descModel?: string,
 ): Promise<void> {
   const probe = await probeOllama(baseUrl, OLLAMA_PROBE_TIMEOUT_MS);
   if (!probe.reachable) {
@@ -103,10 +117,9 @@ async function checkOllama(
     return;
   }
 
-  for (const [label, model] of [
-    ["EMBED_MODEL", embedModel],
-    ["DESC_MODEL", descModel],
-  ] as const) {
+  const modelsToCheck: Array<[string, string]> = [["EMBED_MODEL", embedModel]];
+  if (descModel !== undefined) modelsToCheck.push(["DESC_MODEL", descModel]);
+  for (const [label, model] of modelsToCheck) {
     if (!modelInstalled(probe.installed, model)) {
       console.log(
         chalk.yellow(
@@ -116,6 +129,12 @@ async function checkOllama(
       );
     }
   }
+}
+
+function printFinding(f: Finding): void {
+  if (f.level === "ok") console.log(chalk.green(f.message));
+  else if (f.level === "warning") console.log(chalk.yellow(`warning: ${f.message}`));
+  else console.log(chalk.cyan(f.message));
 }
 
 export async function runUp(
@@ -152,10 +171,21 @@ export async function runUp(
   }
   spinner.succeed(`Weaviate is ready at ${weaviateUrl}`);
 
+  const providersFile = loadProvidersFile(home);
+  for (const f of checkProvidersFile(providersFile)) printFinding(f);
+
   const ollamaBaseUrl = envVar("OLLAMA_BASE_URL", "http://localhost:11434");
   const embedModel = envVar("EMBED_MODEL", "nomic-embed-text");
-  const descModel = envVar("DESC_MODEL", "qwen2.5-coder:3b");
-  await checkOllama(ollamaBaseUrl, embedModel, descModel);
+  const descProvider = resolveDescriptorProvider();
+  if (isOllamaDescriptor(descProvider)) {
+    // No hardcoded DESC_MODEL default, ever (project rule 9a-3-clar).
+    const rawDescModel = envVar("DESC_MODEL", "").trim();
+    await checkOllama(ollamaBaseUrl, embedModel, rawDescModel || undefined);
+    if (!rawDescModel) printFinding(checkDescModel(descProvider));
+  } else {
+    await checkOllama(ollamaBaseUrl, embedModel);
+    for (const f of checkDescriptorRemote(descProvider, providersFile)) printFinding(f);
+  }
 
   const apiUrl = resolveApiUrl(flags);
   if (full) {

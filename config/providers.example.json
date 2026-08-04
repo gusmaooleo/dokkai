@@ -1,0 +1,10 @@
+{
+  "providers": {
+    "groq": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.groq.com/openai/v1",
+      "apiKey": "${GROQ_API_KEY}",
+      "models": ["llama-3.3-70b-versatile"]
+    }
+  }
+}

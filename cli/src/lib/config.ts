@@ -5,14 +5,21 @@ const DEFAULT_API_URL = "http://localhost:8000";
 
 /**
  * Minimal `.env` parser: KEY=VALUE lines, blank lines and lines starting
- * with `#` are ignored, values are trimmed. No quote handling beyond that.
+ * with `#` are ignored, values are trimmed. An optional leading `export `
+ * (as `python-dotenv` — what the API actually loads `.env` with — also
+ * accepts) is stripped before splitting on `=`, so `export FOO=bar` reads
+ * back as `FOO=bar` here too instead of a silently-dropped line (which
+ * this module's callers would otherwise read as "not set" — a false
+ * negative, e.g. reporting a genuinely-configured API key as missing). No
+ * quote handling beyond that.
  */
 function parseEnvFile(path: string): Record<string, string> {
   const result: Record<string, string> = {};
   const contents = readFileSync(path, "utf8");
   for (const rawLine of contents.split("\n")) {
-    const line = rawLine.trim();
+    let line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
+    line = line.replace(/^export\s+/, "");
     const eq = line.indexOf("=");
     if (eq === -1) continue;
     const key = line.slice(0, eq).trim();

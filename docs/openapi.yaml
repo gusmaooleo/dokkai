@@ -1986,15 +1986,45 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /config/llm/providers:
+    get:
+      tags: [Config]
+      summary: List registry-servable provider ids
+      description: |
+        Lists the provider ids the registry can serve directly: the built-ins
+        (`openai`, `gemini`, `anthropic`) plus any id registered from
+        `config/providers.json`. Excludes `ollama` (its own local-only path,
+        not part of this registry) and does not include a synthetic "custom"
+        entry — an unregistered id paired with a `base_url` remains servable
+        via `POST /config/llm` even though it never appears here.
+
+        Never returns a key, a key value, or anything derived from one.
+
+        Requires any authenticated role.
+      operationId: listLlmProviders
+      responses:
+        "200":
+          description: Provider ids the registry can serve.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LLMProvidersListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /config/llm/models:
     get:
       tags: [Config]
       summary: List available models
       description: |
-        Lists models advertised by the currently configured provider. For
-        `openai`/`anthropic`, this fetches the provider's live models API
-        (short timeout) and falls back to a static built-in list on any
-        failure. `ollama` lists what's pulled locally.
+        Lists models advertised by the currently configured provider. Remote
+        providers (`openai`, `gemini`, `anthropic`, and any
+        `config/providers.json`-registered or custom id) fetch the
+        provider's live models API and fall back to a static/declared list
+        on any failure — the `anthropic-messages` shape (`anthropic`) uses a
+        short (5s) timeout for that call; the `openai-completions` shape
+        (`openai`, `gemini`, and everything else) uses the SDK's own
+        default. `ollama` lists what's pulled locally.
 
         Requires any authenticated role.
       operationId: listModels
@@ -2266,6 +2296,8 @@ components:
         pending: { type: integer, description: Queued but not generated (e.g. model unavailable). }
         skipped: { type: integer, description: Entities not eligible for a description. }
         templated: { type: integer, description: "No-LLM template description (doc-less non-test Types, and Enums without methods)." }
+        stale_model_hits: { type: integer, description: "Cache hits whose recorded provider/model is known and differs from the currently configured one (feature 22) — served as-is, logged as a warning; re-describe with `force: true` to refresh them." }
+        unknown_model_hits: { type: integer, description: "Cache hits with no recorded producer at all — a pre-feature-22 cache entry. May or may not match the currently configured provider/model; logged once, informationally, pointing at `force: true`." }
 
     VectorizeResult:
       type: object
@@ -2487,16 +2519,31 @@ components:
       properties:
         provider_name:
           type: string
-          enum: [openai, anthropic, ollama]
+          description: |
+            Ignored when is_local=true (Ollama is always used, forced
+            regardless of this value — Ollama is not reachable through
+            is_local=false). When is_local=false: one of the built-in
+            remote ids (`openai`, `gemini`, `anthropic`), an id registered
+            via `config/providers.json` (see `GET /config/llm/providers`),
+            or any other id paired with base_url (an OpenAI-compatible
+            endpoint, e.g. Groq, LM Studio, vLLM) — but never `ollama`
+            itself, which 400s here. Not a closed enum.
+          example: openai
         model: { type: string, example: qwen2.5-coder:latest }
         key:
           type: string
           default: ""
-          description: API key (empty for local providers).
+          description: >-
+            API key. Empty for local (Ollama) providers and optional for
+            custom endpoints that don't require one; required for the
+            built-in remote providers (openai, gemini, anthropic).
         base_url:
           type: string
           nullable: true
-          description: Custom base URL override.
+          description: >-
+            Base URL override — a full http:// or https:// URL with a host.
+            Required when is_local=false and provider_name isn't one of the
+            built-in remote ids (openai, gemini, anthropic).
 
     LLMConfigRequest:
       type: object
@@ -2516,6 +2563,54 @@ components:
         model: { type: string }
         has_key: { type: boolean }
         base_url: { type: string, nullable: true }
+
+    LLMProviderInfo:
+      type: object
+      description: One entry of `GET /config/llm/providers`.
+      required: [id, label, key_required, registered_via_file]
+      properties:
+        id: { type: string, example: groq }
+        label:
+          type: string
+          description: >-
+            Human-readable display name — the built-in's fixed name
+            ('OpenAI', 'Gemini', 'Anthropic'), or a file-registered
+            provider's id exactly as written in config/providers.json.
+        key_required:
+          type: boolean
+          description: >-
+            Whether a key must be supplied when saving this provider via
+            POST /config/llm. True for the built-in remotes and for a
+            file-registered provider whose declared ${ENV_VAR} key isn't
+            currently resolved. False for a file-registered provider that
+            already resolves a key (a literal apiKey or an already-exported
+            env var).
+        registered_via_file:
+          type: boolean
+          description: >-
+            True for a provider registered from config/providers.json rather
+            than one of the three built-ins.
+        default_base_url:
+          type: string
+          nullable: true
+          description: >-
+            The DEFAULT base URL for a BUILT-IN id only (e.g. Gemini's
+            OpenAI-compat endpoint) — always null for a file-registered
+            provider. Display-only, never used to build a request.
+        models:
+          type: array
+          items: { type: string }
+          description: >-
+            This provider's declared models[] from config/providers.json —
+            empty means "free-text model field" to the UI.
+
+    LLMProvidersListResponse:
+      type: object
+      properties:
+        providers:
+          type: array
+          items:
+            $ref: "#/components/schemas/LLMProviderInfo"
 
     AvailableModel:
       type: object
@@ -2737,11 +2832,14 @@ components:
           type: string
           nullable: true
           description: >-
-            Override the active LLM config's provider for this run only.
-            Supported providers: ollama, openai, anthropic — an unknown value
-            is rejected at launch with a 400, not a validation error.
-            `kind: bughunt` additionally requires the resolved provider to be
-            `ollama` (400 otherwise).
+            Override the active LLM config's provider for this run only —
+            any id the registry can resolve (a built-in: ollama, openai,
+            gemini, anthropic; or one registered via config/providers.json;
+            see `GET /config/llm/providers`). Reuses the active config's own
+            key/base_url only when it targets that SAME provider — an
+            unresolvable override is rejected at launch with a 400, not a
+            validation error. `kind: bughunt` additionally requires the
+            resolved provider to be `ollama` (400 otherwise).
         playbooks:
           type: array
           items: { type: string }

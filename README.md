@@ -4,7 +4,7 @@
 
 Dokkai ingests a repository, builds a full dependency graph of it (calls, inheritance, definitions, modules), slices the real source into rich chunks, and stores everything in a vector database. On top of that it serves a **graph‑augmented RAG**: instead of returning a handful of loosely‑matched snippets, it retrieves the *connected* neighbourhood of the code you asked about, so a local LLM can answer accurately and generate documentation for parts of the system that were never documented.
 
-Everything runs **100% locally** — Weaviate for vectors, Ollama for both embeddings and generation.
+Vector storage is Weaviate; embeddings (and the query vectors retrieval uses) are **local by default** via `VECTORIZER_PROVIDER=ollama` — `openai`/`cohere` are configurable alternatives that send code off-machine to that provider instead, but (unlike the LLM providers below) also require enabling the matching Weaviate module via `ENABLE_MODULES`; the shipped `docker-compose.yml` enables only `text2vec-ollama`. Chat and the descriptor are **local by default** too (Ollama) and can instead be pointed at a remote provider (OpenAI, Gemini, Anthropic, or anything else registered in `config/providers.json`) with no code change — see [LLM providers](#llm-providers).
 
 > The name *dokkai* (読解) is Japanese for "reading comprehension" — which is exactly what this gives an LLM over your code.
 
@@ -22,6 +22,7 @@ Everything runs **100% locally** — Weaviate for vectors, Ollama for both embed
   - [Playbooks & skills](#playbooks--skills)
   - [Routines UI](#routines-ui)
 - [How it works](#how-it-works)
+- [LLM providers](#llm-providers)
 - [Descriptions (Tier 2)](#descriptions-tier-2)
 - [Retrieval eval harness](#retrieval-eval-harness)
 - [Path connectivity eval](#path-connectivity-eval)
@@ -44,7 +45,7 @@ Everything runs **100% locally** — Weaviate for vectors, Ollama for both embed
 - **Token economy.** Agents grep and read whole files to understand code. Dokkai lets them pull the exact connected context semantically, instead of paying tokens to read everything.
 - **Automatic documentation.** Generate complete, audience‑specific docs (developer / manager / customer) for systems that were never documented.
 - **Semantic search for agents.** Ask "how does the alarm flow work?" and get the relevant subsystem — not keyword hits.
-- **Local & private.** Your code never leaves your machine.
+- **Local & private by default.** Embeddings and retrieval's query vectors run locally by default (`VECTORIZER_PROVIDER=ollama`); chat and the descriptor default to local Ollama too. Any of the three can instead be pointed at a remote provider — embeddings also need the matching Weaviate module enabled (`ENABLE_MODULES`) — and that's when code leaves the machine — see [LLM providers](#llm-providers) for the full accounting of what's sent where, including the review routine, the MCP server (however it's registered — `dokkai srcs --model claude|codex`, `claude mcp add`, `codex mcp add`, or a generic stdio client).
 
 ---
 
@@ -167,13 +168,13 @@ Something not working? `dokkai doctor` complements `up`/`status`: it checks the 
 
 | Command | Description |
 | --- | --- |
-| `dokkai up [--full]` | `docker compose up -d` for Weaviate/Postgres/Memgraph, wait for Weaviate to become ready, probe Ollama and the configured embed/descriptor models (warnings only, non-fatal), report whether the API is reachable. With `--full`, brings up the **whole stack** instead (`docker compose --profile full up -d`) — the containerized API and frontend UI — and waits for both to become reachable. Exits 1 only on a `docker compose`/Weaviate failure (or when the dokkai repo root cannot be resolved). |
-| `dokkai status` | Read-only health check (API, Weaviate, Ollama + model presence) plus a list of ingested projects. Always exits 0. |
+| `dokkai up [--full]` | `docker compose up -d` for Weaviate/Postgres/Memgraph, wait for Weaviate to become ready, print `config/providers.json` parse status, probe Ollama and `EMBED_MODEL` plus `DESC_MODEL` (only when `DESC_PROVIDER=ollama` — a remote descriptor gets its own provider/key observations instead, see [LLM providers](#llm-providers)), report whether the API is reachable. Warnings only, non-fatal. With `--full`, brings up the **whole stack** instead (`docker compose --profile full up -d`) — the containerized API and frontend UI — and waits for both to become reachable. Exits 1 only on a `docker compose`/Weaviate failure (or when the dokkai repo root cannot be resolved). |
+| `dokkai status` | Read-only health check (API, Weaviate, `config/providers.json` parse status, `EMBED_MODEL` presence, and descriptor diagnostics — Ollama model presence when `DESC_PROVIDER=ollama`, provider/key observations otherwise) plus a list of ingested projects. Always exits 0. |
 | `dokkai ingest <repo-path> [--recreate] [--no-describe] [--yes]` | Validates the path, confirms `--recreate` interactively (or via `--yes`), calls `POST /instances/pipeline`, and streams live stage progress (SSE with a polling fallback) to a result summary. |
 | `dokkai graph <repo-path\|project> [--out <file>]` | Graph-only run: a **directory** argument enqueues `POST /instances/graph` (cgr only, no LLM/Weaviate) and prints the canonical graph JSON path (with `--out`, also exports the normalized graph); a **project name** argument fetches and prints/writes its normalized structural graph (`GET /graph/{project}?include=structural`) — stdout output pipes cleanly when `--out` is omitted. |
 | `dokkai srcs --model <claude\|codex\|ollama:<name>> [--project <name>] [--agent]` | `claude`/`codex`: idempotently (re-)registers the dokkai MCP server, then launches the tool interactively. `ollama:<name>`: sets the API's global chat model (`POST /config/llm`) and starts a terminal REPL over `/chat`'s SSE stream, with conversation continuity across turns. With `--agent` (ollama only): agentic mode — the CLI spawns the dokkai MCP server itself and navigates the codebase locally with MCP tools, no API server needed (only Weaviate + Ollama). |
 | `dokkai watch <repo-path> [--debounce <seconds>=3] [--no-describe]` | Runs an initial ingest cycle, then watches the repo and debounces file changes into incremental re-ingestions (`POST /instances/pipeline`, `recreate: false`) via the API. Ignores `.git`, `node_modules`, build/venv/data dirs and dotfiles; skips a cycle (and reschedules) on a 409 (job already running for the project); Ctrl-C stops cleanly. |
-| `dokkai doctor` | Read-only environment diagnosis: node/docker/uv/`DOKKAI_HOME` (required), Weaviate readiness, Ollama reachability + `EMBED_MODEL`/`DESC_MODEL` presence, and API reachability (warnings). Prints the exact fix command for each missing/warning item. Exits 1 if a required item is missing, 0 otherwise. |
+| `dokkai doctor` | Read-only environment diagnosis: node/docker/uv/`DOKKAI_HOME` (required), Weaviate readiness, `config/providers.json` parse status, Ollama reachability + `EMBED_MODEL` presence (always) and `DESC_MODEL` presence (only when the descriptor is Ollama), descriptor provider/key observations for a remote `DESC_PROVIDER`, and API reachability (warnings). Prints the exact fix command for each missing/warning item. Never claims a remote provider or a `providers.json` entry is *valid* — only what it can directly observe (the API is the authority on that). Exits 1 if a required item is missing, 0 otherwise. |
 
 Global flag: `--api <url>` — dokkai API URL (default `http://localhost:8000`).
 
@@ -645,7 +646,60 @@ see the demo disclaimer at the top of this section:
 2. **Graph expansion** — a breadth‑first walk over the stored `qualified_name` edges pulls in callers/callees/definitions, scored with per‑hop decay and edge weights, with hub‑node protection so a popular utility doesn't flood the context.
 3. **Context assembly** — results are ranked and formatted with provenance (`SEED` vs `hop 1 · calls ← X`) so the model understands the structure.
 
-**Generation** (`POST /chat`) — the connected context is injected into an audience‑specific prompt and streamed from the local Ollama model over Server‑Sent Events. The prompt is **token-budgeted against the provider's real context window** (Ollama's `num_ctx`): the retrieved context is sized before it is built, recent conversation history gets a guaranteed slice (oldest turns fall off first), and follow-up questions retrieve with the last user turns included — so "and where is it validated?" finds the referent instead of retrieving blind.
+**Generation** (`POST /chat`) — the connected context is injected into an audience‑specific prompt and streamed from the configured chat model (local Ollama by default, or a remote provider set via `POST /config/llm` — see [LLM providers](#llm-providers)) over Server‑Sent Events. The prompt is **token-budgeted against the provider's real context window** (Ollama's `num_ctx`; a conservative constant for remote providers, whose per-model limits aren't tracked here): the retrieved context is sized before it is built, recent conversation history gets a guaranteed slice (oldest turns fall off first), and follow-up questions retrieve with the last user turns included — so "and where is it validated?" finds the referent instead of retrieving blind.
+
+---
+
+## LLM providers
+
+Chat (`POST /config/llm`, the Settings UI) and the descriptor (`DESC_PROVIDER`, see [Descriptions](#descriptions-tier-2)) share one abstraction (`services/llm_provider.py`): **a provider is a config entry, not code.** Two wire "shapes" are implemented, and any provider that speaks one of them is servable with zero code:
+
+| Shape | Served by | Covers |
+| --- | --- | --- |
+| `openai-completions` | the `openai` SDK, with `base_url` overridden | OpenAI, Gemini's OpenAI-compatible endpoint, and any other OpenAI-compatible API — Groq, Together, OpenRouter, DeepSeek, Mistral, xAI, Fireworks, LM Studio, vLLM, llama.cpp, ... |
+| `anthropic-messages` | the `anthropic` SDK | Anthropic, and any gateway speaking the same wire format |
+
+Ollama keeps its own native path (`num_ctx`, `keep_alive`, warmup, tool-calling) — it isn't one of the two shapes above. Embeddings are configured entirely separately (`VECTORIZER_PROVIDER`, unaffected by anything in this section — see the note at the end of it) and default to Ollama, but aren't required to use it.
+
+**Built-in ids** — `openai`, `gemini`, `anthropic` (plus `ollama` on its own local-only path) — each with a standard key env var (`OPENAI_API_KEY` / `GEMINI_API_KEY` / `ANTHROPIC_API_KEY`). Only `gemini` has a fixed default base URL override (its non-guessable OpenAI-compat endpoint); `openai` and `anthropic` use their SDK's own official default.
+
+**Anything else** is registered in `config/providers.json` (gitignored — copy `config/providers.example.json` to start; `docker compose --profile full` mounts the `config/` **directory**, not the file, so a missing `providers.json` never becomes a bind-mount directory trap):
+
+```json
+{
+  "providers": {
+    "groq": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.groq.com/openai/v1",
+      "apiKey": "${GROQ_API_KEY}",
+      "models": ["llama-3.3-70b-versatile"]
+    }
+  }
+}
+```
+
+- **`apiKey` should be `${VAR_NAME}`** — uppercase letters/digits/underscore only, resolved from the environment at request time and never logged. A literal string is accepted (the file is gitignored), but never commit a real key — prefer `${VAR}` in every example and in your own file.
+- `api` must be `openai-completions` or `anthropic-messages` — an unknown value is a loud error at API boot, never a silent fallback.
+- A file id can't shadow a built-in (`openai`, `gemini`, `anthropic`, `ollama`).
+- File absent = no-op. Malformed JSON (or a missing `providers` key) fails the API at boot, naming the file and the parse position — a broken registration must never look like "nothing registered" and quietly keep serving something else.
+- Path overridable via `DOKKAI_PROVIDERS_FILE`.
+- `models` feeds the Settings UI's model dropdown for that provider; omit it (or leave it empty) for a free-text model field instead.
+
+`GET /config/llm/providers` lists everything the registry can currently serve (built-ins + `config/providers.json` entries) — the Settings UI uses it to build its provider tabs instead of hardcoding a closed list; an "Other" tab covers any id the endpoint doesn't list, as long as you supply a base URL. **Excludes `ollama`** — it isn't part of this registry (its own local-only path); the Settings UI keeps a separate, hardcoded Ollama tab.
+
+**Known gap:** the registry is agnostic to the *provider*, not to the *wire format* — anything speaking `openai-completions` or `anthropic-messages` works with no code change. A provider with a genuinely different wire format needs a third shape implemented in `services/llm_provider.py`. **Azure OpenAI does not fit cleanly today** — it routes by deployment path plus an `api-version` query parameter, which neither shape models; this is a known, documented gap, not a silent failure.
+
+**Another known gap:** `POST /config/llm`'s health check calls the OpenAI SDK's `models.retrieve(model)` to confirm the model exists. Some OpenAI-compatible local servers implement `GET /v1/models` (list) but not `GET /v1/models/{id}` (retrieve) — against one of those, saving the config fails with a 400 even though chat itself would work fine; if that happens, it's the health check being pickier than the actual chat endpoint, not a broken connection.
+
+**Embeddings are out of scope for this abstraction and unaffected by it** — this feature changed nothing about how they're configured. They're set independently via `VECTORIZER_PROVIDER` (`ollama` | `openai` | `cohere` | `local`, see [Configuration](#configuration)) and default to Weaviate's `text2vec-ollama` — **local by default**, not local-only: `VECTORIZER_PROVIDER=openai`/`cohere` sends every chunk's raw source and description (and every retrieval query's text) to that provider for embedding, same as before this feature. With a remote chat provider, a remote descriptor, and a non-Ollama `VECTORIZER_PROVIDER`, Ollama itself is no longer needed to run any of the three — **but switching `VECTORIZER_PROVIDER` is not just an env var change**: Weaviate only serves the vectorizer modules it was started with (`ENABLE_MODULES`), and the shipped `docker-compose.yml` enables only `text2vec-ollama` — `VECTORIZER_PROVIDER=openai`/`cohere`/`local` fails at collection creation (`no module with name "text2vec-openai" present`) until `ENABLE_MODULES` is edited to add the matching module (an infrastructure change outside this feature's scope). `OLLAMA_CHAT_MODEL`'s boot-time warmup is itself best-effort and skipped entirely when the var is unset.
+
+**What can leave your machine, and when** (nothing below happens unless you configure it):
+
+- **Embeddings** (`VECTORIZER_PROVIDER=openai`/`cohere`, and the matching Weaviate module enabled — see above) — every chunk's raw source code and its description, plus every retrieval query's text, sent to that provider for embedding.
+- **Chat** (`POST /config/llm` set to a remote provider) — the retrieved graph context and conversation history for that turn.
+- **Descriptor** (`DESC_PROVIDER` set to a remote provider) — each entity's trimmed source excerpt, one call per description.
+- **Code review routine** (`POST /routines/runs`, `kind=review`) — resolves its provider from the active chat config (or a per-run override); sends diff hunks and retrieved graph context to it. Bug hunt is Ollama-gated only in this release, so it's unaffected.
+- **The MCP server** (`dokkai`, `src/mcp_server.py`), however it's registered — `dokkai srcs --model claude|codex` (its own remote client), direct registration with an agent (`claude mcp add dokkai …`, `codex mcp add dokkai …`, or a generic stdio `mcpServers` config, see [Registration](#registration)) — hands retrieved chunks to whichever client made the call, and from there to that client's own remote model, by design (that's the point of the integration), regardless of any of the above.
 
 ---
 
@@ -656,12 +710,12 @@ Every describable entity (not a test, has source, not a one‑liner) gets a one�
 - **Two ways to get a description, no LLM call when avoidable:**
   - **Template (no‑LLM)** — doc‑less, non‑test `Type` aliases and `Enum`s without methods get a deterministic templated sentence (e.g. `Enumeration Status with members ACTIVE, INACTIVE.`). Free and instant; a human docstring always wins over a template.
   - **LLM‑generated** — everything else goes through the configured descriptor model with a **trimmed prompt**: entity type + qualified name, the extracted doc/leading comment (capped), and a capped source excerpt (cut at a line boundary) — instead of the full source. Measured ~21% faster per entity than the original full‑source prompt (0.61 s → 0.48 s/entity, qwen2.5-coder:3b, warm model, 20‑entity sample), with comparable quality.
-- **Cached by source hash** — unchanged source reuses its cached description on re‑ingestion, so incremental ingests only pay the LLM for what changed.
-- **Pluggable descriptor provider** — the descriptor is routed through the same LLM provider abstraction used for chat: `DESC_PROVIDER=ollama` (default, local) `| openai | anthropic`, selected via environment variables only (no `/config` endpoint for it).
+- **Cached by source hash alone** — unchanged source reuses its cached description on re‑ingestion, so incremental ingests only pay the LLM for what changed. This key is deliberately **provider/model-independent**: switching `DESC_PROVIDER`/`DESC_MODEL` is a no-op on chunks already described — it only affects new/changed source. Each cached description records the provider+model that produced it; a describe pass that serves a cache hit generated by a *different* provider/model than the one currently configured logs a warning and reports the count as `stale_model_hits` in the job stats (a cache with no producer recorded at all — i.e. from before this tracking existed — is reported separately as `unknown_model_hits`, with a single informational log line, never a warning). To re-run existing chunks under the newly-configured provider/model, use `POST /instances/{project}/describe` with `{"force": true}` (see [below](#refreshing-descriptions)).
+- **Pluggable descriptor provider** — the descriptor is routed through the same LLM provider abstraction used for chat (see [LLM providers](#llm-providers)): `DESC_PROVIDER` accepts `ollama` (default, local) or any registered id — a built-in (`openai`, `gemini`, `anthropic`), a `config/providers.json` id, or an arbitrary OpenAI-compatible id paired with `DESC_BASE_URL` — selected via environment variables only (no `/config` endpoint for it).
 
 ### Refreshing descriptions
 
-`POST /instances/{project}/describe` re-runs **only** the describe pass over a project that's already ingested — no `cgr`, no re-embedding of unchanged code. Useful when you switch descriptor models (`DESC_MODEL`/`DESC_PROVIDER`) or want to fill in gaps without paying for a full re-ingest.
+`POST /instances/{project}/describe` re-runs **only** the describe pass over a project that's already ingested — no `cgr`, no re-embedding of unchanged code. Useful when you switch descriptor models (`DESC_MODEL`/`DESC_PROVIDER`) or want to fill in gaps without paying for a full re-ingest — the `stale_model_hits`/`unknown_model_hits` counts and log lines described above are the signal that a `{"force": true}` refresh would actually change something.
 
 - The cache is still honored by default — unchanged entities are cache hits and cost nothing. Pass `{"force": true}` in the body to bypass the cache and regenerate every eligible description.
 - **Anti-drift guard**: the endpoint re-chunks the latest graph JSON in `ingested/` and only describes chunks whose source is byte-identical to what's stored in Weaviate. Entities whose source changed on disk since ingestion are counted as `stale_source` and skipped (with a note to re-ingest) — refresh never describes text that isn't what's actually indexed.
@@ -797,8 +851,8 @@ qualified names) — share the former in a PR, not the latter.
 - ✅ Deterministic UUIDs → idempotent re‑ingestion / upsert
 - ✅ Absolute file paths on every chunk — chat sources and LLM context cite real paths on disk (`/full/path/file.py:42`)
 - ✅ Streaming chat over the codebase (SSE) with 3 audiences: `developer`, `manager`, `customer`
-- ✅ 100% local: Weaviate + Ollama (embeddings **and** generation)
-- ✅ Pluggable providers — LLM: Ollama / OpenAI / Anthropic · embeddings: Ollama / OpenAI / Cohere
+- ✅ Local by default — Weaviate (vector storage, always local) + Ollama (embeddings and chat/descriptor, local unless you point one of them at a remote provider — see [LLM providers](#llm-providers))
+- ✅ Pluggable providers — LLM (chat + descriptor): Ollama, plus any provider speaking `openai-completions` or `anthropic-messages` (built-in: OpenAI, Gemini, Anthropic; anything else via `config/providers.json` — see [LLM providers](#llm-providers)) · embeddings (`VECTORIZER_PROVIDER`, unaffected by the above): Ollama / OpenAI / Cohere
 - ✅ Auto‑configure + warm the chat model on startup (no cold starts)
 - ✅ **MCP server** — 10 tools (search, literal grep, graph navigation, entity/file lookup, repo/file structure maps, entity-to-entity paths) for Claude Code, Codex and any stdio MCP client, with a small-model instructions profile and a session usage watchdog (see [MCP server](#mcp-server))
 - ✅ **npm CLI** (`dokkai`) — `up`/`status`/`ingest`/`graph`/`srcs`/`watch`/`doctor` commands: live job progress, one-command SRCS sessions (Claude Code, Codex, a local Ollama REPL, or an agentic local-model MCP loop), debounced incremental re-ingestion on save, and environment diagnostics (see [CLI](#cli))
@@ -891,7 +945,9 @@ OLLAMA_TIMEOUT=600
 # --- Descriptions (Tier 2, required for ingestion — see Descriptions section) ---
 DESC_MODEL=qwen2.5-coder:3b
 DESC_CONCURRENCY=4
-# DESC_PROVIDER=ollama       # ollama (default) | openai | anthropic
+# DESC_PROVIDER=ollama         # ollama (default), or any registered id (openai, gemini, anthropic, a config/providers.json id, ...) — see LLM providers
+# DESC_BASE_URL=               # only for a custom (unregistered) DESC_PROVIDER id
+# DESC_API_KEY=                # overrides the provider's own key env var for the descriptor only
 ```
 
 ### 4. Run the API
@@ -984,11 +1040,15 @@ All configuration is via environment variables (loaded from `.env` at startup).
 | `OLLAMA_NUM_CTX` | `8192` | Context window for generation |
 | `OLLAMA_TIMEOUT` | `600` | httpx read timeout, in seconds (covers cold model loads) |
 | `OLLAMA_KEEP_ALIVE` | `-1` | Keep model resident: `-1` = forever, or a duration like `30m` |
-| `OPENAI_API_KEY` / `COHERE_API_KEY` | _(unset)_ | Only when using those vectorizer providers, or when `DESC_PROVIDER=openai` |
-| `ANTHROPIC_API_KEY` | _(unset)_ | Only required when `DESC_PROVIDER=anthropic` |
-| `DESC_PROVIDER` | `ollama` | Provider for per-entity descriptions: `ollama` \| `openai` \| `anthropic` |
+| `OPENAI_API_KEY` / `COHERE_API_KEY` | _(unset)_ | Only when using those vectorizer providers, or (`OPENAI_API_KEY`) when `DESC_PROVIDER=openai` and no `DESC_API_KEY` override is set |
+| `GEMINI_API_KEY` | _(unset)_ | Only required when `DESC_PROVIDER=gemini` and no `DESC_API_KEY` override is set. **Not** read by the `/config/llm` chat path — `POST /config/llm` always requires `provider_data.key` in the request body for `gemini`, even if this is set |
+| `ANTHROPIC_API_KEY` | _(unset)_ | Only required when `DESC_PROVIDER=anthropic` and no `DESC_API_KEY` override is set |
+| `DESC_PROVIDER` | `ollama` | Provider for per-entity descriptions — `ollama` (local), a built-in remote id (`openai`, `gemini`, `anthropic`), a `config/providers.json` id, or any other id paired with `DESC_BASE_URL`. See [LLM providers](#llm-providers) |
 | `DESC_MODEL` | _(unset)_ | Model used to generate per-entity descriptions (e.g. `qwen2.5-coder:3b`). If unset (or unavailable), `POST /instances/pipeline` fails with HTTP 400 before creating a job — see [Descriptions](#descriptions-tier-2) |
+| `DESC_BASE_URL` | _(unset)_ | Base URL for the descriptor provider — required only when `DESC_PROVIDER` is a custom (unregistered) id; overrides a registered provider's own base URL when set (logged as a warning, since it redirects that provider's key to the override host too) |
+| `DESC_API_KEY` | _(unset)_ | API key for the descriptor, taking precedence over the provider's own key env var and over a file-registered provider's own `apiKey` — blank/whitespace-only counts as unset |
 | `DESC_CONCURRENCY` | `4` | Max concurrent description requests |
+| `DOKKAI_PROVIDERS_FILE` | `config/providers.json` | Path to the provider-registration file — see [LLM providers](#llm-providers) |
 | `RETRIEVAL_TEST_PENALTY` | `0.35` | Score multiplier applied to test-file results during retrieval |
 | `DOKKAI_RECREATE_COLLECTION` | _(unset)_ | If truthy: recreate the Weaviate collection instead of failing on schema mismatch |
 | `DOKKAI_MCP_PROFILE` | _(unset)_ | MCP server only. `small-model` swaps the server's instructions for a more directive, anti-loop variant tuned for small local models — see [Instructions profile](#instructions-profile) |
@@ -1088,6 +1148,7 @@ curl -X DELETE localhost:8000/auth/users/2 -H "Authorization: Bearer $TOKEN"
 | `DELETE` | `/chat/conversations/{id}` | admin, user | Delete a conversation (503 if Postgres is unreachable) |
 | `POST` | `/config/llm` | admin | Set the active LLM provider/model (rejects an invalid/retired remote model) |
 | `GET` | `/config/llm` | any | Get the current LLM config |
+| `GET` | `/config/llm/providers` | any | List the ids the registry can serve directly — built-ins plus `config/providers.json` entries (see [LLM providers](#llm-providers)); never a key or anything derived from one |
 | `GET` | `/config/llm/models` | any | List available models for the provider (live catalog, static fallback on failure) |
 | `GET` | `/config/llm/health` | any | Check connectivity — probes the configured model |
 | `GET` | `/` | public | Health check |
@@ -1183,6 +1244,10 @@ These are known and tracked in the [Roadmap](#roadmap):
 | 15 | Retrieval router (question-aware choice of retrieval strategy; a first identifier-shape heuristic already ships in the retriever) | backlog |
 | 16 | Native ingestion engine (in-house parsing, no external ingestion dependency, broader language coverage) | backlog |
 | 17 | Chat UI improvements (visualization/navigation of long conversations) | backlog |
+| 18 | Retrieval precision pass + eval harness (token-budgeted prompt assembly, history-aware retrieval query, and `scripts/eval_retrieval.py` — deterministic rank-based quality metrics across 5 retrieval variants with `--compare` baseline deltas) | ✅ done (pending merge) |
+| 19 | Agent navigation tools (`tree`/`outline`/`path` MCP tools — repo structure map, per-file entity outline, shortest structural connectivity between two entities) | ✅ done (pending merge) |
+| 21 | Gitignore-aware ingestion (batched `git check-ignore` plus curated build-artifact patterns filter the graph before chunking/embedding/describing) | ✅ done (pending merge) |
+| 22 | LLM provider independence (register any chat/descriptor provider by shape + base URL + key — `config/providers.json`, `GET /config/llm/providers`, `DESC_BASE_URL`/`DESC_API_KEY`; embeddings are unaffected, configured separately via `VECTORIZER_PROVIDER`) | ✅ done (pending merge) |
 
 Items 13–17 are registered for planning purposes only — none of them is scheduled or in progress.
 

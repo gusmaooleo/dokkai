@@ -16,7 +16,14 @@ from dataclasses import dataclass
 import httpx
 
 from services.db import DatabaseUnavailableError, get_pool
-from services.llm_provider import effective_base_url, get_provider, LLMProvider
+from services.llm_provider import (
+    effective_base_url,
+    get_provider,
+    get_registered_provider_ids,
+    key_env_for,
+    validate_base_url,
+    LLMProvider,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -195,8 +202,11 @@ async def validate_and_save_config(
     2. The requested model is actually installed
 
     For remote configs, verifies that:
-    1. An API key is provided
-    2. The provider is reachable
+    1. The provider id and base_url combination is resolvable (a built-in
+       id, or a custom id paired with an http(s) base_url)
+    2. An API key is provided, when the provider requires one (built-in
+       remotes always do; a custom OpenAI-compatible endpoint may not)
+    3. The provider is reachable
 
     Returns (success, message).
     """
@@ -247,11 +257,44 @@ async def validate_and_save_config(
         )
 
     else:
-        # Remote provider
-        if name not in ("openai", "anthropic"):
-            return False, f"Unknown remote provider: '{provider_name}'. Use 'openai' or 'anthropic'."
+        # Remote provider — resolved through the registry built in
+        # services.llm_provider (feature 22): a built-in id (openai,
+        # gemini, anthropic) uses its own default base URL and requires
+        # its key; any other id is servable through the openai-completions
+        # shape as soon as a base_url is supplied, and its key is optional
+        # (LM Studio/vLLM/llama.cpp and similar local servers commonly
+        # don't require one). Every check below runs before any network
+        # call, so a malformed config never costs a live request.
+        if not name:
+            return False, "provider_name is required"
 
-        if not key:
+        if name == "ollama":
+            # Ollama is always local — it isn't one of this branch's
+            # registered ids (get_registered_provider_ids() excludes it)
+            # and isn't a valid "custom" id either; a base_url here would
+            # silently skip the is_local branch's /api/tags model check.
+            return False, (
+                "provider_name 'ollama' is only reachable with "
+                "is_local=true (Ollama is always local) — retry with "
+                "is_local=true."
+            )
+
+        registered = get_registered_provider_ids()
+
+        if base_url:
+            normalized_base_url, url_error = validate_base_url(base_url)
+            if url_error:
+                return False, url_error
+            base_url = normalized_base_url
+
+        if name not in registered and not base_url:
+            return False, (
+                f"Unknown provider '{provider_name}'. Registered providers: "
+                f"{', '.join(sorted(registered))}. A custom provider needs "
+                "an OpenAI-compatible base_url."
+            )
+
+        if key_env_for(name) and not key:
             return False, f"API key is required for {name}"
 
         # Quick connectivity check

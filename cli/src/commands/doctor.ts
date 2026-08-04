@@ -1,6 +1,14 @@
 import { spawn } from "node:child_process";
 import chalk from "chalk";
 import { envVar, resolveApiUrl, resolveDokkaiHome } from "../lib/config.js";
+import {
+  checkDescModel,
+  checkDescriptorRemote,
+  checkProvidersFile,
+  isOllamaDescriptor,
+  loadProvidersFile,
+  resolveDescriptorProvider,
+} from "../lib/descriptor.js";
 import { getJson } from "../lib/http.js";
 import { modelInstalled, probeOllama } from "../lib/ollama.js";
 
@@ -9,7 +17,7 @@ const MIN_NODE_MINOR = 12;
 const OLLAMA_PROBE_TIMEOUT_MS = 5_000;
 const READY_TIMEOUT_MS = 3_000;
 
-type Status = "ok" | "warning" | "missing";
+type Status = "ok" | "warning" | "missing" | "info";
 
 interface CheckRow {
   status: Status;
@@ -26,7 +34,9 @@ function printRow({ status, message }: CheckRow): void {
       ? chalk.green("[ok]     ")
       : status === "warning"
         ? chalk.yellow("[warn]   ")
-        : chalk.red("[missing]");
+        : status === "info"
+          ? chalk.cyan("[info]   ")
+          : chalk.red("[missing]");
   console.log(`${prefix} ${message}`);
 }
 
@@ -101,10 +111,19 @@ function checkDokkaiHome(): { check: CheckRow; home: string | undefined } {
   }
 }
 
+/**
+ * Ollama reachability + installed-model check. `descModel` is only passed
+ * when `DESC_PROVIDER` is (or defaults to) `ollama` — embeddings always go
+ * through Ollama regardless of the descriptor provider (feature 22 keeps
+ * embeddings Ollama-only), so `embedModel` is checked unconditionally, but
+ * checking `DESC_MODEL` against Ollama's installed models — and suggesting
+ * `ollama pull` — only makes sense when Ollama is actually what will serve
+ * the descriptor.
+ */
 async function checkOllama(
   baseUrl: string,
   embedModel: string,
-  descModel: string,
+  descModel?: string,
 ): Promise<CheckRow[]> {
   const probe = await probeOllama(baseUrl, OLLAMA_PROBE_TIMEOUT_MS);
   if (!probe.reachable) {
@@ -118,10 +137,9 @@ async function checkOllama(
   }
 
   const rows: CheckRow[] = [row("ok", `Ollama reachable at ${baseUrl}`)];
-  for (const [label, model] of [
-    ["EMBED_MODEL", embedModel],
-    ["DESC_MODEL", descModel],
-  ] as const) {
+  const modelsToCheck: Array<[string, string]> = [["EMBED_MODEL", embedModel]];
+  if (descModel !== undefined) modelsToCheck.push(["DESC_MODEL", descModel]);
+  for (const [label, model] of modelsToCheck) {
     if (modelInstalled(probe.installed, model)) {
       rows.push(row("ok", `${label} '${model}' installed`));
     } else {
@@ -170,6 +188,11 @@ async function checkApi(apiUrl: string, home: string | undefined): Promise<Check
   }
 }
 
+/** Convert a `Finding` (feature 22, `../lib/descriptor.js`) into a `CheckRow`. */
+function toCheckRow(f: { level: "ok" | "warning" | "info"; message: string }): CheckRow {
+  return row(f.level, f.message);
+}
+
 export async function runDoctor(flags: { api?: string }): Promise<void> {
   const apiUrl = resolveApiUrl(flags);
 
@@ -186,22 +209,57 @@ export async function runDoctor(flags: { api?: string }): Promise<void> {
   const weaviateRow = await checkWeaviate(weaviateUrl, home);
   printRow(weaviateRow);
 
+  const providersFile = loadProvidersFile(home);
+  const providersFileRows = checkProvidersFile(providersFile).map(toCheckRow);
+  for (const check of providersFileRows) printRow(check);
+
   const ollamaBaseUrl = envVar("OLLAMA_BASE_URL", "http://localhost:11434");
   const embedModel = envVar("EMBED_MODEL", "nomic-embed-text");
-  const descModel = envVar("DESC_MODEL", "qwen2.5-coder:3b");
-  const ollamaRows = await checkOllama(ollamaBaseUrl, embedModel, descModel);
+  const descProvider = resolveDescriptorProvider();
+
+  let ollamaRows: CheckRow[];
+  let descriptorRows: CheckRow[];
+  if (isOllamaDescriptor(descProvider)) {
+    // No hardcoded DESC_MODEL default, ever (project rule 9a-3-clar): only
+    // pass a model into the Ollama installed-model check when one is
+    // actually configured — otherwise report that plainly instead of
+    // silently assuming qwen2.5-coder:3b.
+    const rawDescModel = envVar("DESC_MODEL", "").trim();
+    ollamaRows = await checkOllama(ollamaBaseUrl, embedModel, rawDescModel || undefined);
+    descriptorRows = rawDescModel ? [] : [toCheckRow(checkDescModel(descProvider))];
+  } else {
+    ollamaRows = await checkOllama(ollamaBaseUrl, embedModel);
+    descriptorRows = checkDescriptorRemote(descProvider, providersFile).map(toCheckRow);
+  }
   for (const check of ollamaRows) printRow(check);
+  for (const check of descriptorRows) printRow(check);
 
   const apiRow = await checkApi(apiUrl, home);
   printRow(apiRow);
 
-  const allRows = [...requiredRows, weaviateRow, ...ollamaRows, apiRow];
+  const allRows = [
+    ...requiredRows,
+    weaviateRow,
+    ...providersFileRows,
+    ...ollamaRows,
+    ...descriptorRows,
+    apiRow,
+  ];
   const okCount = allRows.filter((r) => r.status === "ok").length;
   const warningCount = allRows.filter((r) => r.status === "warning").length;
+  const infoCount = allRows.filter((r) => r.status === "info").length;
   const missingCount = allRows.filter((r) => r.status === "missing").length;
 
+  // "0 info" for the ordinary case (nothing to report beyond ok/warning/
+  // missing) would be a second, gratuitous deviation from the pre-C6
+  // summary line beyond the one DESC_MODEL change authorized for this
+  // commit — omit the segment entirely when there's nothing to show.
+  const summaryParts = [`${okCount} ok`, `${warningCount} warnings`];
+  if (infoCount > 0) summaryParts.push(`${infoCount} info`);
+  summaryParts.push(`${missingCount} missing`);
+
   console.log();
-  console.log(`${okCount} ok, ${warningCount} warnings, ${missingCount} missing`);
+  console.log(summaryParts.join(", "));
 
   if (missingCount > 0) process.exit(1);
 }

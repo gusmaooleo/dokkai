@@ -294,6 +294,13 @@ export interface DescriptionStats {
   pending: number;
   skipped: number;
   templated: number;
+  /** Cache hits whose recorded provider/model is known and differs from the
+   * currently configured one (feature 22) — served as-is, warned about;
+   * re-describe with `force: true` to refresh them. */
+  stale_model_hits?: number;
+  /** Cache hits with no recorded producer at all (pre-feature-22 entry) —
+   * may or may not match the currently configured provider/model. */
+  unknown_model_hits?: number;
 }
 
 export interface VectorizeResult {
@@ -534,7 +541,13 @@ export interface UpdateSkillRequest {
 // -----------------------------------------------------------------------
 
 export interface ProviderData {
-  provider_name: "openai" | "anthropic" | "ollama";
+  /**
+   * Not a closed union (feature 22, C5): a built-in id ('openai',
+   * 'gemini', 'anthropic', 'ollama'), any id registered in
+   * `config/providers.json` (discovered via `configApi.listProviders()`),
+   * or a free-form custom id paired with `base_url`.
+   */
+  provider_name: string;
   model: string;
   key?: string;
   base_url?: string | null;
@@ -562,6 +575,33 @@ export interface AvailableModel {
 export interface ModelsListResponse {
   provider_name: string;
   models: AvailableModel[];
+}
+
+/** One entry of GET /config/llm/providers. Never carries a key. */
+export interface LLMProviderInfo {
+  id: string;
+  label: string;
+  key_required: boolean;
+  /** Registered via config/providers.json — already has its own base URL (and usually its own key). */
+  registered_via_file: boolean;
+  /**
+   * A built-in's default base URL (e.g. Gemini's non-guessable
+   * OpenAI-compat endpoint) — always null for a file-registered provider
+   * (its own baseUrl may legitimately carry credentials this endpoint
+   * must never expose). Display-only.
+   */
+  default_base_url: string | null;
+  /**
+   * This provider's declared models[] from config/providers.json — empty
+   * for a built-in or a file-registered provider that declared none
+   * (both mean "free-text model field"). Unlike default_base_url, not
+   * restricted to built-ins: a model name carries no secret.
+   */
+  models: string[];
+}
+
+export interface LLMProvidersListResponse {
+  providers: LLMProviderInfo[];
 }
 
 export interface ProviderHealth {

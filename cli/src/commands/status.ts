@@ -1,6 +1,15 @@
 import chalk from "chalk";
 import ora from "ora";
 import { envVar, resolveApiUrl, resolveDokkaiHome } from "../lib/config.js";
+import {
+  Finding,
+  checkDescModel,
+  checkDescriptorRemote,
+  checkProvidersFile,
+  isOllamaDescriptor,
+  loadProvidersFile,
+  resolveDescriptorProvider,
+} from "../lib/descriptor.js";
 import { getJson } from "../lib/http.js";
 import { modelInstalled, probeOllama } from "../lib/ollama.js";
 
@@ -20,6 +29,11 @@ function tryResolveHome(): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function printFinding(f: Finding): void {
+  const color = f.level === "ok" ? chalk.green : f.level === "warning" ? chalk.yellow : chalk.cyan;
+  console.log(`  ${color(f.message)}`);
 }
 
 async function fetchWithTimeout(
@@ -81,17 +95,26 @@ export async function runStatus(flags: { api?: string }): Promise<void> {
     weaviateSpinner.fail(chalk.red(`Weaviate: not ready (${weaviateUrl})`));
   }
 
+  const providersFile = loadProvidersFile(home);
+  for (const f of checkProvidersFile(providersFile)) printFinding(f);
+
   const ollamaBaseUrl = envVar("OLLAMA_BASE_URL", "http://localhost:11434");
   const embedModel = envVar("EMBED_MODEL", "nomic-embed-text");
-  const descModel = envVar("DESC_MODEL", "qwen2.5-coder:3b");
+  const descProvider = resolveDescriptorProvider();
+  const descriptorIsOllama = isOllamaDescriptor(descProvider);
+  // No hardcoded DESC_MODEL default, ever (project rule 9a-3-clar): only
+  // check it against Ollama's installed models when one is actually
+  // configured.
+  const rawDescModel = envVar("DESC_MODEL", "").trim();
   const ollamaSpinner = ora(`Checking Ollama at ${ollamaBaseUrl}...`).start();
   const ollamaProbe = await probeOllama(ollamaBaseUrl, 5_000);
   if (ollamaProbe.reachable) {
     ollamaSpinner.succeed(chalk.green(`Ollama: up (${ollamaBaseUrl})`));
-    for (const [label, model] of [
-      ["EMBED_MODEL", embedModel],
-      ["DESC_MODEL", descModel],
-    ] as const) {
+    const modelsToCheck: Array<[string, string]> = [["EMBED_MODEL", embedModel]];
+    if (descriptorIsOllama && rawDescModel) {
+      modelsToCheck.push(["DESC_MODEL", rawDescModel]);
+    }
+    for (const [label, model] of modelsToCheck) {
       if (modelInstalled(ollamaProbe.installed, model)) {
         console.log(chalk.green(`  ${label} '${model}': present`));
       } else {
@@ -109,6 +132,12 @@ export async function runStatus(flags: { api?: string }): Promise<void> {
           "graph-only works without it",
       ),
     );
+  }
+
+  if (descriptorIsOllama) {
+    if (!rawDescModel) printFinding(checkDescModel(descProvider));
+  } else {
+    for (const f of checkDescriptorRemote(descProvider, providersFile)) printFinding(f);
   }
 
   console.log();
