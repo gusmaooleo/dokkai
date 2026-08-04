@@ -5,10 +5,32 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from controllers import auth, instances, chat, config, graph, routines
 from dotenv import load_dotenv
 
+# Load .env BEFORE importing controllers — same convention as
+# src/mcp_server.py and every scripts/*.py entry point. `controllers.config`
+# imports `services.llm_config` -> `services.llm_provider`, whose
+# `_load_providers_file()` reads `DOKKAI_PROVIDERS_FILE` (and populates the
+# provider registry) as a MODULE-LEVEL side effect at import time — if that
+# import ran before .env was loaded, a `DOKKAI_PROVIDERS_FILE` set only in
+# .env would be silently invisible (`os.getenv` reads back unset), and the
+# API would boot having loaded either nothing or, worse, a stale default
+# `config/providers.json` instead of the intended file.
 load_dotenv()
+
+from controllers import auth, instances, chat, config, graph, routines
+
+# Belt-and-braces (feature 22, C9 review): the import above just triggered
+# services.llm_provider's one-shot providers.json load. Confirm the path it
+# actually used still agrees with what DOKKAI_PROVIDERS_FILE resolves to
+# now that .env is fully loaded — if a future edit reintroduces the wrong
+# import order (or any other path to this same class of bug), this fails
+# loudly at boot instead of silently serving the wrong file. See
+# verify_providers_file_consistency()'s own docstring for the full
+# reasoning; a no-op given the order above.
+from services.llm_provider import verify_providers_file_consistency
+
+verify_providers_file_consistency()
 
 logger = logging.getLogger(__name__)
 

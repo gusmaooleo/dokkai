@@ -28,6 +28,7 @@ Usage
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -152,6 +153,158 @@ def main() -> None:
         check(
             "default path, cwd/config/providers.json present: loads it",
             r.returncode == 0 and "defaultpathid" in r.stdout,
+            (r.returncode, r.stdout, r.stderr),
+        )
+
+        # -----------------------------------------------------------------
+        # THE REAL DEPLOYMENT CHANNEL: DOKKAI_PROVIDERS_FILE set in a
+        # .env file, not the subprocess environment directly (the channel
+        # `run()`'s ``providers_file`` param uses everywhere else in this
+        # suite, via `extra_env`/the process environment). A .env-only
+        # var is the realistic way an admin sets this, and it's the one
+        # channel that previously went untested — it exposed a real bug:
+        # `services.llm_provider._load_providers_file()` reads
+        # `DOKKAI_PROVIDERS_FILE` EAGERLY, as a module-level side effect
+        # at import time, and `src/main.py` used to import `controllers`
+        # (-> `services.llm_config` -> `services.llm_provider`, triggering
+        # that read) BEFORE calling `load_dotenv()` — so a
+        # `DOKKAI_PROVIDERS_FILE` living only in `.env` was silently
+        # invisible, and a stale `config/providers.json` at the default
+        # path (if one existed) was loaded instead, with no error at all.
+        #
+        # This imports the REAL `main` module — not a hand-typed mirror
+        # of its statement order, which could silently drift the moment
+        # someone reorders main.py's imports again — with `src/` on
+        # PYTHONPATH and cwd pointed at a scratch directory holding a
+        # `.env` override AND a STALE default `config/providers.json`,
+        # proving main.py's CURRENT import order resolves the .env
+        # override (not the stale default, and not nothing) before
+        # `services.llm_provider` is first imported.
+        #
+        # Hermetic: run() strips DOKKAI_PROVIDERS_FILE from the launch
+        # environment (providers_file=None) so the ONLY source of the
+        # override is the .env file itself; the scratch cwd is outside
+        # the real repo tree, so python-dotenv's cwd-based search (the
+        # fallback path it takes when invoked via `python -c`, which has
+        # no `__main__.__file__`) can never reach the developer's real
+        # `.env` at the repo root.
+        # -----------------------------------------------------------------
+        dotenv_channel_dir = os.path.join(tmpdir, "dotenv_channel")
+        os.makedirs(os.path.join(dotenv_channel_dir, "config"))
+        os.makedirs(os.path.join(dotenv_channel_dir, "altdir"))
+        with open(os.path.join(dotenv_channel_dir, "config", "providers.json"), "w") as f:
+            json.dump(
+                {"providers": {"staleprovider": {"api": "openai-completions", "baseUrl": "http://stale.example/v1"}}},
+                f,
+            )
+        with open(os.path.join(dotenv_channel_dir, "altdir", "my-providers.json"), "w") as f:
+            json.dump(
+                {"providers": {"realprovider": {"api": "openai-completions", "baseUrl": "http://real.example/v1"}}},
+                f,
+            )
+        with open(os.path.join(dotenv_channel_dir, ".env"), "w") as f:
+            f.write("DOKKAI_PROVIDERS_FILE=altdir/my-providers.json\n")
+
+        main_module_probe = (
+            "import main\n"
+            "import services.llm_provider as lp\n"
+            "print(sorted(lp.get_registered_provider_ids()))\n"
+        )
+        r = run(main_module_probe, None, cwd=dotenv_channel_dir)
+        check(
+            "main.py's real import order: importing the actual `main` module succeeds",
+            r.returncode == 0,
+            (r.returncode, r.stdout, r.stderr),
+        )
+        check(
+            "main.py's real import order: a .env-only DOKKAI_PROVIDERS_FILE is honored "
+            "— the file it points at IS loaded ('realprovider' registered)",
+            "realprovider" in r.stdout,
+            (r.stdout, r.stderr),
+        )
+        check(
+            "main.py's real import order: the STALE default config/providers.json is "
+            "NOT loaded instead ('staleprovider' absent)",
+            "staleprovider" not in r.stdout,
+            r.stdout,
+        )
+
+        # -----------------------------------------------------------------
+        # verify_providers_file_consistency() (feature 22, C9 review round
+        # 2) — belt-and-braces for the exact bug just fixed above: if a
+        # FUTURE entry point reintroduces the wrong import order (imports
+        # this module before its own load_dotenv() runs), this must fail
+        # LOUDLY at boot instead of silently serving the wrong file again.
+        # Exercised directly (not through `main`, which no longer
+        # reproduces the broken order at all now that it's fixed) —
+        # reusing the SAME fixture directory as the block above (`.env`
+        # naming altdir/my-providers.json as the override, a STALE
+        # config/providers.json at the default path).
+        # -----------------------------------------------------------------
+        consistency_fixed_probe = (
+            "from dotenv import load_dotenv\n"
+            "load_dotenv()\n"
+            "import services.llm_provider as lp\n"
+            "lp.verify_providers_file_consistency()\n"
+            "print('no error')\n"
+        )
+        r = run(consistency_fixed_probe, None, cwd=dotenv_channel_dir)
+        check(
+            "consistency check: load_dotenv() BEFORE import (the fixed main.py order) stays silent",
+            r.returncode == 0 and "no error" in r.stdout,
+            (r.returncode, r.stdout, r.stderr),
+        )
+
+        consistency_broken_probe = (
+            "import services.llm_provider as lp\n"  # import BEFORE load_dotenv() — the OLD bug
+            "from dotenv import load_dotenv\n"
+            "load_dotenv()\n"
+            "lp.verify_providers_file_consistency()\n"
+            "print('no error')\n"
+        )
+        r = run(consistency_broken_probe, None, cwd=dotenv_channel_dir)
+        check(
+            "consistency check: import BEFORE load_dotenv() (the old bug, reintroduced) raises",
+            r.returncode != 0 and "inconsistency" in r.stderr,
+            (r.returncode, r.stdout, r.stderr),
+        )
+        check(
+            "...and the error names BOTH the actually-loaded (stale, default) path and the "
+            "now-expected (.env-provided) path",
+            "config/providers.json" in r.stderr and "altdir" in r.stderr and "my-providers.json" in r.stderr,
+            r.stderr,
+        )
+
+        no_override_dir = os.path.join(tmpdir, "no_override_at_all")
+        os.makedirs(no_override_dir)
+        r = run(consistency_fixed_probe, None, cwd=no_override_dir)
+        check(
+            "consistency check: no override at all (no .env, no default file present) stays silent",
+            r.returncode == 0 and "no error" in r.stdout,
+            (r.returncode, r.stdout, r.stderr),
+        )
+        r = run(consistency_broken_probe, None, cwd=no_override_dir)
+        check(
+            "consistency check: no override at all, even under the broken import order, stays silent "
+            "(nothing was loaded and nothing should have been)",
+            r.returncode == 0 and "no error" in r.stdout,
+            (r.returncode, r.stdout, r.stderr),
+        )
+
+        env_preset_probe = (
+            "import services.llm_provider as lp\n"  # import BEFORE load_dotenv() — broken order
+            "from dotenv import load_dotenv\n"
+            "load_dotenv()\n"  # no .env file to find here — harmless no-op
+            "lp.verify_providers_file_consistency()\n"
+            "print('no error')\n"
+        )
+        real_file_abs_path = os.path.join(dotenv_channel_dir, "altdir", "my-providers.json")
+        r = run(env_preset_probe, real_file_abs_path, cwd=no_override_dir)
+        check(
+            "consistency check: DOKKAI_PROVIDERS_FILE already set in the PROCESS environment "
+            "(not only via .env) stays silent even under the broken import order — the var was "
+            "already visible at import time, so there was never a mismatch to begin with",
+            r.returncode == 0 and "no error" in r.stdout,
             (r.returncode, r.stdout, r.stderr),
         )
 
@@ -598,9 +751,8 @@ def main() -> None:
         # a message showing the supported syntax, rather than silently
         # accepting it as a literal secret that 401s later. Discrimination
         # is UPPERCASE-only, matching OpenClaw's own convention exactly
-        # (dokkai_agent/openclaw's src/config/env-substitution.ts /
-        # types.secrets.ts:31-32 — var names match ^[A-Z_][A-Z0-9_]*$):
-        # this is what lets a lowercase/punctuated $-leading literal (a
+        # (var names match ^[A-Z_][A-Z0-9_]*$): this is what lets a
+        # lowercase/punctuated $-leading literal (a
         # real-world token/hash shape) be accepted with NO indirection
         # required, while still catching a genuine typo'd reference
         # attempt. Full matrix: everything the heuristic must catch, and
@@ -662,8 +814,8 @@ def main() -> None:
             # Uppercase-leading but not a clean whole-string identifier
             # (hyphens aren't valid in an env var name) — the
             # bare-shorthand check is anchored at BOTH ends, matching
-            # OpenClaw's own ^\$([A-Z][A-Z0-9_]{0,127})$, not just
-            # "starts with $ + uppercase".
+            # OpenClaw's own convention of anchoring the pattern rather
+            # than just checking "starts with $ + uppercase".
             "$SECRET-123-SUFFIX",
         ]
         for i, ok_ref in enumerate(must_accept):
@@ -832,6 +984,71 @@ def main() -> None:
                 "(file-registered defaults are never exposed through this accessor)",
                 out_lines[8] == "None",
                 out_lines[8],
+            )
+
+        # -----------------------------------------------------------------
+        # Three independent copies of the built-in provider id list exist
+        # (feature 22): this module's `_REGISTRY` (the source of truth,
+        # reached here through `get_builtin_provider_ids()`), the CLI's
+        # `BUILTIN_DESCRIPTOR_PROVIDERS` (`cli/src/lib/descriptor.ts`),
+        # and the frontend's degraded-mode `FALLBACK_BUILTIN_PROVIDERS`
+        # (`frontend/components/settings/llm-card.tsx`). Each carries an
+        # honest "this can go stale" comment and degrades safely — that
+        # part is fine and stays — but the `OTHER_TAB` sentinel got a
+        # dedicated cross-language test (above) tying the frontend and
+        # the loader together, while the built-in list itself never did:
+        # adding a fourth built-in to `_REGISTRY` alone would desync both
+        # copies with zero failing tests. This reads the id set out of
+        # ALL THREE sources' ACTUAL current text — never a hardcoded
+        # guess that could itself drift from any of them, the same
+        # discipline the `OTHER_TAB` check above already uses — and
+        # proves they agree, so a future built-in added to one without
+        # the matching edit to the other two fails HERE instead of
+        # shipping a silently-stale CLI table or Settings fallback.
+        # -----------------------------------------------------------------
+        registry_probe = "import services.llm_provider as lp\nprint(sorted(lp.get_builtin_provider_ids()))\n"
+        r = run(registry_probe, None)
+        check(
+            "reading the real _REGISTRY's built-in id set to compare the two copies against",
+            r.returncode == 0,
+            (r.returncode, r.stdout, r.stderr),
+        )
+        registry_builtin_ids: set[str] = set()
+        if r.returncode == 0:
+            registry_builtin_ids = set(ast.literal_eval(r.stdout.strip()))
+
+        llm_card_src = (REPO_ROOT / "frontend" / "components" / "settings" / "llm-card.tsx").read_text()
+        frontend_block_match = re.search(
+            r"const FALLBACK_BUILTIN_PROVIDERS[^=]*=\s*\[(.*?)\];", llm_card_src, re.DOTALL
+        )
+        check(
+            "found the frontend's FALLBACK_BUILTIN_PROVIDERS declaration to test against",
+            frontend_block_match is not None,
+            llm_card_src[:200],
+        )
+        if frontend_block_match:
+            frontend_ids = set(re.findall(r'id:\s*"([a-z0-9._-]+)"', frontend_block_match.group(1)))
+            check(
+                "frontend FALLBACK_BUILTIN_PROVIDERS ids match the real _REGISTRY built-ins exactly",
+                frontend_ids == registry_builtin_ids,
+                (sorted(frontend_ids), sorted(registry_builtin_ids)),
+            )
+
+        descriptor_ts_src = (REPO_ROOT / "cli" / "src" / "lib" / "descriptor.ts").read_text()
+        cli_block_match = re.search(
+            r"const BUILTIN_DESCRIPTOR_PROVIDERS[^=]*=\s*new Map[^(]*\(\[(.*?)\]\);", descriptor_ts_src, re.DOTALL
+        )
+        check(
+            "found the CLI's BUILTIN_DESCRIPTOR_PROVIDERS declaration to test against",
+            cli_block_match is not None,
+            descriptor_ts_src[:200],
+        )
+        if cli_block_match:
+            cli_ids = set(re.findall(r'\[\s*"([a-z0-9._-]+)"\s*,\s*\{\s*keyEnv:', cli_block_match.group(1)))
+            check(
+                "CLI BUILTIN_DESCRIPTOR_PROVIDERS ids match the real _REGISTRY built-ins exactly",
+                cli_ids == registry_builtin_ids,
+                (sorted(cli_ids), sorted(registry_builtin_ids)),
             )
 
         # -----------------------------------------------------------------

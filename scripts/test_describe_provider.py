@@ -1001,6 +1001,36 @@ def main() -> None:
         reason,
     )
 
+    # -----------------------------------------------------------------
+    # 16. validate_base_url() also redacts a credential living in a QUERY
+    #     STRING (feature 22, C9 review) — a real gateway convention
+    #     (``?api-key=``, ``?subscription-key=``) and, crucially, the
+    #     exact shape a scheme-less DESC_BASE_URL typo takes
+    #     (``localhost:1234/v1?tok=...`` — this validator's own reason for
+    #     existing). Before this fix only ``://user:pass@`` userinfo was
+    #     scrubbed; a query-string key was echoed back verbatim into this
+    #     same graceful-skip reason. Same fixture-secret discipline as
+    #     check 15 above: the ``extra`` shown on failure is a fixed
+    #     placeholder, never the actual reason string.
+    # -----------------------------------------------------------------
+    _scheme_less_with_query = f"localhost:1234/v1?tok={_fixture_secret}"
+    provider, reason = describe._resolve_provider("mycustom", _scheme_less_with_query)
+    check(
+        "DESC_BASE_URL with a query-string credential: graceful skip (invalid — scheme-less)",
+        provider is None,
+        "<redacted, see next check>",
+    )
+    check(
+        "DESC_BASE_URL with a query-string credential: the key is NEVER echoed in the skip reason",
+        _fixture_secret not in reason,
+        "<redacted — the point of this check is that the secret never appears>",
+    )
+    check(
+        "DESC_BASE_URL with a query-string credential: reason still names the actionable rejection cause",
+        "http://" in reason or "https://" in reason,
+        reason,
+    )
+
     print(f"\n{_passed} passed, {_failed} failed")
     if _failed:
         sys.exit(1)

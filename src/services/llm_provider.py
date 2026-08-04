@@ -93,24 +93,53 @@ def effective_base_url(url: str) -> str:
 # before the first path segment — an ordinary host-only URL is untouched.
 _USERINFO_RE = re.compile(r"://[^/\s]*@")
 
+# Matches a URL's query string — from the FIRST ``?`` up to the next
+# whitespace/quote/end of string (the text this redacts is always a raw
+# value embedded inside a quoted error message, e.g. ``'{raw}'``, so a
+# closing quote is as much a boundary as whitespace). A key/token in a
+# query parameter (``?api-key=...``, ``?subscription-key=...``,
+# ``?tok=...``) is a real gateway convention — as real a leak surface as
+# userinfo, and the exact shape a scheme-less URL like
+# ``localhost:1234/v1?tok=secret`` takes: it fails ``validate_base_url``
+# (no scheme) and, unlike userinfo, was previously echoed BACK verbatim in
+# the rejection message, since ``_USERINFO_RE`` only ever matched
+# ``://user:pass@``.
+_QUERY_STRING_RE = re.compile(r"\?[^\s'\"]*")
+
 
 def _redact_userinfo(text: str) -> str:
     """
-    Redact an embedded userinfo credential (``scheme://user:pass@host``)
-    from *text* — used to scrub ``validate_base_url``'s error messages
-    before they're returned, never the successfully-validated URL itself
-    (which the caller still needs, intact, to actually connect/persist).
+    Redact embedded URL secrets — userinfo credentials
+    (``scheme://user:pass@host``) AND query-string parameters
+    (``?api-key=...``, ``?tok=...``) — from *text*, used to scrub
+    ``validate_base_url``'s error messages before they're returned, never
+    the successfully-validated URL itself (which the caller still needs,
+    intact, to actually connect/persist).
 
     ``validate_base_url`` is shared by three entry points that each put a
     raw, caller-supplied ``base_url`` straight into a returned error
     string — the ``/config/llm`` POST body, the ``config/providers.json``
     loader (feature 22, C3), and ``DESC_BASE_URL`` (C4) — any of which can
-    read back to the caller (an HTTP 400 body, a boot-time traceback, a
-    job log). A malformed value with embedded Basic-auth credentials
+    read back to a caller that isn't necessarily an admin (a
+    ``DescriptorError`` from a bad ``DESC_BASE_URL`` reaches
+    ``POST /instances/pipeline``'s HTTP 400 body, and that endpoint is
+    ``require_role("admin", "user")`` — any authenticated non-admin can
+    trigger it). A malformed value with embedded Basic-auth credentials
     (``https://bob:secret@`` — hostless, so it fails validation) must not
-    echo the password back in the rejection message.
+    echo the password back in the rejection message, and neither must a
+    key living in a query parameter instead.
+
+    The query string is redacted WHOLESALE (``?<redacted>``, not just its
+    secret-shaped parameters) rather than trying to name-match which
+    params look like a key/token/credential: the actionable part of a
+    "malformed base_url" message is the scheme, host and path — what the
+    caller needs to fix a typo or a missing scheme — a query string is
+    essentially never it, so there's no accuracy cost to redacting all of
+    it, and no heuristic (``?key=``/``?token=``/``?api-key=``/...) that
+    could miss an unrecognized gateway's own parameter name.
     """
-    return _USERINFO_RE.sub("://***@", text)
+    text = _USERINFO_RE.sub("://***@", text)
+    return _QUERY_STRING_RE.sub("?<redacted>", text)
 
 
 def validate_base_url(raw: str) -> tuple[str | None, str]:
@@ -150,9 +179,13 @@ def validate_base_url(raw: str) -> tuple[str | None, str]:
     Every error message below is passed through ``_redact_userinfo``
     before being returned — a rejected URL with embedded Basic-auth
     credentials (``https://bob:secret@`` — hostless, so it always fails
-    validation) never echoes the password back; only the userinfo segment
-    is scrubbed, the rest of the URL (host, port, path — the actionable
-    part) stays visible.
+    validation) never echoes the password back, and neither does a key
+    living in a query parameter (``?api-key=...``, a real gateway
+    convention, and the exact shape a scheme-less URL like
+    ``localhost:1234/v1?tok=secret`` takes); only the userinfo segment and
+    the query string are scrubbed, the rest of the URL (scheme, host,
+    port, path — the actionable part for fixing a malformed URL) stays
+    visible.
 
     Returns ``(normalized_url, error_message)``. On success,
     ``error_message`` is ``""`` and ``normalized_url`` is the trimmed
@@ -692,13 +725,18 @@ class _ProviderSpec:
     default_api_key: str | None = field(default=None, repr=False)
     # The env var named by a ``"${VAR}"`` apiKey — resolved LAZILY, via
     # os.getenv(), in get_provider()/key_env_for() at USE time, never at
-    # load time. This matters for two reasons: (1) this module is
-    # imported (triggering the file load) before main.py's load_dotenv()
-    # call runs, so a var that only lives in .env would read back empty
-    # if resolved eagerly here; (2) resolving lazily means exporting the
-    # var after boot works on the next call, no restart needed. A var
-    # that isn't set yet is not a value to log — this field only ever
-    # holds the (non-secret) variable NAME.
+    # load time. This matters for two reasons: (1) defense in depth
+    # against import order — main.py now calls load_dotenv() BEFORE
+    # importing controllers (feature 22, C9 fix: it used to do the
+    # reverse, which meant a var living only in .env read back empty
+    # here, since THIS module's file-load side effect ran before .env was
+    # ever parsed), but a var resolved eagerly here would still silently
+    # break under any OTHER entry point that imports this module ahead of
+    # its own load_dotenv() call, or a var set/changed after that call
+    # runs; (2) resolving lazily means exporting the var after boot works
+    # on the next call, no restart needed. A var that isn't set yet is
+    # not a value to log — this field only ever holds the (non-secret)
+    # variable NAME.
     api_key_env: str | None = None
     # providers.json's models[] — feeds TWO consumers (feature 22): (1)
     # list_models()'s fallback (_FALLBACK_MODELS, wired in below) when
@@ -1122,6 +1160,67 @@ def _load_providers_file() -> None:
 _load_providers_file()
 
 
+def verify_providers_file_consistency() -> None:
+    """
+    Defense in depth against the class of bug fixed in feature 22, C9: an
+    entry point that imports this module (triggering
+    ``_load_providers_file()``'s file-load side effect, above) BEFORE its
+    own ``load_dotenv()`` call runs sees an unset ``DOKKAI_PROVIDERS_FILE``
+    at import time and silently falls back to the default path — which may
+    not be the file ``.env`` goes on to name a moment later. The worst
+    form of that bug isn't "loaded nothing", it's "loaded a stale file at
+    the default path while every diagnostic keeps naming the
+    wrong-but-actually-loaded file as if it were correct" — exactly the
+    confidently-wrong-diagnostic failure mode this whole module's error
+    messages otherwise work hard to avoid.
+
+    Reordering the caller (``main.py`` now calls ``load_dotenv()`` before
+    importing ``controllers``) is the real fix — this is the belt to that
+    fix's braces, so the SAME mistake reappearing in a future entry point
+    fails LOUDLY at boot instead of quietly shipping the wrong file again.
+
+    Call this ONCE, from a real entry point, immediately after BOTH
+    ``load_dotenv()`` has run AND this module has already been imported
+    (so ``_PROVIDERS_FILE_PATH`` reflects whatever was actually loaded) —
+    and before anything starts serving requests. It re-derives the path
+    ``DOKKAI_PROVIDERS_FILE`` resolves to NOW, under the (by now fully
+    loaded) environment, using the exact same default
+    ``_load_providers_file()`` itself uses, and compares it against the
+    path that was ACTUALLY used at import time. A mismatch means the
+    environment was completed (e.g. by ``load_dotenv()``) AFTER the
+    one-shot file-load side effect already ran, and raises naming both
+    paths — this function is never called from inside a request, so
+    raising here is a boot-time failure, matching every other loud-on-
+    malformed guarantee ``_load_providers_file()`` itself already makes.
+
+    A no-op in the common case: an entry point that (like ``main.py``
+    today, and ``mcp_server.py`` already) calls ``load_dotenv()`` BEFORE
+    importing this module never sees a mismatch, because the environment
+    was already complete the one time ``_load_providers_file()`` ever
+    runs — ``expected`` below is then always identical to ``actual``, so
+    this returns immediately without touching the filesystem. Also silent
+    when no override was ever in play at all: no path was loaded AND the
+    now-recomputed default still doesn't exist either — a genuine no-op,
+    not a mismatch to report.
+    """
+    expected = Path(os.getenv("DOKKAI_PROVIDERS_FILE", "config/providers.json"))
+    actual = _PROVIDERS_FILE_PATH
+    if actual == expected:
+        return
+    if actual is None and not expected.exists():
+        return
+    raise RuntimeError(
+        f"providers.json inconsistency: services.llm_provider actually "
+        f"loaded {str(actual)!r} at import time, but DOKKAI_PROVIDERS_FILE "
+        f"now resolves to {str(expected)!r} now that the environment is "
+        "fully loaded — the environment (e.g. a .env file) was completed "
+        "AFTER services.llm_provider was first imported, so the WRONG "
+        "file (or no file at all) was registered. Ensure load_dotenv() "
+        "runs before importing controllers/services.llm_config/"
+        "services.llm_provider, then restart."
+    )
+
+
 # -----------------------------------------------------------------------
 # Public registry accessors — services.llm_config and controllers.config
 # need to know which ids are registered/built-in, whether a key is
@@ -1316,11 +1415,12 @@ def get_provider(
         )
 
     # api_key_env is resolved LAZILY here, via os.getenv(), never cached
-    # from load time — see _ProviderSpec.api_key_env's docstring: this
-    # module is imported (triggering the providers.json load) before
-    # main.py's load_dotenv() runs, so an eager read at load time would
-    # provably miss a .env-only var; resolving here also means exporting
-    # the var after boot works on the very next call, no restart needed.
+    # from load time — see _ProviderSpec.api_key_env's docstring: this is
+    # defense in depth against an entry point that imports this module
+    # (triggering the providers.json load) before its own load_dotenv()
+    # call runs, which would otherwise miss a .env-only var; resolving
+    # here also means exporting the var after boot works on the very next
+    # call, no restart needed.
     env_key = os.getenv(spec.api_key_env) if spec.api_key_env else None
     resolved_api_key = api_key or spec.default_api_key or env_key or ""
 
